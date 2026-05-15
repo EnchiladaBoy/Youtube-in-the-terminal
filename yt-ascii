@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""yt-ascii: stream YouTube videos as ASCII art in your terminal.
+
+Usage:
+    yt-ascii <url> [options]
+
+Keys (while playing):
+    space        pause / resume
+    ← / →        seek -5s / +5s
+    ↓ / ↑        seek -30s / +30s
+    0..9         jump to 0%..90% of the video
+    q / Ctrl-C   quit
+
+Requires: yt-dlp, ffmpeg (with ffplay), python3-numpy.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+PALETTES = {
+    "simple": " .:-=+*#%@",
+    "dense":  " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$",
+    "blocks": " ░▒▓█",
+}
+
+# Terminal character cells are ~2x taller than wide; correct aspect ratio.
+CHAR_ASPECT = 2.0
+
+# Upper bound for --fps. Picked so that:
+#   - YouTube: ≥99% of content tops out at 60 fps; higher values just duplicate
+#     frames out of ffmpeg's fps filter, no visible benefit.
+#   - Terminal: even GPU-accelerated terminals (alacritty/kitty/foot) start
+#     dropping frames above this for full-window truecolor output.
+MAX_FPS = 60
+
+
+def fps_type(value):
+    """argparse type for --fps. Accepts an int in [1, MAX_FPS] or the
+    literal 'max'."""
+    if value.lower() == "max":
+        return MAX_FPS
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--fps must be an integer 1..{MAX_FPS} or 'max' (got {value!r})"
+        )
+    if n < 1:
+        raise argparse.ArgumentTypeError("--fps must be at least 1")
+    if n > MAX_FPS:
+        raise argparse.ArgumentTypeError(
+            f"--fps {n} exceeds the maximum of {MAX_FPS}; "
+            f"use '--fps max' to request the cap"
+        )
+    return n
+
+
+def fail(msg, code=1):
+    sys.stderr.write(f"yt-ascii: {msg}\n")
+    sys.exit(code)
+
+
+def check_deps():
+    missing = []
+    if not shutil.which("yt-dlp"):
+        missing.append(("yt-dlp",        "sudo dnf install yt-dlp"))
+    if not shutil.which("ffmpeg"):
+        missing.append(("ffmpeg",        "sudo dnf install ffmpeg"))
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        missing.append(("python3-numpy", "sudo dnf install python3-numpy"))
+    if missing:
+        lines = "\n".join(f"  - {n}: {c}" for n, c in missing)
+        fail(f"missing dependencies:\n{lines}")
+
+
+def probe(url, max_h):
+    fmt = (f"bestvideo[height<={max_h}][vcodec!=none]+bestaudio[acodec!=none]/"
+           f"best[height<={max_h}]")
+    meta = subprocess.run(
+        ["yt-dlp", "-f", fmt, "-j", "--no-warnings", url],
+        capture_output=True, text=True,
+    )
+    if meta.returncode != 0:
+        fail(f"yt-dlp failed:\n{meta.stderr.strip()}")
+    try:
+        info = json.loads(meta.stdout.splitlines()[0])
+    except (json.JSONDecodeError, IndexError):
+        fail("yt-dlp returned no metadata")
+
+    # When yt-dlp picks "bestvideo+bestaudio" it lists both in requested_formats;
+    # for a single combined format the URL sits at the top level.
+    formats = info.get("requested_formats") or []
+    if formats:
+        video_url = formats[0].get("url")
+        audio_url = (formats[1].get("url") if len(formats) > 1 else None) or video_url
+        if formats[0].get("vcodec") == "none" and len(formats) > 1:
+            video_url, audio_url = audio_url, video_url
+    else:
+        video_url = info.get("url")
+        audio_url = video_url
+    if not video_url:
+        fail("yt-dlp did not return a stream URL")
+
+    return {
+        "title":    info.get("title", "?"),
+        "width":    int(info.get("width") or 16),
+        "height":   int(info.get("height") or 9),
+        "duration": float(info.get("duration") or 0),
+        "video":    video_url,
+        "audio":    audio_url,
+    }
+
+
+def fit_to_terminal(cols, rows, vw, vh):
+    rows = max(rows - 1, 1)
+    aspect = vw / vh
+    w = cols
+    h = max(1, round(w / aspect / CHAR_ASPECT))
+    if h > rows:
+        h = rows
+        w = max(1, round(h * aspect * CHAR_ASPECT))
+    return w, h
+
+
+def fmt_time(seconds):
+    s = max(0, int(seconds))
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+# ── Keyboard input ────────────────────────────────────────────────────────────
+ARROWS = {"A": "up", "B": "down", "C": "right", "D": "left"}
+
+
+def read_keys(fd):
+    """Drain any pending key bytes from stdin into a list of key names."""
+    keys = []
+    while True:
+        r, _, _ = select.select([fd], [], [], 0)
+        if not r:
+            return keys
+        try:
+            data = os.read(fd, 64).decode("utf-8", errors="replace")
+        except OSError:
+            return keys
+        if not data:
+            return keys
+        i = 0
+        while i < len(data):
+            ch = data[i]
+            # ESC '[' <letter>  → arrow keys
+            if ch == "\x1b" and i + 2 < len(data) and data[i + 1] == "[":
+                arrow = ARROWS.get(data[i + 2])
+                if arrow:
+                    keys.append(arrow)
+                    i += 3
+                    continue
+                i += 1
+                continue
+            if ch == "\x1b":
+                keys.append("esc"); i += 1; continue
+            if ch == " ":
+                keys.append("space"); i += 1; continue
+            if ch in "qQ\x03":  # Ctrl-C as well
+                keys.append("q"); i += 1; continue
+            if ch.isdigit():
+                keys.append(ch); i += 1; continue
+            i += 1
+
+
+# ── Process management for video + audio ──────────────────────────────────────
+def spawn_video(info, fps, ow, oh, pos):
+    cmd = ["ffmpeg", "-loglevel", "quiet"]
+    if pos > 0:
+        cmd += ["-ss", f"{pos:.3f}"]
+    cmd += [
+        "-i", info["video"], "-an",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-vf", f"fps={fps},scale={ow}:{oh}:flags=fast_bilinear",
+        "-",
+    ]
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE)
+
+
+def spawn_audio(info, pos, eight_bit=False):
+    cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
+    if pos > 0:
+        cmd += ["-ss", f"{pos:.3f}"]
+    if eight_bit:
+        # Retro chiptune chain:
+        #   aresample=22050      - chop the upper octave (no airy hi-hats)
+        #   pan=mono|...         - sum L+R; classic 8-bit hardware was mono
+        #   acrusher bits=4      - quantize to 4 bits (16 levels — matches
+        #                          NES DPCM / Game Boy waveform RAM, much
+        #                          coarser than the prior 8-bit pass)
+        #   samples=4            - sample-and-hold every 4 samples, giving
+        #                          the stepped, aliased "old DAC" sound
+        cmd += [
+            "-af",
+            "aresample=22050,pan=mono|c0=0.5*c0+0.5*c1,"
+            "acrusher=bits=4:mix=1:mode=log:samples=4",
+        ]
+    cmd.append(info["audio"])
+    return subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def stop_proc(p):
+    if p is None:
+        return
+    try:
+        p.terminate()
+        p.wait(timeout=1)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+
+
+def signal_proc(p, sig):
+    if p is None:
+        return
+    try:
+        os.kill(p.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    p = argparse.ArgumentParser(
+        prog="yt-ascii",
+        description="Watch YouTube videos as ASCII art in the terminal.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Keys while playing:\n"
+            "  space        pause / resume\n"
+            "  ←/→          seek ±5s\n"
+            "  ↓/↑          seek ±30s\n"
+            "  0..9         jump to 0%..90%\n"
+            "  q / Ctrl-C   quit"
+        ),
+    )
+    p.add_argument("url", help="YouTube URL or video ID")
+    p.add_argument("--no-color", action="store_true",
+                   help="render in grayscale (default is 24-bit color)")
+    p.add_argument("--no-audio", action="store_true",
+                   help="disable audio playback")
+    p.add_argument("--8bit", dest="eight_bit", action="store_true",
+                   help="bit-crush the audio (≈8-bit, 11kHz) for a retro "
+                        "chiptune sound; no effect with --no-audio")
+    p.add_argument("--pixels", action="store_true",
+                   help="render with half-block pixels (▀) instead of ASCII "
+                        "characters — packs two colored pixels per cell, "
+                        "giving 2x vertical resolution and a sharper image. "
+                        "Ignored when --no-color is set.")
+    p.add_argument("--fps", type=fps_type, default=30, metavar="N",
+                   help=f"target frame rate (default: 30, max: {MAX_FPS}). "
+                        f"Pass '--fps max' to request the cap. Values above "
+                        f"{MAX_FPS} are rejected because most YouTube content "
+                        f"tops out at 60fps and terminals can't reliably draw "
+                        f"faster anyway.")
+    p.add_argument("--width", type=int,
+                   help="output width in characters")
+    p.add_argument("--height", type=int,
+                   help="output height in characters")
+    p.add_argument("--max-res", type=int, default=480, metavar="N",
+                   help="max source video resolution (default: 480)")
+    p.add_argument("--palette", choices=PALETTES, default="dense",
+                   help="ASCII palette (default: dense, ~70 chars)")
+    p.add_argument("--chars", help="custom palette, dark→light")
+    args = p.parse_args()
+
+    half_block = args.pixels and not args.no_color
+
+    check_deps()
+    import numpy as np
+
+    chars = args.chars or PALETTES[args.palette]
+    if not chars:
+        fail("palette must be non-empty")
+    palette = np.array(list(chars), dtype="U1")
+
+    sys.stderr.write("Resolving stream…\n")
+    info = probe(args.url, args.max_res)
+
+    def compute_dims():
+        """Read terminal size and derive output (cols, rows, ow, oh)."""
+        c, r = shutil.get_terminal_size((80, 24))
+        if args.width and args.height:
+            return c, r, args.width, args.height
+        if args.width:
+            w = args.width
+            h = max(1, round(w / (info["width"] / info["height"]) / CHAR_ASPECT))
+            return c, r, w, h
+        if args.height:
+            h = args.height
+            w = max(1, round(h * (info["width"] / info["height"]) * CHAR_ASPECT))
+            return c, r, w, h
+        w, h = fit_to_terminal(c, r, info["width"], info["height"])
+        return c, r, w, h
+
+    cols, rows, ow, oh = compute_dims()
+    pix_h = oh * 2 if half_block else oh   # source-pixel height ffmpeg scales to
+
+    mode_label = "pixels" if half_block else ("color-chars" if not args.no_color else "gray-chars")
+    audio_enabled = not args.no_audio and bool(shutil.which("ffplay"))
+    audio_label = (
+        "8-bit audio" if (audio_enabled and args.eight_bit)
+        else ("audio" if audio_enabled else "no audio")
+    )
+    sys.stderr.write(
+        f"▶ {info['title']}\n"
+        f"  source {info['width']}x{info['height']}  "
+        f"→  terminal {ow}x{oh} chars @ {args.fps}fps  "
+        f"({mode_label}, {audio_label})\n"
+    )
+
+    # Playback timeline:
+    #   seek_pos = video time at the start of the current decoder segment
+    #   seek_at  = wall clock when the current segment began
+    # current playback position is therefore seek_pos + (now - seek_at)
+    state = {"video": None, "audio": None}
+    seek_pos = 0.0
+    seek_at = time.monotonic()
+    frame_no = 0          # frames consumed within current segment
+    paused = False
+    pause_started = 0.0
+
+    def current_pos():
+        if paused:
+            return seek_pos + (pause_started - seek_at)
+        return seek_pos + (time.monotonic() - seek_at)
+
+    def start_at(pos):
+        state["video"] = spawn_video(info, args.fps, ow, pix_h, pos)
+        if audio_enabled:
+            state["audio"] = spawn_audio(info, pos, args.eight_bit)
+
+    def stop_all():
+        stop_proc(state["video"]); state["video"] = None
+        stop_proc(state["audio"]); state["audio"] = None
+
+    def seek_to(new_pos):
+        nonlocal seek_pos, seek_at, frame_no, paused
+        if info["duration"]:
+            new_pos = max(0.0, min(new_pos, info["duration"] - 0.5))
+        else:
+            new_pos = max(0.0, new_pos)
+        stop_all()
+        start_at(new_pos)
+        seek_pos = new_pos
+        seek_at = time.monotonic()
+        frame_no = 0
+        paused = False  # resume on seek so the user sees the new position
+
+    def toggle_pause():
+        nonlocal paused, pause_started, seek_at
+        if paused:
+            seek_at += time.monotonic() - pause_started
+            signal_proc(state["video"], signal.SIGCONT)
+            signal_proc(state["audio"], signal.SIGCONT)
+            paused = False
+        else:
+            pause_started = time.monotonic()
+            signal_proc(state["video"], signal.SIGSTOP)
+            signal_proc(state["audio"], signal.SIGSTOP)
+            paused = True
+
+    def do_resize():
+        """Recompute output size and restart the video decoder in place.
+        Audio is left running so there's no audible gap on resize."""
+        nonlocal cols, rows, ow, oh, pix_h, frame_size
+        nonlocal seek_pos, seek_at, frame_no, pause_started
+        new_cols, new_rows, new_ow, new_oh = compute_dims()
+        if (new_ow, new_oh, new_cols) == (ow, oh, cols):
+            return
+        pos = current_pos()
+        cols, rows = new_cols, new_rows
+        ow, oh = new_ow, new_oh
+        pix_h = oh * 2 if half_block else oh
+        frame_size = ow * pix_h * 3
+        stop_proc(state["video"])
+        state["video"] = spawn_video(info, args.fps, ow, pix_h, pos)
+        seek_pos = pos
+        seek_at = time.monotonic()
+        frame_no = 0
+        if paused:
+            pause_started = seek_at
+            signal_proc(state["video"], signal.SIGSTOP)
+        sys.stdout.write("\x1b[2J\x1b[H")  # clear; old frame had wrong dims
+        sys.stdout.flush()
+
+    resize_flag = [False]
+    def on_winch(*_):
+        resize_flag[0] = True
+    if hasattr(signal, "SIGWINCH"):
+        signal.signal(signal.SIGWINCH, on_winch)
+
+    # Put stdin in cbreak mode so we can read single keys without Enter.
+    fd = sys.stdin.fileno()
+    is_tty = os.isatty(fd)
+    old_term = None
+    if is_tty:
+        try:
+            old_term = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except termios.error:
+            is_tty = False
+
+    sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")  # hide cursor, clear, home
+    sys.stdout.flush()
+
+    color = not args.no_color
+    n_pal = palette.size - 1
+    frame_dur = 1.0 / args.fps
+    frame_size = ow * pix_h * 3
+
+    def render_half(frame_):
+        # frame_ shape: (2*oh, ow, 3). Pair rows: even=top fg, odd=bottom bg.
+        top = frame_[0::2]
+        bot = frame_[1::2]
+        tr = top[:, :, 0].astype("U3")
+        tg = top[:, :, 1].astype("U3")
+        tb = top[:, :, 2].astype("U3")
+        br = bot[:, :, 0].astype("U3")
+        bgc = bot[:, :, 1].astype("U3")
+        bb = bot[:, :, 2].astype("U3")
+        out = np.char.add("\x1b[38;2;", tr)
+        out = np.char.add(out, ";")
+        out = np.char.add(out, tg)
+        out = np.char.add(out, ";")
+        out = np.char.add(out, tb)
+        out = np.char.add(out, "m\x1b[48;2;")
+        out = np.char.add(out, br)
+        out = np.char.add(out, ";")
+        out = np.char.add(out, bgc)
+        out = np.char.add(out, ";")
+        out = np.char.add(out, bb)
+        out = np.char.add(out, "m▀")
+        return "\n".join("".join(row) + "\x1b[0m\x1b[K" for row in out)
+
+    def render_chars(frame_):
+        # frame_ shape: (oh, ow, 3) — classic ASCII palette render.
+        lum = (0.299 * frame_[:, :, 0] +
+               0.587 * frame_[:, :, 1] +
+               0.114 * frame_[:, :, 2]).astype(np.int32)
+        idx = (lum * n_pal) // 255
+        cells = palette[idx]
+        if color:
+            r = frame_[:, :, 0].astype("U3")
+            g = frame_[:, :, 1].astype("U3")
+            b = frame_[:, :, 2].astype("U3")
+            esc = np.char.add("\x1b[38;2;", r)
+            esc = np.char.add(esc, ";")
+            esc = np.char.add(esc, g)
+            esc = np.char.add(esc, ";")
+            esc = np.char.add(esc, b)
+            esc = np.char.add(esc, "m")
+            esc = np.char.add(esc, cells)
+            return "\n".join("".join(row) + "\x1b[0m\x1b[K" for row in esc)
+        return "\n".join("".join(row) + "\x1b[K" for row in cells)
+
+    start_at(0.0)
+
+    try:
+        while True:
+            # ── Handle keyboard ──────────────────────────────────────────
+            quit_now = False
+            pending_seek = None  # final target after applying all queued keys
+            if is_tty:
+                for key in read_keys(fd):
+                    if key == "q":
+                        quit_now = True
+                        break
+                    if key == "space":
+                        toggle_pause()
+                        continue
+                    base = pending_seek if pending_seek is not None else current_pos()
+                    if key == "left":
+                        pending_seek = base - 5
+                    elif key == "right":
+                        pending_seek = base + 5
+                    elif key == "down":
+                        pending_seek = base - 30
+                    elif key == "up":
+                        pending_seek = base + 30
+                    elif key.isdigit() and info["duration"]:
+                        pending_seek = info["duration"] * int(key) / 10
+            if quit_now:
+                break
+            if pending_seek is not None:
+                seek_to(pending_seek)
+
+            if resize_flag[0]:
+                resize_flag[0] = False
+                do_resize()
+
+            # ── Paused: just idle and keep the status line updating ─────
+            if paused:
+                pos = current_pos()
+                status = build_status(args.fps, pos, info, cols, paused=True)
+                sys.stdout.write(f"\x1b[{oh + 1};1H" + status + "\x1b[K")
+                sys.stdout.flush()
+                time.sleep(0.05)
+                continue
+
+            # ── Drop frames if behind, to stay in sync with audio ───────
+            now = time.monotonic()
+            seg_elapsed = now - seek_at
+            target = int(seg_elapsed * args.fps)
+            if frame_no < target - 1:
+                skip = target - frame_no - 1
+                skipped = state["video"].stdout.read(frame_size * skip)
+                if len(skipped) < frame_size * skip:
+                    break
+                frame_no += skip
+
+            data = state["video"].stdout.read(frame_size)
+            if len(data) < frame_size:
+                break
+
+            frame = np.frombuffer(data, dtype=np.uint8).reshape(pix_h, ow, 3)
+            body = render_half(frame) if half_block else render_chars(frame)
+
+            pos = seek_pos + seg_elapsed
+            status = build_status(args.fps, pos, info, cols, paused=False)
+
+            sys.stdout.write("\x1b[H" + body + "\n" + status + "\x1b[K")
+            sys.stdout.flush()
+
+            frame_no += 1
+            delay = (seek_at + frame_no * frame_dur) - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_all()
+        if is_tty and old_term is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+        sys.stdout.write("\x1b[0m\x1b[?25h\n")
+        sys.stdout.flush()
+
+
+def build_status(fps, pos, info, cols, paused):
+    if info["duration"]:
+        clock = f"{fmt_time(pos)} / {fmt_time(info['duration'])}"
+    else:
+        clock = fmt_time(pos)
+    tag = "‖ PAUSED" if paused else "▶"
+    controls = "space:pause  ←→±5s  ↑↓±30s  0-9:jump  q:quit"
+    head = f"  {tag}  {clock}  {fps}fps  "
+    title_room = max(0, cols - len(head) - len(controls) - 4)
+    title = info["title"][:title_room]
+    sep = "  " if title else ""
+    return f"\x1b[0m{head}{title}{sep}{controls}"
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        sys.stdout.write("\x1b[0m\x1b[?25h\n")
