@@ -43,6 +43,52 @@ CHAR_ASPECT = 2.0
 #     dropping frames above this for full-window truecolor output.
 MAX_FPS = 60
 
+# Consecutive failed reconnects (at the same position) before we treat the
+# stream as genuinely dead and stop.
+MAX_STREAM_RETRIES = 3
+
+# --typewriter: default seconds for the left-to-right / top-to-bottom sweep to
+# progressively unmask the (live, playing) picture. Override with --type-secs.
+REVEAL_SECS = 5.0
+
+# --rain: default seconds for the Matrix-style rain reveal to fill the screen.
+# A touch longer than the typewriter because the staggered columns finish over
+# the back half of the window, so a slightly wider window reads better; this
+# also sets how fast the glyphs fall (longer = slower). Override with --rain-secs.
+RAIN_SECS = 7.5
+
+# Glyphs the rain is drawn from: digits, half-width katakana (each a single
+# cell wide, so columns stay aligned) and a few symbols. A fresh glyph is picked
+# per cell each frame so the falling streaks shimmer like Matrix "digital rain".
+RAIN_GLYPHS = (
+    "0123456789"
+    "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ"
+    ":.=+*<>|/"
+)
+
+# Let ffmpeg/ffplay ride out transient googlevideo failures — expired URL
+# segments, 403/5xx throttling, TCP/TLS resets — instead of exiting, which
+# otherwise shows up as the video never starting or cutting off partway
+# through. These are input options, so they must precede -i / the input URL.
+#   delay_max        - cap the wait between retries (exponential backoff)
+#   delay_total_max  - after this many seconds of cumulative retrying, let
+#                      ffmpeg give up so our own recover_stream() can show a
+#                      "reconnecting…" hint and fetch a fresh URL, rather than
+#                      freezing on a stale frame for minutes (ffmpeg's default
+#                      total budget is 256s).
+RECONNECT_FLAGS = [
+    "-reconnect", "1",
+    "-reconnect_streamed", "1",
+    "-reconnect_on_network_error", "1",
+    "-reconnect_on_http_error", "4xx,5xx",
+    "-reconnect_delay_max", "5",
+    "-reconnect_delay_total_max", "30",
+]
+
+
+class ProbeError(Exception):
+    """Raised when yt-dlp can't resolve a usable stream."""
+
 
 def fps_type(value):
     """argparse type for --fps. Accepts an int in [1, MAX_FPS] or the
@@ -93,11 +139,11 @@ def probe(url, max_h):
         capture_output=True, text=True,
     )
     if meta.returncode != 0:
-        fail(f"yt-dlp failed:\n{meta.stderr.strip()}")
+        raise ProbeError(f"yt-dlp failed:\n{meta.stderr.strip()}")
     try:
         info = json.loads(meta.stdout.splitlines()[0])
     except (json.JSONDecodeError, IndexError):
-        fail("yt-dlp returned no metadata")
+        raise ProbeError("yt-dlp returned no metadata")
 
     # When yt-dlp picks "bestvideo+bestaudio" it lists both in requested_formats;
     # for a single combined format the URL sits at the top level.
@@ -111,7 +157,7 @@ def probe(url, max_h):
         video_url = info.get("url")
         audio_url = video_url
     if not video_url:
-        fail("yt-dlp did not return a stream URL")
+        raise ProbeError("yt-dlp did not return a stream URL")
 
     return {
         "title":    info.get("title", "?"),
@@ -184,6 +230,7 @@ def read_keys(fd):
 # ── Process management for video + audio ──────────────────────────────────────
 def spawn_video(info, fps, ow, oh, pos):
     cmd = ["ffmpeg", "-loglevel", "quiet"]
+    cmd += RECONNECT_FLAGS
     if pos > 0:
         cmd += ["-ss", f"{pos:.3f}"]
     cmd += [
@@ -197,6 +244,7 @@ def spawn_video(info, fps, ow, oh, pos):
 
 def spawn_audio(info, pos, eight_bit=False):
     cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
+    cmd += RECONNECT_FLAGS
     if pos > 0:
         cmd += ["-ss", f"{pos:.3f}"]
     if eight_bit:
@@ -272,6 +320,22 @@ def main():
                         "characters — packs two colored pixels per cell, "
                         "giving 2x vertical resolution and a sharper image. "
                         "Ignored when --no-color is set.")
+    reveal = p.add_mutually_exclusive_group()
+    reveal.add_argument("--typewriter", action="store_true",
+                        help="reveal the picture with a slow left-to-right, "
+                             "top-to-bottom sweep while it plays (re-sweeps "
+                             "after each seek)")
+    reveal.add_argument("--rain", action="store_true",
+                        help="reveal the picture with a Matrix-style rain: "
+                             "white glyphs cascade down each column and the "
+                             "live picture settles in behind them (re-rains "
+                             "after each seek)")
+    p.add_argument("--type-secs", type=float, default=REVEAL_SECS, metavar="S",
+                   help=f"seconds for the --typewriter sweep to fill the "
+                        f"screen (default: {REVEAL_SECS:g})")
+    p.add_argument("--rain-secs", type=float, default=RAIN_SECS, metavar="S",
+                   help=f"seconds for the --rain reveal to fill the screen "
+                        f"(default: {RAIN_SECS:g})")
     p.add_argument("--fps", type=fps_type, default=30, metavar="N",
                    help=f"target frame rate (default: 30, max: {MAX_FPS}). "
                         f"Pass '--fps max' to request the cap. Values above "
@@ -290,6 +354,17 @@ def main():
     args = p.parse_args()
 
     half_block = args.pixels and not args.no_color
+    # One reveal animation may be active per run (the flags are mutually
+    # exclusive); reveal_secs is its fill time, pulled from the matching knob.
+    if args.rain:
+        reveal_style = "rain"
+        reveal_secs = max(0.1, args.rain_secs)
+    elif args.typewriter:
+        reveal_style = "typewriter"
+        reveal_secs = max(0.1, args.type_secs)
+    else:
+        reveal_style = None
+        reveal_secs = 0.0
 
     check_deps()
     import numpy as np
@@ -300,7 +375,10 @@ def main():
     palette = np.array(list(chars), dtype="U1")
 
     sys.stderr.write("Resolving stream…\n")
-    info = probe(args.url, args.max_res)
+    try:
+        info = probe(args.url, args.max_res)
+    except ProbeError as e:
+        fail(str(e))
 
     def compute_dims():
         """Read terminal size and derive output (cols, rows, ow, oh)."""
@@ -344,6 +422,9 @@ def main():
     frame_no = 0          # frames consumed within current segment
     paused = False
     pause_started = 0.0
+    # Reveal animation: wall-clock time the current segment's reveal began
+    # (set on the first rendered frame; None until then, and when disabled).
+    reveal_start = None
 
     def current_pos():
         if paused:
@@ -371,11 +452,15 @@ def main():
         seek_at = time.monotonic()
         frame_no = 0
         paused = False  # resume on seek so the user sees the new position
+        begin_reveal()  # replay the reveal from the new position
 
     def toggle_pause():
-        nonlocal paused, pause_started, seek_at
+        nonlocal paused, pause_started, seek_at, reveal_start
         if paused:
-            seek_at += time.monotonic() - pause_started
+            delta = time.monotonic() - pause_started
+            seek_at += delta
+            if reveal_start is not None:
+                reveal_start += delta  # keep the reveal frozen while paused
             signal_proc(state["video"], signal.SIGCONT)
             signal_proc(state["audio"], signal.SIGCONT)
             paused = False
@@ -408,6 +493,42 @@ def main():
             signal_proc(state["video"], signal.SIGSTOP)
         sys.stdout.write("\x1b[2J\x1b[H")  # clear; old frame had wrong dims
         sys.stdout.flush()
+        # A reveal in progress just continues at the new size: its progress is
+        # wall-clock based, so the typewriter mask repaints against the new dims
+        # and the rain reshuffles its columns to the new width on the next frame.
+
+    retry = {"n": 0, "pos": -1.0}
+    def recover_stream():
+        """The video pipe closed before the end of the video. A close near the
+        known end is a normal finish; otherwise the stream dropped (the
+        googlevideo URL expired, or a network blip outlasted ffmpeg's own
+        reconnect) — refresh the URL and resume from the last shown frame.
+        Returns True if playback resumed, False if we should stop."""
+        nonlocal seek_pos, seek_at, frame_no, paused
+        pos = seek_pos + frame_no * frame_dur
+        dur = info["duration"]
+        if dur and pos >= dur - 1.0:
+            return False  # reached the end — a normal finish
+
+        # Count consecutive failures at (roughly) the same spot so a truly
+        # dead stream gives up instead of looping forever.
+        if abs(pos - retry["pos"]) < 1.0:
+            retry["n"] += 1
+        else:
+            retry["n"], retry["pos"] = 1, pos
+        if retry["n"] > MAX_STREAM_RETRIES:
+            return False
+
+        sys.stdout.write(f"\x1b[{oh + 1};1H\x1b[0m  ⟳ reconnecting…\x1b[K")
+        sys.stdout.flush()
+        try:
+            info.update(probe(args.url, args.max_res))
+        except Exception:
+            pass  # keep the old URL; recovery must never crash the player
+        stop_all()
+        start_at(pos)
+        seek_pos, seek_at, frame_no, paused = pos, time.monotonic(), 0, False
+        return True
 
     resize_flag = [False]
     def on_winch(*_):
@@ -434,8 +555,15 @@ def main():
     frame_dur = 1.0 / args.fps
     frame_size = ow * pix_h * 3
 
-    def render_half(frame_):
+    # --rain state. `rng` seeds a fresh pattern each reveal; rain_state caches
+    # the per-column fall timings, regenerated whenever the width changes.
+    rain_glyphs = np.array(list(RAIN_GLYPHS), dtype="U1")
+    np_rng = np.random.default_rng()
+    rain_state = {"cols": 0}
+
+    def cells_half(frame_):
         # frame_ shape: (2*oh, ow, 3). Pair rows: even=top fg, odd=bottom bg.
+        # Returns a 2-D (oh × ow) array of per-cell strings.
         top = frame_[0::2]
         bot = frame_[1::2]
         tr = top[:, :, 0].astype("U3")
@@ -456,30 +584,128 @@ def main():
         out = np.char.add(out, ";")
         out = np.char.add(out, bb)
         out = np.char.add(out, "m▀")
-        return "\n".join("".join(row) + "\x1b[0m\x1b[K" for row in out)
+        return out
 
-    def render_chars(frame_):
+    def cells_chars(frame_):
         # frame_ shape: (oh, ow, 3) — classic ASCII palette render.
+        # Returns a 2-D (oh × ow) array of per-cell strings.
         lum = (0.299 * frame_[:, :, 0] +
                0.587 * frame_[:, :, 1] +
                0.114 * frame_[:, :, 2]).astype(np.int32)
         idx = (lum * n_pal) // 255
         cells = palette[idx]
-        if color:
-            r = frame_[:, :, 0].astype("U3")
-            g = frame_[:, :, 1].astype("U3")
-            b = frame_[:, :, 2].astype("U3")
-            esc = np.char.add("\x1b[38;2;", r)
+        if not color:
+            return cells
+        r = frame_[:, :, 0].astype("U3")
+        g = frame_[:, :, 1].astype("U3")
+        b = frame_[:, :, 2].astype("U3")
+        esc = np.char.add("\x1b[38;2;", r)
+        esc = np.char.add(esc, ";")
+        esc = np.char.add(esc, g)
+        esc = np.char.add(esc, ";")
+        esc = np.char.add(esc, b)
+        esc = np.char.add(esc, "m")
+        esc = np.char.add(esc, cells)
+        return esc
+
+    # Trailing reset+clear for each rendered row: color modes need the reset so
+    # a row's last color doesn't bleed; gray needs only the clear-to-EOL.
+    row_suffix = "\x1b[0m\x1b[K" if (half_block or color) else "\x1b[K"
+
+    def frame_cells(frame_):
+        return cells_half(frame_) if half_block else cells_chars(frame_)
+
+    def render_half(frame_):
+        return "\n".join("".join(row) + row_suffix for row in cells_half(frame_))
+
+    def render_chars(frame_):
+        return "\n".join("".join(row) + row_suffix for row in cells_chars(frame_))
+
+    def begin_reveal():
+        """Start (or restart, after a seek) the current reveal animation: clear
+        the screen so the picture builds on from nothing. The effect then grows
+        in the render path, against the live frames. No-op when disabled."""
+        nonlocal reveal_start
+        reveal_start = None
+        if reveal_style:
+            rain_state["cols"] = 0   # reshuffle the rain columns for this segment
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+    def render_revealed(frame_, frac):
+        """Render only the top-left fraction `frac` of the frame's cells in
+        row-major order (full rows, then a partial row, then blank rows), so
+        the live picture is progressively unmasked left-to-right, top-to-bottom."""
+        grid = frame_cells(frame_)
+        nrows, ncols = grid.shape
+        shown = max(0, min(nrows * ncols, int(round(nrows * ncols * frac))))
+        full, partial = divmod(shown, ncols)
+        lines = []
+        for r in range(nrows):
+            if r < full:
+                lines.append("".join(grid[r].tolist()) + row_suffix)
+            elif r == full and partial:
+                lines.append("".join(grid[r, :partial].tolist()) + row_suffix)
+            else:
+                lines.append(row_suffix)  # below the sweep: blank/cleared
+        return "\n".join(lines)
+
+    def render_rain(frame_, frac):
+        """Matrix-style reveal. White glyphs cascade down each column and the
+        live picture settles in behind the falling head, so the image builds top
+        to bottom with a ragged, rain-like front. Columns start at staggered
+        times and fall at varied speeds, but every column reaches the bottom by
+        frac == 1.0 — when the caller switches to the plain render, so the hand-
+        off is seamless. `frac` is the segment's global 0..1 reveal progress."""
+        grid = frame_cells(frame_)              # settled image cells, (nrows, ncols)
+        nrows, ncols = grid.shape
+
+        # (Re)generate per-column fall timings whenever the width changes: the
+        # first frame of a reveal (begin_reveal zeroes "cols") or after a resize.
+        # `dur` is each column's fall time as a fraction of the window; `off` is
+        # its start time, drawn so the fall still completes by frac == 1.0.
+        if rain_state["cols"] != ncols:
+            dur = np_rng.uniform(0.45, 0.8, ncols)
+            off = np_rng.uniform(0.0, 1.0 - dur)
+            rain_state.update(cols=ncols, dur=dur, off=off)
+
+        trail = max(3, min(10, nrows // 6))
+        # Column progress 0..1 → head row. The head travels one extra `trail`
+        # past the last row so the tail also clears the bottom before the hand-
+        # off (no green glyphs left behind when we switch to the plain render).
+        p = np.clip((frac - rain_state["off"]) / rain_state["dur"], 0.0, 1.0)
+        front = p * (nrows + trail)                       # (ncols,)
+
+        rows = np.arange(nrows)[:, None]                  # (nrows, 1)
+        dist = front[None, :] - rows         # rows above the head are positive
+        settled = dist >= trail              # picture has set here
+        # glowing tail behind the head, but only for columns that have started
+        in_trail = (dist >= 0) & (dist < trail) & (front > 0.0)[None, :]
+        reset = "\x1b[0m"
+        pre = reset if half_block else ""    # half-block sets a bg; clear it first
+        out = np.where(settled, grid, pre + " ")          # image, else blank
+
+        if in_trail.any():
+            glyph = rain_glyphs[np_rng.integers(0, rain_glyphs.size,
+                                                size=(nrows, ncols))]
+            t = np.clip(dist / trail, 0.0, 1.0)           # 0 at head → 1 at tail end
+            # White rain: a bright white head fading to dim gray down the tail.
+            v = (255 - 200 * t).astype(int).astype("U3")
+            esc = np.char.add(pre + "\x1b[38;2;", v)
             esc = np.char.add(esc, ";")
-            esc = np.char.add(esc, g)
+            esc = np.char.add(esc, v)
             esc = np.char.add(esc, ";")
-            esc = np.char.add(esc, b)
+            esc = np.char.add(esc, v)
             esc = np.char.add(esc, "m")
-            esc = np.char.add(esc, cells)
-            return "\n".join("".join(row) + "\x1b[0m\x1b[K" for row in esc)
-        return "\n".join("".join(row) + "\x1b[K" for row in cells)
+            cell = np.char.add(esc, glyph)
+            cell = np.char.add(cell, reset)               # don't bleed the tint onward
+            out = np.where(in_trail, cell, out)
+
+        return "\n".join("".join(row.tolist()) + row_suffix for row in out)
 
     start_at(0.0)
+    seek_at = time.monotonic()  # pace from first-frame time, not probe time
+    begin_reveal()
 
     try:
         while True:
@@ -531,15 +757,34 @@ def main():
                 skip = target - frame_no - 1
                 skipped = state["video"].stdout.read(frame_size * skip)
                 if len(skipped) < frame_size * skip:
+                    if recover_stream():
+                        continue
                     break
                 frame_no += skip
 
             data = state["video"].stdout.read(frame_size)
             if len(data) < frame_size:
+                if recover_stream():
+                    continue
                 break
 
             frame = np.frombuffer(data, dtype=np.uint8).reshape(pix_h, ow, 3)
-            body = render_half(frame) if half_block else render_chars(frame)
+
+            # Reveal animations unmask the live frame over `reveal_secs`, timed
+            # from the first frame actually shown (so a slow stream connect
+            # doesn't eat the start of the effect).
+            if reveal_style:
+                rnow = time.monotonic()
+                if reveal_start is None:
+                    reveal_start = rnow
+                frac = (rnow - reveal_start) / reveal_secs
+            else:
+                frac = 1.0
+            if frac < 1.0:
+                body = (render_rain(frame, frac) if reveal_style == "rain"
+                        else render_revealed(frame, frac))
+            else:
+                body = render_half(frame) if half_block else render_chars(frame)
 
             pos = seek_pos + seg_elapsed
             status = build_status(args.fps, pos, info, cols, paused=False)
