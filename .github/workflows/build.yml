@@ -1,0 +1,79 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# Cancel an in-progress run for the same ref when a new commit/tag is pushed, so
+# a stuck or superseded job (e.g. a queue-starved runner) doesn't pile up.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x86_64
+            asset: yt-ascii-linux-x86_64
+          - os: macos-14
+            label: macos-arm64
+            asset: yt-ascii-macos-arm64
+          - os: windows-latest
+            label: windows-x86_64
+            asset: yt-ascii-windows-x86_64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: python -m pip install --upgrade pip -r requirements-build.txt
+
+      - name: Build executable
+        run: python packaging/build.py
+
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p out
+          cp dist/yt-ascii "out/${{ matrix.asset }}"
+          chmod +x "out/${{ matrix.asset }}"
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item dist/yt-ascii.exe "out/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: out/${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish release with binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true

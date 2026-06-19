@@ -1,0 +1,4 @@
+numpy
+yt-dlp
+imageio-ffmpeg
+certifi

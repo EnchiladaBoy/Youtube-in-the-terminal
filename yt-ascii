@@ -2,7 +2,7 @@
 """yt-ascii: stream YouTube videos as ASCII art in your terminal.
 
 Usage:
-    yt-ascii <url> [options]
+    yt-ascii [url] [options]      # omit the url for an interactive paste prompt
 
 Keys (while playing):
     space        pause / resume
@@ -11,21 +11,42 @@ Keys (while playing):
     0..9         jump to 0%..90% of the video
     q / Ctrl-C   quit
 
-Requires: yt-dlp, ffmpeg (with ffplay), python3-numpy.
+Needs numpy, plus ffmpeg and yt-dlp. The packaged executable bundles all of
+them (ffmpeg via imageio-ffmpeg, yt-dlp as a library), so a standalone build
+plays video with nothing else installed; audio additionally wants ffplay on
+PATH. Runs on Linux, macOS and Windows.
 """
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
-import select
 import shutil
 import signal
 import subprocess
 import sys
-import termios
 import time
-import tty
+
+# Single-key terminal input is POSIX-only (termios/tty + select on stdin). On
+# Windows we read the console through msvcrt instead; if neither is available
+# the video still plays, just without the interactive pause/seek keys.
+IS_WINDOWS = os.name == "nt"
+if not IS_WINDOWS:
+    import select
+    import termios
+    import tty
+    msvcrt = None
+else:                                       # pragma: no cover - Windows only
+    select = termios = tty = None
+    try:
+        import msvcrt
+    except ImportError:
+        msvcrt = None
+
+# os.kill(pid, SIGSTOP/SIGCONT) gives a gap-free pause, but those signals don't
+# exist on Windows; there we fall back to stopping and respawning the decoders.
+_CAN_SUSPEND = hasattr(signal, "SIGSTOP") and hasattr(signal, "SIGCONT")
 
 PALETTES = {
     "simple": " .:-=+*#%@",
@@ -85,6 +106,13 @@ RECONNECT_FLAGS = [
     "-reconnect_delay_total_max", "30",
 ]
 
+# yt-dlp player clients to try (in order) when resolving YouTube streams.
+# YouTube increasingly bot-checks the default web client from datacenter/VM IPs
+# ("Sign in to confirm you're not a bot"); the android_vr client sidesteps that
+# and rarely needs sign-in, with web/ios as fallbacks for videos it can't serve.
+# yt-dlp merges the formats found across all listed clients.
+YOUTUBE_CLIENTS = ["android_vr", "web", "ios"]
+
 
 class ProbeError(Exception):
     """Raised when yt-dlp can't resolve a usable stream."""
@@ -116,34 +144,160 @@ def fail(msg, code=1):
     sys.exit(code)
 
 
+def _bundle_dir():
+    """Directory PyInstaller unpacks bundled files into (and where we look for a
+    bundled ffmpeg/ffplay), or None when running from source."""
+    return getattr(sys, "_MEIPASS", None)
+
+
+def _bundled_tool(name):
+    """Path to a binary shipped inside the frozen app (via --add-binary), or
+    None. `name` is the base name; the .exe variant is tried too (Windows)."""
+    d = _bundle_dir()
+    if not d:
+        return None
+    for cand in (os.path.join(d, name + ".exe"), os.path.join(d, name)):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def find_ffmpeg():
+    """Locate an ffmpeg binary. A system ffmpeg is preferred: it is dynamically
+    linked and resolves DNS reliably, whereas the statically linked build we can
+    bundle can fail name resolution on some hosts. It is still the fallback for
+    machines that have no ffmpeg at all. Order:
+        $YTASCII_FFMPEG -> system PATH -> bundled -> imageio-ffmpeg's build."""
+    env = os.environ.get("YTASCII_FFMPEG")
+    if env and os.path.isfile(env):
+        return env
+    sys_exe = shutil.which("ffmpeg")
+    if sys_exe:
+        return sys_exe
+    bundled = _bundled_tool("ffmpeg")
+    if bundled:
+        return bundled
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            if not os.access(exe, os.X_OK):
+                try:
+                    os.chmod(exe, 0o755)
+                except OSError:
+                    pass
+            return exe
+    except Exception:
+        pass
+    return None
+
+
+@functools.lru_cache(maxsize=None)
+def find_ffplay():
+    """Locate ffplay for audio: $YTASCII_FFPLAY -> system PATH -> bundled.
+    imageio-ffmpeg doesn't ship ffplay, so None ⇒ play silently."""
+    env = os.environ.get("YTASCII_FFPLAY")
+    if env and os.path.isfile(env):
+        return env
+    sys_exe = shutil.which("ffplay")
+    if sys_exe:
+        return sys_exe
+    return _bundled_tool("ffplay")
+
+
+def _popen_kwargs():
+    """Keep ffmpeg/ffplay from flashing a console window on Windows."""
+    if IS_WINDOWS:
+        return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {}
+
+
+def _enable_windows_ansi():
+    """Enable ANSI escape processing and UTF-8 output in the Windows console so
+    color and the block/katakana glyphs render. No-op on other platforms."""
+    if not IS_WINDOWS:
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)            # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # VT processing
+    except Exception:
+        pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+
+def have_ytdlp():
+    """True if yt-dlp is usable, as a library (preferred, bundled) or a CLI."""
+    try:
+        import yt_dlp  # noqa: F401
+        return True
+    except ImportError:
+        return bool(shutil.which("yt-dlp"))
+
+
 def check_deps():
     missing = []
-    if not shutil.which("yt-dlp"):
-        missing.append(("yt-dlp",        "sudo dnf install yt-dlp"))
-    if not shutil.which("ffmpeg"):
-        missing.append(("ffmpeg",        "sudo dnf install ffmpeg"))
+    if find_ffmpeg() is None:
+        missing.append(("ffmpeg", "install ffmpeg, or: pip install imageio-ffmpeg"))
+    if not have_ytdlp():
+        missing.append(("yt-dlp", "pip install yt-dlp (or your package manager)"))
     try:
         import numpy  # noqa: F401
     except ImportError:
-        missing.append(("python3-numpy", "sudo dnf install python3-numpy"))
+        missing.append(("numpy", "pip install numpy"))
     if missing:
         lines = "\n".join(f"  - {n}: {c}" for n, c in missing)
         fail(f"missing dependencies:\n{lines}")
 
 
-def probe(url, max_h):
-    fmt = (f"bestvideo[height<={max_h}][vcodec!=none]+bestaudio[acodec!=none]/"
-           f"best[height<={max_h}]")
+def _probe_info(url, fmt):
+    """Fetch yt-dlp's info dict for `url`, via the Python API when it's
+    importable (the packaged build bundles it), else the yt-dlp CLI."""
+    try:
+        import yt_dlp
+    except ImportError:
+        yt_dlp = None
+    if yt_dlp is not None:
+        opts = {"format": fmt, "quiet": True, "no_warnings": True,
+                "noplaylist": True, "skip_download": True,
+                "extractor_args": {"youtube": {"player_client": YOUTUBE_CLIENTS}}}
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as e:
+            raise ProbeError(f"yt-dlp failed: {e}")
+        if info is None:
+            raise ProbeError("yt-dlp returned no metadata")
+        return info
+    exe = shutil.which("yt-dlp")
+    if not exe:
+        raise ProbeError("yt-dlp not found")
     meta = subprocess.run(
-        ["yt-dlp", "-f", fmt, "-j", "--no-warnings", url],
+        [exe, "-f", fmt, "-j", "--no-warnings", "--no-playlist",
+         "--extractor-args", "youtube:player_client=" + ",".join(YOUTUBE_CLIENTS),
+         url],
         capture_output=True, text=True,
     )
     if meta.returncode != 0:
         raise ProbeError(f"yt-dlp failed:\n{meta.stderr.strip()}")
     try:
-        info = json.loads(meta.stdout.splitlines()[0])
+        return json.loads(meta.stdout.splitlines()[0])
     except (json.JSONDecodeError, IndexError):
         raise ProbeError("yt-dlp returned no metadata")
+
+
+def probe(url, max_h):
+    fmt = (f"bestvideo[height<={max_h}][vcodec!=none]+bestaudio[acodec!=none]/"
+           f"best[height<={max_h}]")
+    info = _probe_info(url, fmt)
 
     # When yt-dlp picks "bestvideo+bestaudio" it lists both in requested_formats;
     # for a single combined format the URL sits at the top level.
@@ -192,6 +346,36 @@ ARROWS = {"A": "up", "B": "down", "C": "right", "D": "left"}
 
 
 def read_keys(fd):
+    """Drain pending keypresses into a list of key names (cross-platform)."""
+    if IS_WINDOWS:
+        return _read_keys_windows()
+    return _read_keys_posix(fd)
+
+
+def _read_keys_windows():
+    keys = []
+    if msvcrt is None:
+        return keys
+    arrows = {"H": "up", "P": "down", "K": "left", "M": "right"}
+    while msvcrt.kbhit():
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):          # arrow / function-key prefix
+            code = msvcrt.getwch()
+            if code in arrows:
+                keys.append(arrows[code])
+            continue
+        if ch == " ":
+            keys.append("space")
+        elif ch in "qQ\x03":
+            keys.append("q")
+        elif ch == "\x1b":
+            keys.append("esc")
+        elif ch.isdigit():
+            keys.append(ch)
+    return keys
+
+
+def _read_keys_posix(fd):
     """Drain any pending key bytes from stdin into a list of key names."""
     keys = []
     while True:
@@ -229,7 +413,7 @@ def read_keys(fd):
 
 # ── Process management for video + audio ──────────────────────────────────────
 def spawn_video(info, fps, ow, oh, pos):
-    cmd = ["ffmpeg", "-loglevel", "quiet"]
+    cmd = [find_ffmpeg(), "-loglevel", "quiet"]
     cmd += RECONNECT_FLAGS
     if pos > 0:
         cmd += ["-ss", f"{pos:.3f}"]
@@ -239,11 +423,11 @@ def spawn_video(info, fps, ow, oh, pos):
         "-vf", f"fps={fps},scale={ow}:{oh}:flags=fast_bilinear",
         "-",
     ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    return subprocess.Popen(cmd, stdout=subprocess.PIPE, **_popen_kwargs())
 
 
 def spawn_audio(info, pos, eight_bit=False):
-    cmd = ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet"]
+    cmd = [find_ffplay(), "-nodisp", "-autoexit", "-loglevel", "quiet"]
     cmd += RECONNECT_FLAGS
     if pos > 0:
         cmd += ["-ss", f"{pos:.3f}"]
@@ -267,6 +451,7 @@ def spawn_audio(info, pos, eight_bit=False):
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        **_popen_kwargs(),
     )
 
 
@@ -293,7 +478,7 @@ def signal_proc(p, sig):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-def main():
+def parse_args():
     p = argparse.ArgumentParser(
         prog="yt-ascii",
         description="Watch YouTube videos as ASCII art in the terminal.",
@@ -307,7 +492,9 @@ def main():
             "  q / Ctrl-C   quit"
         ),
     )
-    p.add_argument("url", help="YouTube URL or video ID")
+    p.add_argument("url", nargs="?",
+                   help="YouTube URL or video ID. Omit it to get a simple "
+                        "interactive prompt where you can paste a link.")
     p.add_argument("--no-color", action="store_true",
                    help="render in grayscale (default is 24-bit color)")
     p.add_argument("--no-audio", action="store_true",
@@ -351,8 +538,41 @@ def main():
     p.add_argument("--palette", choices=PALETTES, default="dense",
                    help="ASCII palette (default: dense, ~70 chars)")
     p.add_argument("--chars", help="custom palette, dark→light")
-    args = p.parse_args()
+    return p.parse_args()
 
+
+def prompt_for_url():
+    """Interactive entry point: show a banner and let the user paste a YouTube
+    link. Used when launched with no URL (e.g. by double-clicking the packaged
+    executable). Returns the link; exits on q / Ctrl-D / Ctrl-C."""
+    cyan, gray, bold, reset = "\x1b[36m", "\x1b[90m", "\x1b[1m", "\x1b[0m"
+    sys.stdout.write(
+        "\x1b[2J\x1b[H"
+        f"{cyan}{bold}"
+        "   +-----------------------------------------------+\n"
+        "   |   yt-ascii  -  YouTube as ASCII in your shell  |\n"
+        "   +-----------------------------------------------+"
+        f"{reset}\n\n"
+        f"{gray}   Paste a YouTube link and press Enter to play it.\n"
+        "   While playing:  space=pause  <-/-> +-5s  up/down +-30s  "
+        "0-9=jump  q=quit\n"
+        "   Run with --help for color / audio / effect options."
+        f"{reset}\n\n"
+    )
+    sys.stdout.flush()
+    while True:
+        try:
+            line = input(f"   {cyan}>{reset} paste link (q to quit): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.stdout.write("\n")
+            sys.exit(0)
+        if line.lower() in ("q", "quit", "exit"):
+            sys.exit(0)
+        if line:
+            return line
+
+
+def run(args):
     half_block = args.pixels and not args.no_color
     # One reveal animation may be active per run (the flags are mutually
     # exclusive); reveal_secs is its fill time, pulled from the matching knob.
@@ -366,7 +586,6 @@ def main():
         reveal_style = None
         reveal_secs = 0.0
 
-    check_deps()
     import numpy as np
 
     chars = args.chars or PALETTES[args.palette]
@@ -400,7 +619,7 @@ def main():
     pix_h = oh * 2 if half_block else oh   # source-pixel height ffmpeg scales to
 
     mode_label = "pixels" if half_block else ("color-chars" if not args.no_color else "gray-chars")
-    audio_enabled = not args.no_audio and bool(shutil.which("ffplay"))
+    audio_enabled = not args.no_audio and bool(find_ffplay())
     audio_label = (
         "8-bit audio" if (audio_enabled and args.eight_bit)
         else ("audio" if audio_enabled else "no audio")
@@ -455,20 +674,32 @@ def main():
         begin_reveal()  # replay the reveal from the new position
 
     def toggle_pause():
-        nonlocal paused, pause_started, seek_at, reveal_start
-        if paused:
-            delta = time.monotonic() - pause_started
-            seek_at += delta
-            if reveal_start is not None:
-                reveal_start += delta  # keep the reveal frozen while paused
-            signal_proc(state["video"], signal.SIGCONT)
-            signal_proc(state["audio"], signal.SIGCONT)
-            paused = False
-        else:
+        nonlocal paused, pause_started, seek_at, reveal_start, seek_pos, frame_no
+        if not paused:
             pause_started = time.monotonic()
-            signal_proc(state["video"], signal.SIGSTOP)
-            signal_proc(state["audio"], signal.SIGSTOP)
+            if _CAN_SUSPEND:
+                signal_proc(state["video"], signal.SIGSTOP)
+                signal_proc(state["audio"], signal.SIGSTOP)
+            else:
+                # No process-suspend (Windows): freeze the clock right here and
+                # stop the decoders; we respawn from this spot on resume.
+                seek_pos = current_pos()
+                seek_at = pause_started     # current_pos() == seek_pos paused
+                stop_all()
             paused = True
+        else:
+            delta = time.monotonic() - pause_started
+            if _CAN_SUSPEND:
+                seek_at += delta
+                if reveal_start is not None:
+                    reveal_start += delta   # keep the reveal frozen while paused
+                signal_proc(state["video"], signal.SIGCONT)
+                signal_proc(state["audio"], signal.SIGCONT)
+            else:
+                start_at(seek_pos)
+                seek_at = time.monotonic()
+                frame_no = 0
+            paused = False
 
     def do_resize():
         """Recompute output size and restart the video decoder in place.
@@ -488,7 +719,7 @@ def main():
         seek_pos = pos
         seek_at = time.monotonic()
         frame_no = 0
-        if paused:
+        if paused and _CAN_SUSPEND:
             pause_started = seek_at
             signal_proc(state["video"], signal.SIGSTOP)
         sys.stdout.write("\x1b[2J\x1b[H")  # clear; old frame had wrong dims
@@ -540,11 +771,11 @@ def main():
     fd = sys.stdin.fileno()
     is_tty = os.isatty(fd)
     old_term = None
-    if is_tty:
+    if is_tty and not IS_WINDOWS:
         try:
             old_term = termios.tcgetattr(fd)
             tty.setcbreak(fd)
-        except termios.error:
+        except Exception:
             is_tty = False
 
     sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")  # hide cursor, clear, home
@@ -800,7 +1031,7 @@ def main():
         pass
     finally:
         stop_all()
-        if is_tty and old_term is not None:
+        if old_term is not None and termios is not None:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
         sys.stdout.write("\x1b[0m\x1b[?25h\n")
         sys.stdout.flush()
@@ -818,6 +1049,19 @@ def build_status(fps, pos, info, cols, paused):
     title = info["title"][:title_room]
     sep = "  " if title else ""
     return f"\x1b[0m{head}{title}{sep}{controls}"
+
+
+def main():
+    _enable_windows_ansi()
+    args = parse_args()
+    check_deps()
+    interactive = args.url is None
+    while True:
+        if interactive:
+            args.url = prompt_for_url()      # exits the program on q / Ctrl-D
+        run(args)
+        if not interactive:
+            return
 
 
 if __name__ == "__main__":
