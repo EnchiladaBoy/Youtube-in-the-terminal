@@ -68,24 +68,60 @@ MAX_FPS = 60
 # stream as genuinely dead and stop.
 MAX_STREAM_RETRIES = 3
 
-# --typewriter: default seconds for the left-to-right / top-to-bottom sweep to
-# progressively unmask the (live, playing) picture. Override with --type-secs.
-REVEAL_SECS = 5.0
+# --scatter: default seconds for the random pop-in reveal to fill the screen.
+# Cells appear one-by-one in a shuffled order — characters spraying in from
+# random spots until the picture is complete — so this wants to be short and
+# snappy ("rapidly", per the effect). The video plays live behind it the whole
+# time. Override with --scatter-secs.
+SCATTER_SECS = 4.0
 
 # --rain: default seconds for the Matrix-style rain reveal to fill the screen.
-# A touch longer than the typewriter because the staggered columns finish over
-# the back half of the window, so a slightly wider window reads better; this
-# also sets how fast the glyphs fall (longer = slower). Override with --rain-secs.
+# The staggered columns finish over the back half of the window, so a slightly
+# wider window reads better; this also sets how fast the glyphs fall (longer =
+# slower). Override with --rain-secs.
 RAIN_SECS = 7.5
 
-# Glyphs the rain is drawn from: digits, half-width katakana (each a single
-# cell wide, so columns stay aligned) and a few symbols. A fresh glyph is picked
-# per cell each frame so the falling streaks shimmer like Matrix "digital rain".
-RAIN_GLYPHS = (
-    "0123456789"
-    "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ"
-    ":.=+*<>|/"
-)
+# Glyph sets the --rain reveal can draw from, selected with --rain-chars. A fresh
+# glyph is picked per cell each frame so the streaks shimmer like Matrix "digital
+# rain". Every glyph MUST be a single terminal cell wide or the columns drift, so
+# these are limited to single-width, left-to-right, non-combining scripts. That
+# rules out double-width CJK (Han + full-width kana/Hangul) and RTL/combining
+# scripts (Arabic, Hebrew, Thai, Devanagari…) — they'd ripple the columns. Korean
+# and Japanese therefore use their HALF-width forms (jamo / katakana). Greek and
+# Cyrillic are East-Asian-"ambiguous" width: one cell in a normal terminal, two
+# only in a CJK locale set to ambiguous=wide. `matrix` is the default; `polyglot`
+# mixes every aligned script (letters), and `all` is the whole alphabet — every
+# preset unioned, symbols included. --rain-chars also takes a literal custom
+# string, so the presets are just convenient names.
+def _chars(*ranges):
+    """Expand (lo, hi) inclusive Unicode codepoint ranges into a glyph string."""
+    return "".join(chr(cp) for lo, hi in ranges for cp in range(lo, hi + 1))
+
+_DIGITS   = "0123456789"
+_LATIN    = _chars((0x41, 0x5A), (0x61, 0x7A))                # A-Z a-z
+_KATAKANA = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ"   # half-width
+_CYRILLIC = _chars((0x410, 0x44F))                           # А-я  (Russian)
+_GREEK    = _chars((0x391, 0x3A1), (0x3A3, 0x3A9), (0x3B1, 0x3C9))  # Α-Ω α-ω (3A2 reserved)
+_ARMENIAN = _chars((0x531, 0x556), (0x561, 0x586))           # Ա-Ֆ ա-ֆ
+_GEORGIAN = _chars((0x10D0, 0x10F0))                         # ა-ჰ  (Mkhedruli)
+_HANGUL   = _chars((0xFFA1, 0xFFBE), (0xFFC2, 0xFFC7),       # half-width jamo
+                   (0xFFCA, 0xFFCF), (0xFFD2, 0xFFD7), (0xFFDA, 0xFFDC))
+
+RAIN_CHARSETS = {
+    "matrix":   _DIGITS + _KATAKANA + ":.=+*<>|/",
+    "katakana": _KATAKANA,
+    "english":  _LATIN + _DIGITS,
+    "russian":  _CYRILLIC,
+    "greek":    _GREEK,
+    "armenian": _ARMENIAN,
+    "georgian": _GEORGIAN,
+    "korean":   _HANGUL,
+    "polyglot": (_LATIN + _CYRILLIC + _GREEK + _ARMENIAN + _GEORGIAN
+                 + _KATAKANA + _HANGUL + _DIGITS),
+}
+# `all` = the entire rain alphabet: every glyph from every preset above, deduped.
+RAIN_CHARSETS["all"] = "".join(sorted(set("".join(RAIN_CHARSETS.values()))))
+DEFAULT_RAIN_CHARS = "matrix"
 
 # Let ffmpeg/ffplay ride out transient googlevideo failures — expired URL
 # segments, 403/5xx throttling, TCP/TLS resets — instead of exiting, which
@@ -511,21 +547,26 @@ def parse_args():
                         "giving 2x vertical resolution and a sharper image. "
                         "Ignored when --no-color is set.")
     reveal = p.add_mutually_exclusive_group()
-    reveal.add_argument("--typewriter", action="store_true",
-                        help="reveal the picture with a slow left-to-right, "
-                             "top-to-bottom sweep while it plays (re-sweeps "
-                             "after each seek)")
+    reveal.add_argument("--scatter", action="store_true",
+                        help="reveal the picture with a random pop-in: ASCII "
+                             "characters appear one-by-one from random positions, "
+                             "rapidly filling the screen (re-scatters after each "
+                             "seek)")
     reveal.add_argument("--rain", action="store_true",
                         help="reveal the picture with a Matrix-style rain: "
                              "white glyphs cascade down each column and the "
                              "live picture settles in behind them (re-rains "
                              "after each seek)")
-    p.add_argument("--type-secs", type=float, default=REVEAL_SECS, metavar="S",
-                   help=f"seconds for the --typewriter sweep to fill the "
-                        f"screen (default: {REVEAL_SECS:g})")
+    p.add_argument("--scatter-secs", type=float, default=SCATTER_SECS, metavar="S",
+                   help=f"seconds for the --scatter reveal to fill the "
+                        f"screen (default: {SCATTER_SECS:g})")
     p.add_argument("--rain-secs", type=float, default=RAIN_SECS, metavar="S",
                    help=f"seconds for the --rain reveal to fill the screen "
                         f"(default: {RAIN_SECS:g})")
+    p.add_argument("--rain-chars", default=DEFAULT_RAIN_CHARS, metavar="SET",
+                   help=f"glyphs for the --rain reveal: a preset "
+                        f"({', '.join(RAIN_CHARSETS)}) or a custom string of "
+                        f"glyphs to fall (default: {DEFAULT_RAIN_CHARS})")
     p.add_argument("--fps", type=fps_type, default=30, metavar="N",
                    help=f"target frame rate (default: 30, max: {MAX_FPS}). "
                         f"Pass '--fps max' to request the cap. Values above "
@@ -582,9 +623,9 @@ def run(args):
     if args.rain:
         reveal_style = "rain"
         reveal_secs = max(0.1, args.rain_secs)
-    elif args.typewriter:
-        reveal_style = "typewriter"
-        reveal_secs = max(0.1, args.type_secs)
+    elif args.scatter:
+        reveal_style = "scatter"
+        reveal_secs = max(0.1, args.scatter_secs)
     else:
         reveal_style = None
         reveal_secs = 0.0
@@ -728,8 +769,8 @@ def run(args):
         sys.stdout.write("\x1b[2J\x1b[H")  # clear; old frame had wrong dims
         sys.stdout.flush()
         # A reveal in progress just continues at the new size: its progress is
-        # wall-clock based, so the typewriter mask repaints against the new dims
-        # and the rain reshuffles its columns to the new width on the next frame.
+        # wall-clock based, so the scatter mask reshuffles to the new dims and
+        # the rain reshuffles its columns to the new width on the next frame.
 
     retry = {"n": 0, "pos": -1.0}
     def recover_stream():
@@ -791,9 +832,15 @@ def run(args):
 
     # --rain state. `rng` seeds a fresh pattern each reveal; rain_state caches
     # the per-column fall timings, regenerated whenever the width changes.
-    rain_glyphs = np.array(list(RAIN_GLYPHS), dtype="U1")
+    # The glyph set comes from --rain-chars: a preset name or a literal string.
+    rain_chars = RAIN_CHARSETS.get(args.rain_chars, args.rain_chars)
+    if not rain_chars:
+        fail("--rain-chars must be a preset "
+             f"({', '.join(RAIN_CHARSETS)}) or a non-empty string of glyphs")
+    rain_glyphs = np.array(list(rain_chars), dtype="U1")
     np_rng = np.random.default_rng()
     rain_state = {"cols": 0}
+    scatter_state = {"cols": 0, "rows": 0}   # cached --scatter cell-reveal order
 
     def cells_half(frame_):
         # frame_ shape: (2*oh, ow, 3). Pair rows: even=top fg, odd=bottom bg.
@@ -863,26 +910,32 @@ def run(args):
         reveal_start = None
         if reveal_style:
             rain_state["cols"] = 0   # reshuffle the rain columns for this segment
+            scatter_state["cols"] = 0   # reshuffle the pop-in order for this segment
             sys.stdout.write("\x1b[2J\x1b[H")
             sys.stdout.flush()
 
-    def render_revealed(frame_, frac):
-        """Render only the top-left fraction `frac` of the frame's cells in
-        row-major order (full rows, then a partial row, then blank rows), so
-        the live picture is progressively unmasked left-to-right, top-to-bottom."""
-        grid = frame_cells(frame_)
+    def render_scatter(frame_, frac):
+        """--scatter reveal: pop the picture's cells in one-by-one in a shuffled
+        order, so characters appear from random positions and rapidly fill the
+        screen. `frac` is the segment's linear 0..1 time progress; the first
+        `frac` share of a cached random permutation is shown, the rest left blank.
+        A fresh permutation is rolled per segment (and on resize)."""
+        grid = frame_cells(frame_)              # settled image cells, (nrows, ncols)
         nrows, ncols = grid.shape
-        shown = max(0, min(nrows * ncols, int(round(nrows * ncols * frac))))
-        full, partial = divmod(shown, ncols)
-        lines = []
-        for r in range(nrows):
-            if r < full:
-                lines.append("".join(grid[r].tolist()) + row_suffix)
-            elif r == full and partial:
-                lines.append("".join(grid[r, :partial].tolist()) + row_suffix)
-            else:
-                lines.append(row_suffix)  # below the sweep: blank/cleared
-        return "\n".join(lines)
+        total = nrows * ncols
+        # Cache a random reveal order as a per-cell rank in [0, total): a cell is
+        # shown once `rank < shown`. Regenerated on the first frame of a reveal
+        # (begin_reveal zeroes "cols") and after a resize.
+        if scatter_state["cols"] != ncols or scatter_state["rows"] != nrows:
+            rank = np.empty(total, dtype=np.int64)
+            rank[np_rng.permutation(total)] = np.arange(total)
+            scatter_state.update(rows=nrows, cols=ncols,
+                                 rank=rank.reshape(nrows, ncols))
+        shown = max(0, min(total, int(round(total * frac))))
+        reset = "\x1b[0m"
+        pre = reset if half_block else ""       # half-block sets a bg; clear it first
+        out = np.where(scatter_state["rank"] < shown, grid, pre + " ")
+        return "\n".join("".join(row.tolist()) + row_suffix for row in out)
 
     def render_rain(frame_, frac):
         """Matrix-style reveal. White glyphs cascade down each column and the
@@ -1016,7 +1069,7 @@ def run(args):
                 frac = 1.0
             if frac < 1.0:
                 body = (render_rain(frame, frac) if reveal_style == "rain"
-                        else render_revealed(frame, frac))
+                        else render_scatter(frame, frac))
             else:
                 body = render_half(frame) if half_block else render_chars(frame)
 

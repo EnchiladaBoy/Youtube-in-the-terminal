@@ -54,7 +54,8 @@ the `YTASCII_FFMPEG` / `YTASCII_FFPLAY` environment variables.
 ## Options
 
 `--no-color`, `--no-audio`, `--8bit` (chiptune audio), `--pixels` (half-block,
-2× vertical resolution), `--typewriter` / `--rain` (reveal effects), `--fps`,
+2× vertical resolution), `--scatter` / `--rain` (reveal effects), `--rain-chars`
+(rain glyph set), `--fps`,
 `--width` / `--height`, `--max-res`, `--palette`, `--chars`. See
 `yt-ascii --help` for the full list.
 
