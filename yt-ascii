@@ -109,9 +109,12 @@ RECONNECT_FLAGS = [
 # yt-dlp player clients to try (in order) when resolving YouTube streams.
 # YouTube increasingly bot-checks the default web client from datacenter/VM IPs
 # ("Sign in to confirm you're not a bot"); the android_vr client sidesteps that
-# and rarely needs sign-in, with web/ios as fallbacks for videos it can't serve.
-# yt-dlp merges the formats found across all listed clients.
-YOUTUBE_CLIENTS = ["android_vr", "web", "ios"]
+# and rarely needs sign-in. Plain `android` is kept alongside it because some
+# studio / DRM-gated uploads (e.g. Apple TV+ or Paramount clips) report "This
+# video is not available" to android_vr/web/ios yet still serve a plain
+# progressive stream to the `android` client. web/ios remain last-resort
+# fallbacks. yt-dlp merges the formats found across all listed clients.
+YOUTUBE_CLIENTS = ["android_vr", "android", "web", "ios"]
 
 
 class ProbeError(Exception):
