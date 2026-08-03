@@ -11,10 +11,9 @@ Keys (while playing):
     0..9         jump to 0%..90% of the video
     q / Ctrl-C   quit
 
-Needs numpy, plus ffmpeg and yt-dlp. The packaged executable bundles all of
-them (ffmpeg via imageio-ffmpeg, yt-dlp as a library), so a standalone build
-plays video with nothing else installed; audio additionally wants ffplay on
-PATH. Runs on Linux, macOS and Windows.
+Needs NumPy and yt-dlp. The supported installer supplies those plus an FFmpeg
+fallback through imageio-ffmpeg in a private environment; audio additionally
+wants ffplay on PATH. Runs on Linux, macOS and Windows.
 """
 from __future__ import annotations
 
@@ -22,11 +21,20 @@ import argparse
 import functools
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
 import sys
 import time
+
+
+APP_VERSION = "0.3.0"
+INSTALL_REF_ENV = "YTASCII_INSTALL_REF"
+_MAX_INSTALL_REF_LENGTH = 64
+_VERSION_REF_RE = re.compile(
+    r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
+)
 
 # Single-key terminal input is POSIX-only (termios/tty + select on stdin). On
 # Windows we read the console through msvcrt instead; if neither is available
@@ -494,17 +502,58 @@ def spawn_audio(info, pos, eight_bit=False):
     )
 
 
-def stop_proc(p):
-    if p is None:
-        return
-    try:
-        p.terminate()
-        p.wait(timeout=1)
-    except Exception:
+def stop_procs(*processes):
+    """Resume, terminate and reap children against one shared deadline.
+
+    A SIGTERM remains pending while a POSIX child is SIGSTOP'd, so seeking or
+    quitting from pause used to wait one second per decoder before killing it.
+    Resuming every live child first and terminating the group before waiting
+    makes teardown both quick and bounded.
+    """
+    live = []
+    for process in processes:
+        if process is None:
+            continue
         try:
-            p.kill()
-        except Exception:
+            if process.poll() is None:
+                live.append(process)
+        except (AttributeError, OSError):
+            live.append(process)
+    if not live:
+        return
+
+    if _CAN_SUSPEND:
+        for process in live:
+            signal_proc(process, signal.SIGCONT)
+    for process in live:
+        try:
+            process.terminate()
+        except OSError:
             pass
+
+    deadline = time.monotonic() + 1.0
+    survivors = []
+    for process in live:
+        try:
+            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        except (OSError, subprocess.TimeoutExpired):
+            survivors.append(process)
+    for process in survivors:
+        try:
+            process.kill()
+        except OSError:
+            pass
+    # Always reap killed children; keep this cleanup bounded as well.
+    reap_deadline = time.monotonic() + 0.25
+    for process in survivors:
+        try:
+            process.wait(timeout=max(0.0, reap_deadline - time.monotonic()))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def stop_proc(process):
+    stop_procs(process)
 
 
 def signal_proc(p, sig):
@@ -512,11 +561,72 @@ def signal_proc(p, sig):
         return
     try:
         os.kill(p.pid, sig)
-    except ProcessLookupError:
+    except OSError:
         pass
 
 
+def read_exact_into(stream, buffer):
+    """Fill ``buffer`` from a binary stream, tolerating short reads.
+
+    Returns the number of bytes copied. A result smaller than ``len(buffer)``
+    means EOF. The caller owns the reusable bytearray, so successful reads do
+    not allocate a new frame-sized ``bytes`` object.
+    """
+    view = memoryview(buffer)
+    offset = 0
+    while offset < len(view):
+        count = stream.readinto(view[offset:])
+        if not count:
+            break
+        offset += count
+    return offset
+
+
+def discard_frames(stream, count, scratch):
+    """Drain at most ``count`` complete frames using one bounded buffer."""
+    complete = 0
+    for _ in range(count):
+        if read_exact_into(stream, scratch) != len(scratch):
+            break
+        complete += 1
+    return complete
+
+
+def write_terminal_frame(body, status):
+    """Write one already-composed UTF-8 frame, with a text-stream fallback."""
+    payload = b"".join(
+        (b"\x1b[H", body, b"\n", status.encode("utf-8"), b"\x1b[K")
+    )
+    binary = getattr(sys.stdout, "buffer", None)
+    if binary is None:
+        sys.stdout.write(payload.decode("utf-8"))
+        sys.stdout.flush()
+        return
+    binary.write(payload)
+    binary.flush()
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
+def version_text():
+    """Return the public version plus trusted installer provenance.
+
+    Install launchers may identify either an immutable ``vX.Y.Z`` source ref
+    or the rolling ``edge`` channel. Any other environment value is ignored so
+    control characters and unbounded text can never reach the terminal.
+    """
+    install_ref = os.environ.get(INSTALL_REF_ENV, "")
+    valid_ref = (
+        len(install_ref) <= _MAX_INSTALL_REF_LENGTH
+        and (
+            install_ref == "edge"
+            or _VERSION_REF_RE.fullmatch(install_ref) is not None
+        )
+    )
+    if not valid_ref:
+        install_ref = "source"
+    return f"yt-ascii {APP_VERSION} ({install_ref})"
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         prog="yt-ascii",
@@ -531,6 +641,7 @@ def parse_args():
             "  q / Ctrl-C   quit"
         ),
     )
+    p.add_argument("--version", action="version", version=version_text())
     p.add_argument("url", nargs="?",
                    help="YouTube URL or video ID. Omit it to get a simple "
                         "interactive prompt where you can paste a link.")
@@ -582,6 +693,7 @@ def parse_args():
     p.add_argument("--palette", choices=PALETTES, default="dense",
                    help="ASCII palette (default: dense, ~70 chars)")
     p.add_argument("--chars", help="custom palette, dark→light")
+    p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
 
 
@@ -618,6 +730,7 @@ def prompt_for_url():
 
 def run(args):
     half_block = args.pixels and not args.no_color
+    color = not args.no_color
     # One reveal animation may be active per run (the flags are mutually
     # exclusive); reveal_secs is its fill time, pulled from the matching knob.
     if args.rain:
@@ -631,11 +744,13 @@ def run(args):
         reveal_secs = 0.0
 
     import numpy as np
+    from yt_ascii_renderer import AnsiRenderer
 
     chars = args.chars or PALETTES[args.palette]
     if not chars:
         fail("palette must be non-empty")
-    palette = np.array(list(chars), dtype="U1")
+    if "\x00" in chars:
+        fail("palette cannot contain NUL")
 
     sys.stderr.write("Resolving stream…\n")
     try:
@@ -700,8 +815,8 @@ def run(args):
             state["audio"] = spawn_audio(info, pos, args.eight_bit)
 
     def stop_all():
-        stop_proc(state["video"]); state["video"] = None
-        stop_proc(state["audio"]); state["audio"] = None
+        stop_procs(state["video"], state["audio"])
+        state["video"] = state["audio"] = None
 
     def seek_to(new_pos):
         nonlocal seek_pos, seek_at, frame_no, paused
@@ -733,10 +848,10 @@ def run(args):
             paused = True
         else:
             delta = time.monotonic() - pause_started
+            if reveal_start is not None:
+                reveal_start += delta       # keep the reveal frozen while paused
             if _CAN_SUSPEND:
                 seek_at += delta
-                if reveal_start is not None:
-                    reveal_start += delta   # keep the reveal frozen while paused
                 signal_proc(state["video"], signal.SIGCONT)
                 signal_proc(state["audio"], signal.SIGCONT)
             else:
@@ -749,23 +864,36 @@ def run(args):
         """Recompute output size and restart the video decoder in place.
         Audio is left running so there's no audible gap on resize."""
         nonlocal cols, rows, ow, oh, pix_h, frame_size
+        nonlocal frame_buffer, discard_buffer, reveal_start
         nonlocal seek_pos, seek_at, frame_no, pause_started
         new_cols, new_rows, new_ow, new_oh = compute_dims()
         if (new_ow, new_oh, new_cols) == (ow, oh, cols):
             return
+        resize_at = time.monotonic()
         pos = current_pos()
+        if paused and reveal_start is not None:
+            # Account for the paused interval before resetting pause_started;
+            # resume will add the remainder after this resize.
+            reveal_start += resize_at - pause_started
         cols, rows = new_cols, new_rows
         ow, oh = new_ow, new_oh
         pix_h = oh * 2 if half_block else oh
-        frame_size = ow * pix_h * 3
+        frame_size = ow * pix_h * channels
+        frame_buffer = bytearray(frame_size)
+        discard_buffer = bytearray(frame_size)
         stop_proc(state["video"])
-        state["video"] = spawn_video(info, args.fps, ow, pix_h, pos)
+        state["video"] = None
+        # Windows pause stops the decoders instead of suspending them. Do not
+        # spawn a decoder during a paused resize; resume will start exactly one.
+        if not paused or _CAN_SUSPEND:
+            state["video"] = spawn_video(info, args.fps, ow, pix_h, pos)
         seek_pos = pos
-        seek_at = time.monotonic()
+        seek_at = resize_at
         frame_no = 0
-        if paused and _CAN_SUSPEND:
-            pause_started = seek_at
-            signal_proc(state["video"], signal.SIGSTOP)
+        if paused:
+            pause_started = resize_at
+            if _CAN_SUSPEND:
+                signal_proc(state["video"], signal.SIGSTOP)
         sys.stdout.write("\x1b[2J\x1b[H")  # clear; old frame had wrong dims
         sys.stdout.flush()
         # A reveal in progress just continues at the new size: its progress is
@@ -825,82 +953,24 @@ def run(args):
     sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")  # hide cursor, clear, home
     sys.stdout.flush()
 
-    color = not args.no_color
-    n_pal = palette.size - 1
     frame_dur = 1.0 / args.fps
-    frame_size = ow * pix_h * 3
+    channels = 3
+    frame_size = ow * pix_h * channels
+    frame_buffer = bytearray(frame_size)
+    discard_buffer = bytearray(frame_size)
 
-    # --rain state. `rng` seeds a fresh pattern each reveal; rain_state caches
-    # the per-column fall timings, regenerated whenever the width changes.
-    # The glyph set comes from --rain-chars: a preset name or a literal string.
     rain_chars = RAIN_CHARSETS.get(args.rain_chars, args.rain_chars)
     if not rain_chars:
         fail("--rain-chars must be a preset "
              f"({', '.join(RAIN_CHARSETS)}) or a non-empty string of glyphs")
-    rain_glyphs = np.array(list(rain_chars), dtype="U1")
-    np_rng = np.random.default_rng()
-    rain_state = {"cols": 0}
-    scatter_state = {"cols": 0, "rows": 0}   # cached --scatter cell-reveal order
-
-    def cells_half(frame_):
-        # frame_ shape: (2*oh, ow, 3). Pair rows: even=top fg, odd=bottom bg.
-        # Returns a 2-D (oh × ow) array of per-cell strings.
-        top = frame_[0::2]
-        bot = frame_[1::2]
-        tr = top[:, :, 0].astype("U3")
-        tg = top[:, :, 1].astype("U3")
-        tb = top[:, :, 2].astype("U3")
-        br = bot[:, :, 0].astype("U3")
-        bgc = bot[:, :, 1].astype("U3")
-        bb = bot[:, :, 2].astype("U3")
-        out = np.char.add("\x1b[38;2;", tr)
-        out = np.char.add(out, ";")
-        out = np.char.add(out, tg)
-        out = np.char.add(out, ";")
-        out = np.char.add(out, tb)
-        out = np.char.add(out, "m\x1b[48;2;")
-        out = np.char.add(out, br)
-        out = np.char.add(out, ";")
-        out = np.char.add(out, bgc)
-        out = np.char.add(out, ";")
-        out = np.char.add(out, bb)
-        out = np.char.add(out, "m▀")
-        return out
-
-    def cells_chars(frame_):
-        # frame_ shape: (oh, ow, 3) — classic ASCII palette render.
-        # Returns a 2-D (oh × ow) array of per-cell strings.
-        lum = (0.299 * frame_[:, :, 0] +
-               0.587 * frame_[:, :, 1] +
-               0.114 * frame_[:, :, 2]).astype(np.int32)
-        idx = (lum * n_pal) // 255
-        cells = palette[idx]
-        if not color:
-            return cells
-        r = frame_[:, :, 0].astype("U3")
-        g = frame_[:, :, 1].astype("U3")
-        b = frame_[:, :, 2].astype("U3")
-        esc = np.char.add("\x1b[38;2;", r)
-        esc = np.char.add(esc, ";")
-        esc = np.char.add(esc, g)
-        esc = np.char.add(esc, ";")
-        esc = np.char.add(esc, b)
-        esc = np.char.add(esc, "m")
-        esc = np.char.add(esc, cells)
-        return esc
-
-    # Trailing reset+clear for each rendered row: color modes need the reset so
-    # a row's last color doesn't bleed; gray needs only the clear-to-EOL.
-    row_suffix = "\x1b[0m\x1b[K" if (half_block or color) else "\x1b[K"
-
-    def frame_cells(frame_):
-        return cells_half(frame_) if half_block else cells_chars(frame_)
-
-    def render_half(frame_):
-        return "\n".join("".join(row) + row_suffix for row in cells_half(frame_))
-
-    def render_chars(frame_):
-        return "\n".join("".join(row) + row_suffix for row in cells_chars(frame_))
+    if "\x00" in rain_chars:
+        fail("--rain-chars cannot contain NUL")
+    renderer = AnsiRenderer(
+        chars,
+        color=color,
+        half_block=half_block,
+        rain_chars=rain_chars,
+    )
 
     def begin_reveal():
         """Start (or restart, after a seek) the current reveal animation: clear
@@ -909,86 +979,9 @@ def run(args):
         nonlocal reveal_start
         reveal_start = None
         if reveal_style:
-            rain_state["cols"] = 0   # reshuffle the rain columns for this segment
-            scatter_state["cols"] = 0   # reshuffle the pop-in order for this segment
+            renderer.reset_reveal()
             sys.stdout.write("\x1b[2J\x1b[H")
             sys.stdout.flush()
-
-    def render_scatter(frame_, frac):
-        """--scatter reveal: pop the picture's cells in one-by-one in a shuffled
-        order, so characters appear from random positions and rapidly fill the
-        screen. `frac` is the segment's linear 0..1 time progress; the first
-        `frac` share of a cached random permutation is shown, the rest left blank.
-        A fresh permutation is rolled per segment (and on resize)."""
-        grid = frame_cells(frame_)              # settled image cells, (nrows, ncols)
-        nrows, ncols = grid.shape
-        total = nrows * ncols
-        # Cache a random reveal order as a per-cell rank in [0, total): a cell is
-        # shown once `rank < shown`. Regenerated on the first frame of a reveal
-        # (begin_reveal zeroes "cols") and after a resize.
-        if scatter_state["cols"] != ncols or scatter_state["rows"] != nrows:
-            rank = np.empty(total, dtype=np.int64)
-            rank[np_rng.permutation(total)] = np.arange(total)
-            scatter_state.update(rows=nrows, cols=ncols,
-                                 rank=rank.reshape(nrows, ncols))
-        shown = max(0, min(total, int(round(total * frac))))
-        reset = "\x1b[0m"
-        pre = reset if half_block else ""       # half-block sets a bg; clear it first
-        out = np.where(scatter_state["rank"] < shown, grid, pre + " ")
-        return "\n".join("".join(row.tolist()) + row_suffix for row in out)
-
-    def render_rain(frame_, frac):
-        """Matrix-style reveal. White glyphs cascade down each column and the
-        live picture settles in behind the falling head, so the image builds top
-        to bottom with a ragged, rain-like front. Columns start at staggered
-        times and fall at varied speeds, but every column reaches the bottom by
-        frac == 1.0 — when the caller switches to the plain render, so the hand-
-        off is seamless. `frac` is the segment's global 0..1 reveal progress."""
-        grid = frame_cells(frame_)              # settled image cells, (nrows, ncols)
-        nrows, ncols = grid.shape
-
-        # (Re)generate per-column fall timings whenever the width changes: the
-        # first frame of a reveal (begin_reveal zeroes "cols") or after a resize.
-        # `dur` is each column's fall time as a fraction of the window; `off` is
-        # its start time, drawn so the fall still completes by frac == 1.0.
-        if rain_state["cols"] != ncols:
-            dur = np_rng.uniform(0.45, 0.8, ncols)
-            off = np_rng.uniform(0.0, 1.0 - dur)
-            rain_state.update(cols=ncols, dur=dur, off=off)
-
-        trail = max(3, min(10, nrows // 6))
-        # Column progress 0..1 → head row. The head travels one extra `trail`
-        # past the last row so the tail also clears the bottom before the hand-
-        # off (no green glyphs left behind when we switch to the plain render).
-        p = np.clip((frac - rain_state["off"]) / rain_state["dur"], 0.0, 1.0)
-        front = p * (nrows + trail)                       # (ncols,)
-
-        rows = np.arange(nrows)[:, None]                  # (nrows, 1)
-        dist = front[None, :] - rows         # rows above the head are positive
-        settled = dist >= trail              # picture has set here
-        # glowing tail behind the head, but only for columns that have started
-        in_trail = (dist >= 0) & (dist < trail) & (front > 0.0)[None, :]
-        reset = "\x1b[0m"
-        pre = reset if half_block else ""    # half-block sets a bg; clear it first
-        out = np.where(settled, grid, pre + " ")          # image, else blank
-
-        if in_trail.any():
-            glyph = rain_glyphs[np_rng.integers(0, rain_glyphs.size,
-                                                size=(nrows, ncols))]
-            t = np.clip(dist / trail, 0.0, 1.0)           # 0 at head → 1 at tail end
-            # White rain: a bright white head fading to dim gray down the tail.
-            v = (255 - 200 * t).astype(int).astype("U3")
-            esc = np.char.add(pre + "\x1b[38;2;", v)
-            esc = np.char.add(esc, ";")
-            esc = np.char.add(esc, v)
-            esc = np.char.add(esc, ";")
-            esc = np.char.add(esc, v)
-            esc = np.char.add(esc, "m")
-            cell = np.char.add(esc, glyph)
-            cell = np.char.add(cell, reset)               # don't bleed the tint onward
-            out = np.where(in_trail, cell, out)
-
-        return "\n".join("".join(row.tolist()) + row_suffix for row in out)
 
     start_at(0.0)
     seek_at = time.monotonic()  # pace from first-frame time, not probe time
@@ -1042,20 +1035,23 @@ def run(args):
             target = int(seg_elapsed * args.fps)
             if frame_no < target - 1:
                 skip = target - frame_no - 1
-                skipped = state["video"].stdout.read(frame_size * skip)
-                if len(skipped) < frame_size * skip:
+                dropped = discard_frames(
+                    state["video"].stdout, skip, discard_buffer
+                )
+                frame_no += dropped
+                if dropped != skip:
                     if recover_stream():
                         continue
                     break
-                frame_no += skip
 
-            data = state["video"].stdout.read(frame_size)
-            if len(data) < frame_size:
+            received = read_exact_into(state["video"].stdout, frame_buffer)
+            if received != frame_size:
                 if recover_stream():
                     continue
                 break
 
-            frame = np.frombuffer(data, dtype=np.uint8).reshape(pix_h, ow, 3)
+            frame = np.frombuffer(frame_buffer, dtype=np.uint8)
+            frame = frame.reshape(pix_h, ow, 3)
 
             # Reveal animations unmask the live frame over `reveal_secs`, timed
             # from the first frame actually shown (so a slow stream connect
@@ -1068,16 +1064,18 @@ def run(args):
             else:
                 frac = 1.0
             if frac < 1.0:
-                body = (render_rain(frame, frac) if reveal_style == "rain"
-                        else render_scatter(frame, frac))
+                body = (
+                    renderer.render_rain(frame, frac)
+                    if reveal_style == "rain"
+                    else renderer.render_scatter(frame, frac)
+                )
             else:
-                body = render_half(frame) if half_block else render_chars(frame)
+                body = renderer.render(frame)
 
             pos = seek_pos + seg_elapsed
             status = build_status(args.fps, pos, info, cols, paused=False)
 
-            sys.stdout.write("\x1b[H" + body + "\n" + status + "\x1b[K")
-            sys.stdout.flush()
+            write_terminal_frame(body, status)
 
             frame_no += 1
             delay = (seek_at + frame_no * frame_dur) - time.monotonic()
@@ -1107,10 +1105,25 @@ def build_status(fps, pos, info, cols, paused):
     return f"\x1b[0m{head}{title}{sep}{controls}"
 
 
+def self_test():
+    """Exercise bundled NumPy and the renderer without network access."""
+    import numpy as np
+    from yt_ascii_renderer import AnsiRenderer
+
+    frame = np.array([[[1, 2, 3]]], dtype=np.uint8)
+    expected = b"\x1b[38;2;1;2;3mx\x1b[0m\x1b[K"
+    if AnsiRenderer("x").render(frame) != expected:
+        fail("renderer self-test failed")
+    sys.stdout.write("yt-ascii self-test: ok\n")
+
+
 def main():
     _enable_windows_ansi()
     args = parse_args()
     check_deps()
+    if args.self_test:
+        self_test()
+        return
     interactive = args.url is None
     while True:
         if interactive:

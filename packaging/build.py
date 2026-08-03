@@ -42,6 +42,9 @@ def main():
         "--console",
         "--clean",
         "--noconfirm",
+        # The executable entry is copied under build/, while the importable
+        # renderer module stays at the repository root.
+        "--paths", str(ROOT),
         # Pull in everything these packages need at runtime (yt-dlp's lazily
         # imported extractors, the bundled ffmpeg binary, CA certificates).
         "--collect-all", "yt_dlp",

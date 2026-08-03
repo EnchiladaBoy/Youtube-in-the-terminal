@@ -1,19 +1,22 @@
-name: build
+name: source tests
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
-# Cancel an in-progress run for the same ref when a new commit/tag is pushed, so
-# a stuck or superseded job (e.g. a queue-starved runner) doesn't pile up.
+permissions:
+  contents: read
+
+# Cancel an in-progress run for the same ref when a newer commit arrives.
 concurrency:
-  group: build-${{ github.ref }}
+  group: source-tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
+  test:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -21,59 +24,82 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            label: linux-x86_64
-            asset: yt-ascii-linux-x86_64
+            python: "3.10"
+            label: linux / Python 3.10
+          - os: ubuntu-latest
+            python: "3.12"
+            label: linux / Python 3.12
           - os: macos-14
-            label: macos-arm64
-            asset: yt-ascii-macos-arm64
+            python: "3.12"
+            label: macOS arm64 / Python 3.12
           - os: windows-latest
-            label: windows-x86_64
-            asset: yt-ascii-windows-x86_64.exe
+            python: "3.12"
+            label: Windows / Python 3.12
+
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements.txt
 
-      - name: Install build dependencies
-        run: python -m pip install --upgrade pip -r requirements-build.txt
+      - name: Install source dependencies
+        run: python -m pip install --upgrade pip -r requirements.txt
 
-      - name: Build executable
-        run: python packaging/build.py
+      - name: Test source and installer
+        run: python -m unittest discover -s tests -v
 
-      - name: Stage artifact (Unix)
+      - name: Smoke test source entry point
+        run: python yt-ascii --self-test
+
+      - name: Test streamed bootstrap (Unix)
         if: runner.os != 'Windows'
-        run: |
-          mkdir -p out
-          cp dist/yt-ascii "out/${{ matrix.asset }}"
-          chmod +x "out/${{ matrix.asset }}"
+        shell: bash
+        run: python - --source-dir . --no-modify-path < install.py
 
-      - name: Stage artifact (Windows)
+      - name: Test streamed bootstrap (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Get-Content -Raw install.py | py -3 - --source-dir . --no-modify-path
+
+      - name: Test installed launcher (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="$(python -c "import runpy; print(runpy.run_path('yt-ascii', run_name='version_check')['APP_VERSION'])")"
+          test "$(~/.local/bin/yt-ascii --version)" = "yt-ascii ${version} (source)"
+
+      - name: Test installed launcher (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path out | Out-Null
-          Copy-Item dist/yt-ascii.exe "out/${{ matrix.asset }}"
+          $actual = & "$env:LOCALAPPDATA\Programs\yt-ascii\bin\yt-ascii.cmd" --version
+          $version = python -c "import runpy; print(runpy.run_path('yt-ascii', run_name='version_check')['APP_VERSION'])"
+          $expected = "yt-ascii $version (source)"
+          if ($actual -ne $expected) {
+            throw "unexpected version output: $actual"
+          }
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.asset }}
-          path: out/${{ matrix.asset }}
+      - name: Test uninstaller
+        run: python install.py --uninstall
 
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
+      - name: Validate stable tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: >-
+          python -c "import os, runpy;
+          expected = 'v' + runpy.run_path('yt-ascii', run_name='tag_check')['APP_VERSION'];
+          actual = os.environ['GITHUB_REF_NAME'];
+          assert actual == expected, f'tag {actual} != application version {expected}'"
 
-      - name: Publish release with binaries
-        uses: softprops/action-gh-release@v2
-        with:
-          files: artifacts/**/*
-          generate_release_notes: true
+      - name: Test tagged archive bootstrap
+        if: >-
+          startsWith(github.ref, 'refs/tags/') &&
+          matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        shell: bash
+        run: |
+          python install.py --version "${{ github.ref_name }}" --no-modify-path
+          version="$(python -c "import runpy; print(runpy.run_path('yt-ascii', run_name='version_check')['APP_VERSION'])")"
+          test "$(~/.local/bin/yt-ascii --version)" = "yt-ascii ${version} (${{ github.ref_name }})"
+          python install.py --uninstall

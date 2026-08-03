@@ -5,11 +5,29 @@ two reveal effects — on **Linux, macOS and Windows**. The command is `yt-ascii
 
 ## Quick start
 
-Download the executable for your OS from the
-[latest release](../../releases/latest), then run it:
+The installer fetches the project source, creates an isolated Python
+environment for it, and exposes the `yt-ascii` command for your user account.
+It requires Python 3.10 or newer and an internet connection.
 
-- **Linux / macOS:** `chmod +x yt-ascii-* && ./yt-ascii-*`
-- **Windows:** double-click `yt-ascii-windows-x86_64.exe` (or run it from a terminal)
+Linux and macOS:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 -
+```
+
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 -
+```
+
+If the Windows Python launcher is unavailable, replace `py -3 -` with
+`python -` in these commands.
+
+Open a new terminal after installation so the updated `PATH` is available,
+then run `yt-ascii`. The installer also prints the launcher's absolute path.
+By default it installs the stable `v0.3.0` source tag rather than a mutable
+branch.
 
 Launched with no arguments, it shows a prompt — paste a YouTube link and press
 Enter:
@@ -25,21 +43,88 @@ Enter:
 Or pass a link directly:
 
 ```
-./yt-ascii https://youtu.be/jNQXAC9IVRw
+yt-ascii https://youtu.be/jNQXAC9IVRw
 ```
 
-**Dependencies are bundled** — yt-dlp ships inside the released binaries, and so
-does ffmpeg. The binary still prefers a system `ffmpeg` when one is on your
-`PATH`, because the bundled Linux build is statically linked and can fail DNS on
-some hosts:
+The private environment contains NumPy, yt-dlp, imageio-ffmpeg and certifi. The
+player prefers a system `ffmpeg` when one is on `PATH`, then falls back to the
+copy supplied by imageio-ffmpeg. On some Linux systems the fallback's static
+build cannot resolve DNS; install your distribution's FFmpeg package if video
+does not start (`sudo apt install ffmpeg` or `sudo dnf install ffmpeg`).
 
-- **macOS / Windows** — works out of the box, nothing to install.
-- **Linux** — if video won't start, install ffmpeg (`sudo dnf install ffmpeg` or
-  `sudo apt install ffmpeg`); the bundled copy is only a fallback.
+Audio is optional and still requires `ffplay` on `PATH`; playback is silent when
+it is unavailable. Point the player at specific binaries with the
+`YTASCII_FFMPEG` / `YTASCII_FFPLAY` environment variables.
 
-Audio is optional: it uses `ffplay` (shipped with ffmpeg) when found on your
-`PATH`, and plays silently otherwise. Point the player at specific binaries with
-the `YTASCII_FFMPEG` / `YTASCII_FFPLAY` environment variables.
+## Install channels and maintenance
+
+The default command installs the stable version recorded in `STABLE_VERSION`.
+Choose a tagged source version or the latest development branch by adding an
+installer argument. Installer-managed tagged versions start at `v0.3.0`:
+
+```sh
+# Linux / macOS: exact tagged version
+curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 - --version v0.3.0
+
+# Linux / macOS: unreleased main branch
+curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 - --edge
+```
+
+```powershell
+# Windows PowerShell: exact tagged version
+irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 - --version v0.3.0
+
+# Windows PowerShell: unreleased main branch
+irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 - --edge
+```
+
+Rerun the corresponding stable, versioned or edge command to update that
+installation. `--edge` deliberately follows mutable, unreviewed development
+code. To install without changing the user `PATH`, append
+`--no-modify-path`. Run `yt-ascii --version` to see the application version and
+installed source reference.
+
+The default locations are:
+
+- Linux/macOS data: `${XDG_DATA_HOME:-$HOME/.local/share}/yt-ascii`
+- Linux/macOS launcher: `$HOME/.local/bin/yt-ascii`
+- Windows data: `%LOCALAPPDATA%\Programs\yt-ascii`
+- Windows launcher: `%LOCALAPPDATA%\Programs\yt-ascii\bin\yt-ascii.cmd`
+
+Uninstall with:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 - --uninstall
+```
+
+```powershell
+irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 - --uninstall
+```
+
+Uninstall removes only installer-managed versions, state, launcher and `PATH`
+marker. It leaves unrelated files and user configuration alone.
+
+### Inspect before running
+
+Piping downloaded Python into an interpreter executes remote code. If you want
+to inspect it first, download the installer and run the saved copy:
+
+```sh
+curl -fsSLo install.py https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py
+less install.py
+python3 install.py
+```
+
+```powershell
+irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py -OutFile install.py
+Get-Content .\install.py
+py -3 .\install.py
+```
+
+To pin the installer code you review, replace `main` in the download URL with a
+reviewed tag or full commit ID. When using a version tag in that URL, also pass
+the same tag with `--version` so the application source comes from that tag.
+The installer never needs administrator privileges.
 
 ## Controls
 
@@ -61,28 +146,43 @@ the `YTASCII_FFMPEG` / `YTASCII_FFPLAY` environment variables.
 
 ## Run from source
 
-```
+```sh
 git clone https://github.com/EnchiladaBoy/Youtube-in-the-terminal.git
 cd Youtube-in-the-terminal
-pip install -r requirements.txt
-./yt-ascii <url>            # Windows: python yt-ascii <url>
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+python yt-ascii <url>
 ```
 
-Requires Python 3.9 or newer.
+On Windows, create the environment with `py -3 -m venv .venv`, activate it with
+`.\.venv\Scripts\Activate.ps1`, and use `python` for the remaining commands.
+Source installs require Python 3.10 or newer.
 
-## Build your own executable
+## Build a local executable
 
-PyInstaller can't cross-compile, so build on each target OS:
+PyInstaller packaging remains available for local use, but executables are not
+published or installed by this project. PyInstaller cannot cross-compile, so
+build on the target OS:
 
-```
-pip install -r requirements-build.txt
+```sh
+python -m pip install -r requirements-build.txt
 python packaging/build.py          # -> dist/yt-ascii  (yt-ascii.exe on Windows)
 ```
 
-The GitHub Actions workflow in `.github/workflows/build.yml` builds Linux,
-macOS (Apple Silicon) and Windows binaries on every push to `main`, and
-attaches them to a GitHub Release when you push a `v*` tag. (Intel Macs aren't
-built separately — GitHub is retiring the Intel runner; run from source there.)
+The GitHub Actions workflow tests source and installer behavior on Linux with
+Python 3.10 and 3.12, macOS arm64 with Python 3.12, and Windows with Python
+3.12. It does not build, upload or publish executable artifacts.
+
+For measured bottlenecks and proposed optimizations, see the
+[performance improvement roadmap](PERFORMANCE.md).
+
+Run the regression suite and deterministic renderer benchmark with:
+
+```sh
+python -m unittest discover -s tests -v
+python benchmarks/benchmark_renderer.py
+```
 
 ## Author
 
