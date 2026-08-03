@@ -50,7 +50,7 @@ the old renderer in differential tests.
 
 ## v0.4 style pipeline
 
-The v0.4 candidate adds a NumPy-only transform stage between FFmpeg's RGB frame
+The v0.4 release adds a NumPy-only transform stage between FFmpeg's RGB frame
 reshape and `AnsiRenderer`. Each transform accepts a `uint8` RGB array and
 returns the same shape and dtype without mutating the decoded frame. `classic`
 is a zero-copy identity path, so the default output and renderer cost remain
@@ -64,8 +64,8 @@ styles derive their phase from the decoded playback timestamp, so pause and
 seek behavior is reproducible rather than tied to wall-clock scheduling.
 
 `benchmark_renderer.py` reports each style transform separately at a 240 x 136
-RGB input size as well as the existing renderer cases. The candidate acceptance
-budget is a local median below 2 ms per transform; this timing is reported for
+RGB input size as well as the existing renderer cases. The local performance
+budget is a median below 2 ms per transform; this timing is reported for
 comparison and is deliberately not a CI gate because hardware variance would
 make that gate flaky. Run the complete benchmark with:
 

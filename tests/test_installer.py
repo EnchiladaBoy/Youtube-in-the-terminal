@@ -74,8 +74,8 @@ class VersionTests(unittest.TestCase):
                     install.validate_tag(value)
 
     def test_stable_file_and_archive_urls(self):
-        self.assertEqual(install.stable_tag(), "v0.3.0")
-        self.assertTrue(install.archive_url("v0.3.0").endswith("/refs/tags/v0.3.0.zip"))
+        self.assertEqual(install.stable_tag(), "v0.4.0")
+        self.assertTrue(install.archive_url("v0.4.0").endswith("/refs/tags/v0.4.0.zip"))
         self.assertTrue(install.archive_url("ignored", edge=True).endswith("/refs/heads/main.zip"))
 
 class ArchiveTests(unittest.TestCase):

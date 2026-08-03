@@ -27,7 +27,7 @@ If the Windows Python launcher is unavailable, replace `py -3 -` with
 
 Open a new terminal after installation so the updated `PATH` is available,
 then run `yt-ascii`. The installer also prints the launcher's absolute path.
-By default it installs the stable `v0.3.0` source tag rather than a mutable
+By default it installs the stable `v0.4.0` source tag rather than a mutable
 branch.
 
 Launched with no arguments, it shows a prompt — paste a YouTube link and press
@@ -65,7 +65,7 @@ installer argument. Installer-managed tagged versions start at `v0.3.0`:
 
 ```sh
 # Linux / macOS: exact tagged version
-curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 - --version v0.3.0
+curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 - --version v0.4.0
 
 # Linux / macOS: unreleased main branch
 curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 - --edge
@@ -73,7 +73,7 @@ curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-termina
 
 ```powershell
 # Windows PowerShell: exact tagged version
-irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 - --version v0.3.0
+irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 - --version v0.4.0
 
 # Windows PowerShell: unreleased main branch
 irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 - --edge
@@ -147,9 +147,7 @@ The installer never needs administrator privileges.
 
 ### Video styles
 
-Version 0.4.0 adds persistent frame styles. During the candidate rollout the
-default installer remains pinned to stable v0.3.0; install `--edge` to preview
-these features from `main`.
+Version 0.4.0 adds persistent frame styles.
 
 Choose a starting style with `--style NAME`, then press `s` during playback to
 cycle through the styles without restarting the video:
