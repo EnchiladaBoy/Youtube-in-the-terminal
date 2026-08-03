@@ -45,6 +45,12 @@ def minimal_source(root):
     return root
 
 
+def expected_launcher_content(root, bin_dir):
+    if os.name == "nt":
+        return install.windows_launcher(root, bin_dir)
+    return install.posix_launcher(root)
+
+
 class VersionTests(unittest.TestCase):
     def test_strict_stable_tags(self):
         for value in ("v0.3.0", "v1.0.0", "v12.34.567"):
@@ -191,6 +197,7 @@ class LauncherAndPathTests(unittest.TestCase):
             self.assertEqual(destination.read_text(encoding="utf-8"), "managed\n")
             self.assertTrue(predictable.is_symlink())
 
+    @unittest.skipIf(os.name == "nt", "POSIX profile test")
     def test_posix_profile_management_preserves_existing_content(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -209,6 +216,7 @@ class LauncherAndPathTests(unittest.TestCase):
                 install.remove_posix_path(changed, home / ".local" / "bin")
             self.assertEqual(profile.read_text(encoding="utf-8"), "export KEEP=1\n")
 
+    @unittest.skipIf(os.name == "nt", "POSIX profile test")
     def test_non_utf8_profile_reports_an_installer_error(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -223,6 +231,7 @@ class LauncherAndPathTests(unittest.TestCase):
                     install.add_posix_path(home / ".local" / "bin")
             self.assertEqual(profile.read_bytes(), b"\xff\xfe")
 
+    @unittest.skipIf(os.name == "nt", "POSIX profile test")
     def test_posix_path_blocks_are_owned_per_bin_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -292,7 +301,7 @@ class LifecycleTests(unittest.TestCase):
             source = minimal_source(base / "source")
             bin_dir = base / "bin"
             bin_dir.mkdir()
-            launcher = bin_dir / "yt-ascii"
+            launcher = install.launcher_path(bin_dir)
             launcher.write_text("#!/bin/sh\necho mine\n", encoding="utf-8")
             with self.assertRaises(install.InstallerError):
                 install.install(args(
@@ -311,8 +320,8 @@ class LifecycleTests(unittest.TestCase):
             second_root = base / "second"
             bin_dir = base / "bin"
             bin_dir.mkdir()
-            launcher = bin_dir / "yt-ascii"
-            first_content = install.posix_launcher(first_root)
+            launcher = install.launcher_path(bin_dir)
+            first_content = expected_launcher_content(first_root, bin_dir)
             launcher.write_text(first_content, encoding="utf-8")
 
             with self.assertRaises(install.InstallerError):
@@ -336,8 +345,8 @@ class LifecycleTests(unittest.TestCase):
                 install.ROOT_MARKER_CONTENT, encoding="ascii"
             )
             bin_dir.mkdir()
-            launcher = bin_dir / "yt-ascii"
-            first_content = install.posix_launcher(first_root)
+            launcher = install.launcher_path(bin_dir)
+            first_content = expected_launcher_content(first_root, bin_dir)
             launcher.write_text(first_content, encoding="utf-8")
 
             install.uninstall(args(install_root=second_root, bin_dir=bin_dir))
@@ -394,7 +403,7 @@ class LifecycleTests(unittest.TestCase):
             sentinel = target / "keep"
             sentinel.write_text("user", encoding="utf-8")
             (root / "versions").symlink_to(target, target_is_directory=True)
-            launcher = bin_dir / "yt-ascii"
+            launcher = install.launcher_path(bin_dir)
             launcher.write_text(install.posix_launcher(root), encoding="utf-8")
 
             with self.assertRaises(install.InstallerError):
@@ -422,7 +431,7 @@ class LifecycleTests(unittest.TestCase):
                         bin_dir=bin_dir,
                     ))
             self.assertFalse(root.exists())
-            self.assertFalse((bin_dir / "yt-ascii").exists())
+            self.assertFalse(install.launcher_path(bin_dir).exists())
 
     def test_state_write_failure_rolls_back_path_pointer_and_launcher(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -448,7 +457,7 @@ class LifecycleTests(unittest.TestCase):
 
             remove_path.assert_called_once_with(bin_dir.resolve())
             self.assertFalse(root.exists())
-            self.assertFalse((bin_dir / "yt-ascii").exists())
+            self.assertFalse(install.launcher_path(bin_dir).exists())
 
     def test_failed_path_rollback_retains_recovery_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -484,7 +493,7 @@ class LifecycleTests(unittest.TestCase):
             current, current_ref = install.read_current(root)
             self.assertEqual(current_ref, "source")
             self.assertTrue(current.is_dir())
-            self.assertTrue((bin_dir / "yt-ascii").is_file())
+            self.assertTrue(install.launcher_path(bin_dir).is_file())
             self.assertTrue(install.valid_root_marker(root / install.ROOT_MARKER))
             self.assertTrue(install.read_state(root)["windows_path_added"])
 
@@ -510,7 +519,7 @@ class LifecycleTests(unittest.TestCase):
                 first, first_ref = install.read_current(root)
                 self.assertEqual(first_ref, "source")
                 self.assertTrue(first.is_dir())
-                self.assertTrue(install.managed_launcher(bin_dir / "yt-ascii"))
+                self.assertTrue(install.managed_launcher(install.launcher_path(bin_dir)))
                 state = json.loads((root / install.STATE_FILE).read_text())
                 self.assertEqual(state["ref"], "source")
 
@@ -532,7 +541,7 @@ class LifecycleTests(unittest.TestCase):
             install.uninstall(args(install_root=root, bin_dir=bin_dir))
             self.assertTrue(keep.is_file())
             self.assertFalse((root / "versions").exists())
-            self.assertFalse((bin_dir / "yt-ascii").exists())
+            self.assertFalse(install.launcher_path(bin_dir).exists())
 
     def test_failed_upgrade_keeps_previous_pointer_and_environment(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -583,8 +592,8 @@ class LifecycleTests(unittest.TestCase):
 
             build.assert_not_called()
             self.assertEqual(install.read_current(root), previous)
-            self.assertTrue((first_bin / "yt-ascii").is_file())
-            self.assertFalse((second_bin / "yt-ascii").exists())
+            self.assertTrue(install.launcher_path(first_bin).is_file())
+            self.assertFalse(install.launcher_path(second_bin).exists())
 
     @unittest.skipIf(os.name == "nt", "POSIX executable mode test")
     def test_upgrade_repairs_owned_launcher_execute_permission(self):
@@ -596,7 +605,7 @@ class LifecycleTests(unittest.TestCase):
             options = args(source_dir=source, install_root=root, bin_dir=bin_dir)
             with mock.patch.object(install, "build_environment", return_value=None):
                 install.install(options)
-                launcher = bin_dir / "yt-ascii"
+                launcher = install.launcher_path(bin_dir)
                 launcher.chmod(0o600)
                 install.install(options)
 
@@ -612,22 +621,26 @@ class LifecycleTests(unittest.TestCase):
             with mock.patch.object(install, "build_environment", return_value=None):
                 install.install(options)
 
-            with mock.patch.object(
-                install, "remove_posix_path", return_value=False
-            ):
+            remover = "remove_windows_path" if os.name == "nt" else "remove_posix_path"
+            if os.name == "nt":
+                state = install.read_state(root)
+                state["windows_path_added"] = True
+                install.write_atomic(
+                    root / install.STATE_FILE,
+                    json.dumps(state, indent=2, sort_keys=True) + "\n",
+                )
+            with mock.patch.object(install, remover, return_value=False):
                 with self.assertRaises(install.InstallerError):
                     install.uninstall(args(install_root=root, bin_dir=bin_dir))
 
             self.assertTrue((root / install.STATE_FILE).is_file())
             self.assertTrue((root / install.ROOT_MARKER).is_file())
-            self.assertTrue((bin_dir / "yt-ascii").is_file())
+            self.assertTrue(install.launcher_path(bin_dir).is_file())
 
-            with mock.patch.object(
-                install, "remove_posix_path", return_value=True
-            ):
+            with mock.patch.object(install, remover, return_value=True):
                 install.uninstall(args(install_root=root, bin_dir=bin_dir))
             self.assertFalse((root / install.ROOT_MARKER).exists())
-            self.assertFalse((bin_dir / "yt-ascii").exists())
+            self.assertFalse(install.launcher_path(bin_dir).exists())
 
     def test_windows_path_ownership_survives_an_upgrade(self):
         with tempfile.TemporaryDirectory() as directory:
