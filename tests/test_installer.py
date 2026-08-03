@@ -104,6 +104,11 @@ class ArchiveTests(unittest.TestCase):
             [("D:/outside", b"bad")],
             [(backslash.filename, backslash)],
             [("repo/CON.txt", b"bad")],
+            [("repo/CON .txt", b"bad")],
+            [("repo/CONIN$", b"bad")],
+            [("repo/COM¹.txt", b"bad")],
+            [("repo/has?mark", b"bad")],
+            [("repo/control\x01name", b"bad")],
             [("repo/trailing. ", b"bad")],
             [("repo/link", link)],
         ]

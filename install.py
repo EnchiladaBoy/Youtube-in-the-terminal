@@ -47,6 +47,14 @@ MIN_INSTALLABLE_TAG = (0, 3, 0)
 MAX_DOWNLOAD = 50 * 1024 * 1024
 MAX_EXTRACTED = 100 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 5000
+WINDOWS_RESERVED_CHARS = frozenset('<>:"/\\|?*') | frozenset(
+    chr(codepoint) for codepoint in range(32)
+)
+WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+    *(f"COM{suffix}" for suffix in (*range(1, 10), "¹", "²", "³")),
+    *(f"LPT{suffix}" for suffix in (*range(1, 10), "¹", "²", "³")),
+}
 
 
 class InstallerError(RuntimeError):
@@ -198,6 +206,16 @@ def is_zip_symlink(info):
     return stat.S_IFMT(info.external_attr >> 16) == stat.S_IFLNK
 
 
+def is_windows_reserved_name(name):
+    """Match Windows reserved-name rules without requiring Python 3.13+."""
+    if not name or name[-1:] in {".", " "}:
+        return True
+    if WINDOWS_RESERVED_CHARS.intersection(name):
+        return True
+    device = name.partition(".")[0].rstrip(" ").upper()
+    return device in WINDOWS_RESERVED_NAMES
+
+
 def safe_extract_zip(payload, destination):
     """Extract a GitHub ZIP without trusting member paths or symlinks."""
     archive_path = destination / "source.zip"
@@ -210,11 +228,6 @@ def safe_extract_zip(payload, destination):
     except (OSError, zipfile.BadZipFile) as exc:
         raise InstallerError("downloaded source archive is not a valid ZIP") from exc
     normalized_names = set()
-    windows_devices = {
-        "con", "prn", "aux", "nul",
-        *(f"com{number}" for number in range(1, 10)),
-        *(f"lpt{number}" for number in range(1, 10)),
-    }
     with archive:
         infos = archive.infolist()
         if not infos or len(infos) > MAX_ARCHIVE_ENTRIES:
@@ -240,9 +253,7 @@ def safe_extract_zip(payload, destination):
                 or is_zip_symlink(info)
                 or bool(info.flag_bits & 0x1)
                 or normalized in normalized_names
-                or any(part.rstrip(" .") != part for part in parts)
-                or any(":" in part for part in parts)
-                or any(part.split(".", 1)[0].casefold() in windows_devices for part in parts)
+                or any(is_windows_reserved_name(part) for part in parts)
             ):
                 raise InstallerError(f"unsafe path in source archive: {name!r}")
             normalized_names.add(normalized)
