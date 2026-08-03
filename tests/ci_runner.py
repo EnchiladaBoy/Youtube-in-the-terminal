@@ -26,7 +26,10 @@ def main():
     )
     sys.stdout.write(result.stdout)
     if result.returncode:
-        details = result.stdout[-12_000:]
+        # GitHub truncates workflow-command annotation messages at roughly
+        # 4 KiB from the end.  Keep the traceback tail below that limit so a
+        # failure is useful even when the verbose test listing is long.
+        details = result.stdout[-3_500:]
         print(
             "::error title=Cross-platform test failure::"
             + annotation_escape(details)

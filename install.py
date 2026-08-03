@@ -220,7 +220,11 @@ def safe_extract_zip(payload, destination):
         if not infos or len(infos) > MAX_ARCHIVE_ENTRIES:
             raise InstallerError("source archive has an invalid number of entries")
         for info in infos:
-            name = info.filename
+            # ZipInfo normalizes os.sep in ``filename``.  On Windows that can
+            # hide a backslash from the archive's original member name, so
+            # validate the unmodified spelling and only use the normalized
+            # value after it has passed every path check.
+            name = info.orig_filename
             path = PurePosixPath(name)
             windows_path = PureWindowsPath(name)
             parts = path.parts
