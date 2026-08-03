@@ -154,6 +154,22 @@ class ProcessTests(unittest.TestCase):
 
 
 class CommandAndOutputTests(unittest.TestCase):
+    def test_help_is_dependency_free_and_lists_styles(self):
+        output = io.StringIO()
+        globals_ = CORE["main"].__globals__
+        dependency_check = mock.Mock()
+        with mock.patch.object(
+                    globals_["sys"], "argv", ["yt-ascii", "--help"]
+                ), \
+                mock.patch.object(globals_["sys"], "stdout", output), \
+                mock.patch.object(globals_["sys"], "stderr", io.StringIO()), \
+                mock.patch.dict(globals_, {"check_deps": dependency_check}):
+            with self.assertRaises(SystemExit) as raised:
+                CORE["main"]()
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("--style", output.getvalue())
+        dependency_check.assert_not_called()
+
     def test_version_defaults_to_source_and_skips_dependency_checks(self):
         output = io.StringIO()
         globals_ = CORE["main"].__globals__
@@ -168,8 +184,36 @@ class CommandAndOutputTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 CORE["main"]()
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(output.getvalue(), "yt-ascii 0.3.0 (source)\n")
+        self.assertEqual(output.getvalue(), "yt-ascii 0.4.0 (source)\n")
         dependency_check.assert_not_called()
+
+    def test_interactive_style_selection_persists_to_the_next_video(self):
+        args = SimpleNamespace(url=None, style="classic", self_test=False)
+        seen = []
+        urls = iter(("first", "second"))
+        globals_ = CORE["main"].__globals__
+
+        def prompt():
+            try:
+                return next(urls)
+            except StopIteration as error:
+                raise SystemExit(0) from error
+
+        def run(current):
+            seen.append((current.url, current.style))
+            if current.url == "first":
+                current.style = "bayer"
+
+        with mock.patch.dict(globals_, {
+            "parse_args": lambda: args,
+            "check_deps": lambda: None,
+            "prompt_for_url": prompt,
+            "run": run,
+        }):
+            with self.assertRaises(SystemExit) as raised:
+                CORE["main"]()
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(seen, [("first", "classic"), ("second", "bayer")])
 
     def test_version_reports_valid_installer_refs(self):
         for install_ref in ("v0.3.0", "v12.34.567", "edge"):
@@ -178,7 +222,7 @@ class CommandAndOutputTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     CORE["version_text"](),
-                    f"yt-ascii 0.3.0 ({install_ref})",
+                    f"yt-ascii 0.4.0 ({install_ref})",
                 )
 
     def test_version_rejects_untrusted_installer_refs(self):
@@ -198,7 +242,7 @@ class CommandAndOutputTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     CORE["version_text"](),
-                    "yt-ascii 0.3.0 (source)",
+                    "yt-ascii 0.4.0 (source)",
                 )
 
     def test_spawn_video_emits_scaled_rgb24(self):
@@ -243,6 +287,81 @@ class CommandAndOutputTests(unittest.TestCase):
         self.assertEqual(binary.flushes, 1)
         output.write.assert_not_called()
 
+    def test_style_and_palette_cli_contract(self):
+        self.assertEqual(CORE["PALETTES"]["binary"], " 01")
+        self.assertEqual(CORE["PALETTES"]["numbers"], " 123456789")
+        self.assertEqual(CORE["PALETTES"]["symbols"], " .,:;!|?*#@")
+        self.assertEqual(CORE["PALETTES"]["matrix"], " 01:=+*<>|/")
+
+        globals_ = CORE["parse_args"].__globals__
+        with mock.patch.object(globals_["sys"], "argv", ["yt-ascii"]):
+            self.assertEqual(CORE["parse_args"]().style, "classic")
+        for style in CORE["STYLE_NAMES"]:
+            with self.subTest(style=style), mock.patch.object(
+                globals_["sys"], "argv", ["yt-ascii", "--style", style]
+            ):
+                self.assertEqual(CORE["parse_args"]().style, style)
+
+    def test_status_shows_style_and_style_control(self):
+        for width in (120, 80):
+            with self.subTest(width=width):
+                status = CORE["build_status"](
+                    30,
+                    12.0,
+                    {"duration": 60.0, "title": "fixture"},
+                    width,
+                    paused=False,
+                    style="riso",
+                )
+                visible = status.removeprefix("\x1b[0m")
+                self.assertLessEqual(len(visible), width)
+                self.assertIn("style:riso", visible)
+                self.assertIn("s:style", visible)
+
+    def test_status_accounts_for_wide_combining_and_control_characters(self):
+        title = "界e\u0301🙂\x1b[2J" * 20
+        status = CORE["build_status"](
+            30,
+            12.0,
+            {"duration": 60.0, "title": title},
+            120,
+            paused=False,
+            style="duotone",
+        )
+        visible = status.removeprefix("\x1b[0m")
+        self.assertLessEqual(CORE["_terminal_cell_width"](visible), 120)
+        self.assertIn("界e\u0301🙂", visible)
+        self.assertNotIn("\x1b", visible)
+
+    def test_keyboard_backends_accept_only_lowercase_style_key(self):
+        globals_ = CORE["_read_keys_windows"].__globals__
+
+        class FakeMsvcrt:
+            def __init__(self):
+                self.chars = iter(("s", "S", "1"))
+                self.pending = True
+
+            def kbhit(self):
+                return self.pending
+
+            def getwch(self):
+                try:
+                    return next(self.chars)
+                except StopIteration:
+                    self.pending = False
+                    return "S"
+
+        fake = FakeMsvcrt()
+        with mock.patch.dict(globals_, {"msvcrt": fake}):
+            self.assertEqual(CORE["_read_keys_windows"](), ["s", "1"])
+
+        readiness = iter((([0], [], []), ([], [], [])))
+        fake_select = SimpleNamespace(select=lambda *_args: next(readiness))
+        posix_globals = CORE["_read_keys_posix"].__globals__
+        with mock.patch.dict(posix_globals, {"select": fake_select}), \
+                mock.patch.object(posix_globals["os"], "read", return_value=b"sS1"):
+            self.assertEqual(CORE["_read_keys_posix"](0), ["s", "1"])
+
 
 class NonSuspendResizeTests(unittest.TestCase):
     class FrameStream:
@@ -272,6 +391,168 @@ class NonSuspendResizeTests(unittest.TestCase):
         def kill(self):
             self.exited = True
 
+    @staticmethod
+    def args(**overrides):
+        values = {
+            "url": "fixture",
+            "no_color": True,
+            "no_audio": True,
+            "eight_bit": False,
+            "pixels": False,
+            "scatter": False,
+            "rain": False,
+            "scatter_secs": 4.0,
+            "rain_secs": 7.5,
+            "rain_chars": "matrix",
+            "fps": 10,
+            "width": 2,
+            "height": 2,
+            "max_res": 480,
+            "palette": "simple",
+            "chars": None,
+            "style": "classic",
+        }
+        values.update(overrides)
+        return SimpleNamespace(**values)
+
+    @staticmethod
+    def info():
+        return {
+            "title": "fixture",
+            "width": 16,
+            "height": 9,
+            "duration": 0.0,
+            "video": "fixture",
+            "audio": None,
+        }
+
+    def test_style_cycle_redraws_paused_frame_without_restarting_reveal(self):
+        import yt_ascii_renderer
+        import yt_ascii_styles
+
+        base_renderer = yt_ascii_renderer.AnsiRenderer
+        globals_ = CORE["run"].__globals__
+
+        def exercise(key_batch):
+            apply_calls = []
+            reveal_fractions = []
+            reveal_resets = []
+            key_call = 0
+
+            class RecordingStyleProcessor:
+                def __init__(self, name):
+                    self.name = name
+
+                def reset(self):
+                    pass
+
+                def cycle(self):
+                    self.name = "bayer"
+                    return self.name
+
+                def apply(self, frame, time_seconds=0.0):
+                    apply_calls.append((self.name, time_seconds))
+                    return frame
+
+            class RecordingRenderer(base_renderer):
+                def reset_reveal(self):
+                    reveal_resets.append(True)
+                    return super().reset_reveal()
+
+                def render_scatter(self, frame, fraction):
+                    reveal_fractions.append(fraction)
+                    return super().render_scatter(frame, fraction)
+
+            def read_keys(_fd):
+                nonlocal key_call
+                key_call += 1
+                if key_call == 1:
+                    return []
+                if key_call == 2:
+                    return key_batch
+                return ["q"]
+
+            process = self.FakeProcess(video=True)
+            args = self.args(scatter=True)
+            replacements = {
+                "_CAN_SUSPEND": False,
+                "IS_WINDOWS": True,
+                "probe": lambda *_args: self.info(),
+                "spawn_video": lambda *_args: process,
+                "find_ffplay": lambda: None,
+                "read_keys": read_keys,
+            }
+            with mock.patch.dict(globals_, replacements), \
+                    mock.patch.object(globals_["os"], "isatty", return_value=True), \
+                    mock.patch.object(globals_["time"], "monotonic", return_value=0.0), \
+                    mock.patch.object(globals_["time"], "sleep"), \
+                    mock.patch.object(yt_ascii_renderer, "AnsiRenderer", RecordingRenderer), \
+                    mock.patch.object(yt_ascii_styles, "StyleProcessor", RecordingStyleProcessor), \
+                    mock.patch.object(globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)), \
+                    mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
+                    mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+                CORE["run"](args)
+            return args, apply_calls, reveal_fractions, reveal_resets
+
+        for key_batch in (["space", "s"], ["s", "space"]):
+            with self.subTest(key_batch=key_batch):
+                args, apply_calls, reveal_fractions, reveal_resets = exercise(key_batch)
+                self.assertEqual(args.style, "bayer")
+                self.assertEqual(
+                    apply_calls, [("classic", 0.0), ("bayer", 0.0)]
+                )
+                self.assertEqual(len(reveal_fractions), 2)
+                self.assertEqual(reveal_fractions[0], reveal_fractions[1])
+                self.assertEqual(len(reveal_resets), 1)
+
+    def test_style_receives_decoded_frame_timestamps(self):
+        import yt_ascii_styles
+
+        apply_times = []
+        key_call = 0
+
+        class RecordingStyleProcessor:
+            def __init__(self, name):
+                self.name = name
+
+            def reset(self):
+                pass
+
+            def cycle(self):
+                raise AssertionError("unexpected style cycle")
+
+            def apply(self, frame, time_seconds=0.0):
+                apply_times.append(time_seconds)
+                return frame
+
+        def read_keys(_fd):
+            nonlocal key_call
+            key_call += 1
+            return ["q"] if key_call == 3 else []
+
+        process = self.FakeProcess(video=True)
+        args = self.args(style="glitch", fps=10)
+        globals_ = CORE["run"].__globals__
+        replacements = {
+            "_CAN_SUSPEND": False,
+            "IS_WINDOWS": True,
+            "probe": lambda *_args: self.info(),
+            "spawn_video": lambda *_args: process,
+            "find_ffplay": lambda: None,
+            "read_keys": read_keys,
+        }
+        with mock.patch.dict(globals_, replacements), \
+                mock.patch.object(globals_["os"], "isatty", return_value=True), \
+                mock.patch.object(globals_["time"], "monotonic", return_value=10.0), \
+                mock.patch.object(globals_["time"], "sleep"), \
+                mock.patch.object(yt_ascii_styles, "StyleProcessor", RecordingStyleProcessor), \
+                mock.patch.object(globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)), \
+                mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
+                mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+            CORE["run"](args)
+
+        self.assertEqual(apply_times, [0.0, 0.1])
+
     def test_pause_resize_resume_spawns_exactly_one_replacement(self):
         spawned = []
         reveal_fractions = []
@@ -279,8 +560,16 @@ class NonSuspendResizeTests(unittest.TestCase):
         winch = None
 
         import yt_ascii_renderer
+        import yt_ascii_styles
 
         base_renderer = yt_ascii_renderer.AnsiRenderer
+        base_style_processor = yt_ascii_styles.StyleProcessor
+        style_resets = []
+
+        class RecordingStyleProcessor(base_style_processor):
+            def reset(self):
+                style_resets.append(self.name)
+                return super().reset()
 
         class RecordingRenderer(base_renderer):
             def render_scatter(self, frame, fraction):
@@ -351,6 +640,7 @@ class NonSuspendResizeTests(unittest.TestCase):
             max_res=480,
             palette="simple",
             chars=None,
+            style="classic",
         )
         info = {
             "title": "fixture",
@@ -377,6 +667,7 @@ class NonSuspendResizeTests(unittest.TestCase):
                 mock.patch.object(globals_["time"], "monotonic", monotonic), \
                 mock.patch.object(globals_["time"], "sleep", sleep), \
                 mock.patch.object(yt_ascii_renderer, "AnsiRenderer", RecordingRenderer), \
+                mock.patch.object(yt_ascii_styles, "StyleProcessor", RecordingStyleProcessor), \
                 mock.patch.object(globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)), \
                 mock.patch.object(globals_["sys"], "stdout", output), \
                 mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
@@ -386,6 +677,7 @@ class NonSuspendResizeTests(unittest.TestCase):
         # create a third process that is then overwritten and leaked.
         self.assertEqual(len(spawned), 2)
         self.assertTrue(all(process.exited for process in spawned))
+        self.assertEqual(style_resets, ["classic", "classic"])
         self.assertGreaterEqual(len(reveal_fractions), 2)
         self.assertLess(max(reveal_fractions), 0.25)
 

@@ -162,7 +162,7 @@ def selected_locations(args):
 
 
 def fetch_bytes(url, limit=MAX_DOWNLOAD):
-    request = urllib.request.Request(url, headers={"User-Agent": "yt-ascii-installer/0.3"})
+    request = urllib.request.Request(url, headers={"User-Agent": "yt-ascii-installer/0.4"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             data = response.read(limit + 1)
@@ -305,7 +305,26 @@ def stage_source(version_dir, source_dir=None, ref=None, edge=False):
         source = safe_extract_zip(payload, scratch)
         shutil.copytree(source, app_dir, ignore=source_ignore)
         shutil.rmtree(scratch)
-    required = [app_dir / "yt-ascii", app_dir / "yt_ascii_renderer.py", app_dir / "requirements.txt"]
+    required = [
+        app_dir / "yt-ascii",
+        app_dir / "yt_ascii_renderer.py",
+        app_dir / "requirements.txt",
+    ]
+    # v0.3.x predates the style pipeline and remains installable by exact tag.
+    # Local source, edge, and v0.4+ archives must carry the style module.
+    tag_version = (
+        tuple(int(part) for part in ref[1:].split("."))
+        if TAG_RE.fullmatch(ref or "")
+        else None
+    )
+    requires_style_module = (
+        source_dir is not None
+        or edge
+        or tag_version is None
+        or tag_version >= (0, 4, 0)
+    )
+    if requires_style_module:
+        required.append(app_dir / "yt_ascii_styles.py")
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise InstallerError("source is missing required files: " + ", ".join(missing))

@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from yt_ascii_renderer import AnsiRenderer  # noqa: E402
+from yt_ascii_styles import STYLE_NAMES, StyleProcessor  # noqa: E402
 
 
 DENSE = " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
@@ -129,6 +130,7 @@ def main():
     gray = AnsiRenderer(DENSE, color=False, rng=np.random.default_rng(3))
     scatter = AnsiRenderer(DENSE, rng=np.random.default_rng(4))
     rain = AnsiRenderer(DENSE, rain_chars=MATRIX, rng=np.random.default_rng(5))
+    styles = {name: StyleProcessor(name) for name in STYLE_NAMES}
 
     cases = [
         ("truecolor/legacy", lambda: legacy_chars(color_frame)),
@@ -140,6 +142,16 @@ def main():
         ("scatter/new-50pct", lambda: scatter.render_scatter(color_frame, 0.5)),
         ("rain/new-50pct", lambda: rain.render_rain(color_frame, 0.5)),
     ]
+    cases.extend(
+        (
+            f"style/{name}",
+            # Style transforms run before character/half-block composition.
+            # Use the 2x-height RGB frame so the default 240x68 benchmark
+            # measures the documented 240x136 terminal-pixel workload.
+            lambda processor=processor: processor.apply(half_frame, 12.375),
+        )
+        for name, processor in styles.items()
+    )
 
     results = {
         "width": args.width,
@@ -150,10 +162,11 @@ def main():
     for name, function in cases:
         output = function()
         timing = measure(function, args.rounds)
+        output_bytes = output.nbytes if isinstance(output, np.ndarray) else len(output)
         results["cases"][name] = {
             **timing,
-            "bytes_per_frame": len(output),
-            "mib_per_second_at_60fps": len(output) * 60 / (1024 * 1024),
+            "bytes_per_frame": output_bytes,
+            "mib_per_second_at_60fps": output_bytes * 60 / (1024 * 1024),
         }
 
     for mode in ("truecolor", "half-block", "grayscale"):

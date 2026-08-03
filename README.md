@@ -1,7 +1,8 @@
 # Youtube in the Terminal
 
-Stream YouTube videos as ASCII art in your terminal — 24-bit color, audio, and
-two reveal effects — on **Linux, macOS and Windows**. The command is `yt-ascii`.
+Stream YouTube videos as ASCII art in your terminal — 24-bit color, audio,
+persistent video styles, and two reveal effects — on **Linux, macOS and
+Windows**. The command is `yt-ascii`.
 
 ## Quick start
 
@@ -134,15 +135,57 @@ The installer never needs administrator privileges.
 | `←` / `→`      | seek -5s / +5s    |
 | `↓` / `↑`      | seek -30s / +30s  |
 | `0`–`9`        | jump to 0%–90%    |
+| `s`            | cycle video style |
 | `q` / `Ctrl-C` | quit              |
 
 ## Options
 
 `--no-color`, `--no-audio`, `--8bit` (chiptune audio), `--pixels` (half-block,
-2× vertical resolution), `--scatter` / `--rain` (reveal effects), `--rain-chars`
-(rain glyph set), `--fps`,
-`--width` / `--height`, `--max-res`, `--palette`, `--chars`. See
-`yt-ascii --help` for the full list.
+2× vertical resolution), `--style`, `--scatter` / `--rain` (reveal effects),
+`--rain-chars` (rain glyph set), `--fps`, `--width` / `--height`, `--max-res`,
+`--palette`, `--chars`. See `yt-ascii --help` for the full list.
+
+### Video styles
+
+Version 0.4.0 adds persistent frame styles. During the candidate rollout the
+default installer remains pinned to stable v0.3.0; install `--edge` to preview
+these features from `main`.
+
+Choose a starting style with `--style NAME`, then press `s` during playback to
+cycle through the styles without restarting the video:
+
+| Style | Effect |
+|---|---|
+| `classic` | Original unmodified RGB video (the default) |
+| `bayer` | Four-level ordered dithering with the source hue retained |
+| `duotone` | Navy-to-gold luminance mapping |
+| `riso` | Offset red and blue ink plates with purple overlaps |
+| `contour` | Bright cyan edge lines on black |
+| `glitch` | Animated RGB separation, scanlines, and horizontal displacement |
+
+Styles work with character and `--pixels` rendering, color and `--no-color`,
+and both reveal effects. A style selected interactively remains active for the
+next video entered at the prompt. Glitch animation freezes while paused and is
+deterministic after seeking.
+
+```sh
+yt-ascii https://youtu.be/jNQXAC9IVRw --style bayer
+yt-ascii https://youtu.be/jNQXAC9IVRw --style riso --palette symbols
+yt-ascii https://youtu.be/jNQXAC9IVRw --style contour --pixels --rain
+```
+
+Alongside the existing palettes, v0.4.0 adds `binary`, `numbers`, `symbols`,
+and `matrix`. Pass a palette name with `--palette`; an explicit `--chars`
+string always takes precedence:
+
+```sh
+yt-ascii https://youtu.be/jNQXAC9IVRw --style glitch --palette matrix
+yt-ascii https://youtu.be/jNQXAC9IVRw --style duotone --chars ' .oO@'
+```
+
+The style implementations use established image-processing techniques and
+project-owned defaults. Ladybug was visual inspiration only; no Ladybug code,
+shaders, assets, or presets are included.
 
 ## Run from source
 

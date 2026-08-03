@@ -41,6 +41,7 @@ def minimal_source(root):
     root.mkdir(parents=True)
     (root / "yt-ascii").write_text("print('ok')\n", encoding="utf-8")
     (root / "yt_ascii_renderer.py").write_text("# renderer\n", encoding="utf-8")
+    (root / "yt_ascii_styles.py").write_text("# styles\n", encoding="utf-8")
     (root / "requirements.txt").write_text("# none\n", encoding="utf-8")
     return root
 
@@ -151,6 +152,49 @@ class ArchiveTests(unittest.TestCase):
             self.assertTrue((app / "yt-ascii").is_file())
             self.assertFalse((app / ".git").exists())
             self.assertFalse((app / "build").exists())
+
+    def test_source_requires_style_module(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = minimal_source(base / "source")
+            (source / "yt_ascii_styles.py").unlink()
+            with self.assertRaisesRegex(install.InstallerError, "yt_ascii_styles.py"):
+                install.stage_source(base / "version", source_dir=source)
+
+    def test_v03_archive_remains_installable_without_style_module(self):
+        payload = zip_payload([
+            ("repo/yt-ascii", b"entry"),
+            ("repo/yt_ascii_renderer.py", b"# renderer\n"),
+            ("repo/requirements.txt", b"# requirements\n"),
+        ])
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            install, "fetch_bytes", return_value=payload
+        ):
+            version_dir = Path(directory) / "version"
+            version_dir.mkdir()
+            app = install.stage_source(version_dir, ref="v0.3.0")
+            self.assertTrue((app / "yt-ascii").is_file())
+            self.assertFalse((app / "yt_ascii_styles.py").exists())
+
+    def test_v04_and_edge_archives_require_style_module(self):
+        payload = zip_payload([
+            ("repo/yt-ascii", b"entry"),
+            ("repo/yt_ascii_renderer.py", b"# renderer\n"),
+            ("repo/requirements.txt", b"# requirements\n"),
+        ])
+        cases = [
+            {"ref": "v0.4.0"},
+            {"ref": "edge", "edge": True},
+        ]
+        for index, options in enumerate(cases):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.object(install, "fetch_bytes", return_value=payload):
+                version_dir = Path(directory) / f"version-{index}"
+                version_dir.mkdir()
+                with self.assertRaisesRegex(
+                    install.InstallerError, "yt_ascii_styles.py"
+                ):
+                    install.stage_source(version_dir, **options)
 
 
 class LauncherAndPathTests(unittest.TestCase):

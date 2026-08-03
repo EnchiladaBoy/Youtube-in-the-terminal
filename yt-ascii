@@ -6,6 +6,7 @@ Usage:
 
 Keys (while playing):
     space        pause / resume
+    s            cycle visual style
     ← / →        seek -5s / +5s
     ↓ / ↑        seek -30s / +30s
     0..9         jump to 0%..90% of the video
@@ -27,9 +28,9 @@ import signal
 import subprocess
 import sys
 import time
+import unicodedata
 
-
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 INSTALL_REF_ENV = "YTASCII_INSTALL_REF"
 _MAX_INSTALL_REF_LENGTH = 64
 _VERSION_REF_RE = re.compile(
@@ -60,7 +61,16 @@ PALETTES = {
     "simple": " .:-=+*#%@",
     "dense":  " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$",
     "blocks": " ░▒▓█",
+    "binary": " 01",
+    "numbers": " 123456789",
+    "symbols": " .,:;!|?*#@",
+    "matrix": " 01:=+*<>|/",
 }
+
+# Kept dependency-free so ``yt-ascii --version`` works before NumPy is
+# installed. ``run`` and ``self_test`` statically import the implementation
+# only after dependency checks have succeeded.
+STYLE_NAMES = ("classic", "bayer", "duotone", "riso", "contour", "glitch")
 
 # Terminal character cells are ~2x taller than wide; correct aspect ratio.
 CHAR_ASPECT = 2.0
@@ -417,6 +427,8 @@ def _read_keys_windows():
             keys.append("q")
         elif ch == "\x1b":
             keys.append("esc")
+        elif ch == "s":
+            keys.append("s")
         elif ch.isdigit():
             keys.append(ch)
     return keys
@@ -453,6 +465,8 @@ def _read_keys_posix(fd):
                 keys.append("space"); i += 1; continue
             if ch in "qQ\x03":  # Ctrl-C as well
                 keys.append("q"); i += 1; continue
+            if ch == "s":
+                keys.append("s"); i += 1; continue
             if ch.isdigit():
                 keys.append(ch); i += 1; continue
             i += 1
@@ -635,6 +649,7 @@ def parse_args():
         epilog=(
             "Keys while playing:\n"
             "  space        pause / resume\n"
+            "  s            cycle visual style\n"
             "  ←/→          seek ±5s\n"
             "  ↓/↑          seek ±30s\n"
             "  0..9         jump to 0%..90%\n"
@@ -693,6 +708,8 @@ def parse_args():
     p.add_argument("--palette", choices=PALETTES, default="dense",
                    help="ASCII palette (default: dense, ~70 chars)")
     p.add_argument("--chars", help="custom palette, dark→light")
+    p.add_argument("--style", choices=STYLE_NAMES, default="classic",
+                   help="visual style (default: classic)")
     p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
 
@@ -711,7 +728,7 @@ def prompt_for_url():
         f"{reset}\n\n"
         f"{gray}   Paste a YouTube link and press Enter to play it.\n"
         "   While playing:  space=pause  <-/-> +-5s  up/down +-30s  "
-        "0-9=jump  q=quit\n"
+        "0-9=jump  s=style  q=quit\n"
         "   Run with --help for color / audio / effect options."
         f"{reset}\n\n"
     )
@@ -745,6 +762,11 @@ def run(args):
 
     import numpy as np
     from yt_ascii_renderer import AnsiRenderer
+    from yt_ascii_styles import StyleProcessor
+
+    style_processor = StyleProcessor(args.style)
+    args.style = style_processor.name
+    style_processor.reset()  # each new media item starts with fresh style state
 
     chars = args.chars or PALETTES[args.palette]
     if not chars:
@@ -803,6 +825,12 @@ def run(args):
     # Reveal animation: wall-clock time the current segment's reveal began
     # (set on the first rendered frame; None until then, and when disabled).
     reveal_start = None
+    # The raw frame is retained as a zero-copy view of ``frame_buffer``. While
+    # paused that buffer is stable, allowing an immediate style redraw without
+    # restarting or advancing the decoder.
+    last_frame = None
+    last_frame_time = 0.0
+    last_reveal_fraction = 1.0
 
     def current_pos():
         if paused:
@@ -819,7 +847,7 @@ def run(args):
         state["video"] = state["audio"] = None
 
     def seek_to(new_pos):
-        nonlocal seek_pos, seek_at, frame_no, paused
+        nonlocal seek_pos, seek_at, frame_no, paused, last_frame
         if info["duration"]:
             new_pos = max(0.0, min(new_pos, info["duration"] - 0.5))
         else:
@@ -830,6 +858,8 @@ def run(args):
         seek_at = time.monotonic()
         frame_no = 0
         paused = False  # resume on seek so the user sees the new position
+        last_frame = None
+        style_processor.reset()
         begin_reveal()  # replay the reveal from the new position
 
     def toggle_pause():
@@ -865,7 +895,7 @@ def run(args):
         Audio is left running so there's no audible gap on resize."""
         nonlocal cols, rows, ow, oh, pix_h, frame_size
         nonlocal frame_buffer, discard_buffer, reveal_start
-        nonlocal seek_pos, seek_at, frame_no, pause_started
+        nonlocal seek_pos, seek_at, frame_no, pause_started, last_frame
         new_cols, new_rows, new_ow, new_oh = compute_dims()
         if (new_ow, new_oh, new_cols) == (ow, oh, cols):
             return
@@ -890,6 +920,8 @@ def run(args):
         seek_pos = pos
         seek_at = resize_at
         frame_no = 0
+        last_frame = None
+        style_processor.reset()
         if paused:
             pause_started = resize_at
             if _CAN_SUSPEND:
@@ -907,7 +939,7 @@ def run(args):
         googlevideo URL expired, or a network blip outlasted ffmpeg's own
         reconnect) — refresh the URL and resume from the last shown frame.
         Returns True if playback resumed, False if we should stop."""
-        nonlocal seek_pos, seek_at, frame_no, paused
+        nonlocal seek_pos, seek_at, frame_no, paused, last_frame
         pos = seek_pos + frame_no * frame_dur
         dur = info["duration"]
         if dur and pos >= dur - 1.0:
@@ -931,6 +963,8 @@ def run(args):
         stop_all()
         start_at(pos)
         seek_pos, seek_at, frame_no, paused = pos, time.monotonic(), 0, False
+        last_frame = None
+        style_processor.reset()
         return True
 
     resize_flag = [False]
@@ -972,6 +1006,34 @@ def run(args):
         rain_chars=rain_chars,
     )
 
+    def render_frame(frame, video_time, reveal_fraction):
+        """Apply the active visual style before the renderer/reveal stage."""
+        styled = style_processor.apply(frame, video_time)
+        if reveal_fraction < 1.0:
+            return (
+                renderer.render_rain(styled, reveal_fraction)
+                if reveal_style == "rain"
+                else renderer.render_scatter(styled, reveal_fraction)
+            )
+        return renderer.render(styled)
+
+    def redraw_paused_frame():
+        """Render the retained raw frame with the current paused state."""
+        if last_frame is None:
+            return
+        body = render_frame(
+            last_frame, last_frame_time, last_reveal_fraction
+        )
+        status = build_status(
+            args.fps, current_pos(), info, cols, paused=True,
+            style=args.style,
+        )
+        write_terminal_frame(body, status)
+
+    def cycle_style():
+        """Select the next style; the caller coordinates any paused redraw."""
+        args.style = style_processor.cycle()
+
     def begin_reveal():
         """Start (or restart, after a seek) the current reveal animation: clear
         the screen so the picture builds on from nothing. The effect then grows
@@ -991,6 +1053,7 @@ def run(args):
         while True:
             # ── Handle keyboard ──────────────────────────────────────────
             quit_now = False
+            style_changed = False
             pending_seek = None  # final target after applying all queued keys
             if is_tty:
                 for key in read_keys(fd):
@@ -999,6 +1062,10 @@ def run(args):
                         break
                     if key == "space":
                         toggle_pause()
+                        continue
+                    if key == "s":
+                        cycle_style()
+                        style_changed = True
                         continue
                     base = pending_seek if pending_seek is not None else current_pos()
                     if key == "left":
@@ -1015,6 +1082,11 @@ def run(args):
                 break
             if pending_seek is not None:
                 seek_to(pending_seek)
+            # Key reads are batches. Redraw after the whole batch so both
+            # ``space, s`` and ``s, space`` end with a correctly styled frozen
+            # frame rather than a new label over the previous style.
+            if style_changed and paused:
+                redraw_paused_frame()
 
             if resize_flag[0]:
                 resize_flag[0] = False
@@ -1023,7 +1095,9 @@ def run(args):
             # ── Paused: just idle and keep the status line updating ─────
             if paused:
                 pos = current_pos()
-                status = build_status(args.fps, pos, info, cols, paused=True)
+                status = build_status(
+                    args.fps, pos, info, cols, paused=True, style=args.style
+                )
                 sys.stdout.write(f"\x1b[{oh + 1};1H" + status + "\x1b[K")
                 sys.stdout.flush()
                 time.sleep(0.05)
@@ -1052,6 +1126,7 @@ def run(args):
 
             frame = np.frombuffer(frame_buffer, dtype=np.uint8)
             frame = frame.reshape(pix_h, ow, 3)
+            frame_time = seek_pos + frame_no * frame_dur
 
             # Reveal animations unmask the live frame over `reveal_secs`, timed
             # from the first frame actually shown (so a slow stream connect
@@ -1063,17 +1138,15 @@ def run(args):
                 frac = (rnow - reveal_start) / reveal_secs
             else:
                 frac = 1.0
-            if frac < 1.0:
-                body = (
-                    renderer.render_rain(frame, frac)
-                    if reveal_style == "rain"
-                    else renderer.render_scatter(frame, frac)
-                )
-            else:
-                body = renderer.render(frame)
+            body = render_frame(frame, frame_time, frac)
+            last_frame = frame
+            last_frame_time = frame_time
+            last_reveal_fraction = frac
 
             pos = seek_pos + seg_elapsed
-            status = build_status(args.fps, pos, info, cols, paused=False)
+            status = build_status(
+                args.fps, pos, info, cols, paused=False, style=args.style
+            )
 
             write_terminal_frame(body, status)
 
@@ -1091,29 +1164,103 @@ def run(args):
         sys.stdout.flush()
 
 
-def build_status(fps, pos, info, cols, paused):
+def _terminal_cell_width(text):
+    """Return a conservative terminal width using only the standard library."""
+    width = 0
+    for char in text:
+        if unicodedata.combining(char) or unicodedata.category(char) in ("Cf", "Cc"):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
+def _truncate_terminal_cells(text, limit):
+    """Truncate text without splitting a character past the terminal edge."""
+    result = []
+    used = 0
+    for char in text:
+        if unicodedata.category(char) in ("Cf", "Cc"):
+            continue
+        char_width = _terminal_cell_width(char)
+        if used + char_width > limit:
+            break
+        result.append(char)
+        used += char_width
+    return "".join(result)
+
+
+def build_status(fps, pos, info, cols, paused, style="classic"):
     if info["duration"]:
         clock = f"{fmt_time(pos)} / {fmt_time(info['duration'])}"
     else:
         clock = fmt_time(pos)
     tag = "‖ PAUSED" if paused else "▶"
-    controls = "space:pause  ←→±5s  ↑↓±30s  0-9:jump  q:quit"
-    head = f"  {tag}  {clock}  {fps}fps  "
-    title_room = max(0, cols - len(head) - len(controls) - 4)
-    title = info["title"][:title_room]
-    sep = "  " if title else ""
-    return f"\x1b[0m{head}{title}{sep}{controls}"
+    width = max(0, int(cols))
+    head_options = (
+        f"  {tag}  {clock}  {fps}fps  style:{style}",
+        f"  {tag}  {clock}  style:{style}",
+        f"  {clock}  style:{style}",
+        f"  style:{style}",
+    )
+    head = next(
+        (value for value in head_options if _terminal_cell_width(value) <= width),
+        "",
+    )
+    if not head:
+        return "\x1b[0m" + _truncate_terminal_cells(head_options[-1], width)
+
+    control_options = (
+        "space:pause  s:style  ←→±5s  ↑↓±30s  0-9:jump  q:quit",
+        "space:pause  s:style  arrows:seek  0-9:jump  q:quit",
+        "space  s:style  arrows:seek  q:quit",
+        "s:style  q:quit",
+    )
+    controls = next(
+        (
+            value for value in control_options
+            if _terminal_cell_width(head) + 2 + _terminal_cell_width(value) <= width
+        ),
+        "",
+    )
+    head_width = _terminal_cell_width(head)
+    controls_width = _terminal_cell_width(controls) + 2 if controls else 0
+    title_room = max(0, width - head_width - controls_width - 2)
+    title = (
+        _truncate_terminal_cells(info["title"], title_room)
+        if title_room else ""
+    )
+    visible = head
+    if title:
+        visible += "  " + title
+    if controls:
+        visible += "  " + controls
+    return "\x1b[0m" + _truncate_terminal_cells(visible, width)
 
 
 def self_test():
-    """Exercise bundled NumPy and the renderer without network access."""
+    """Exercise bundled NumPy, every style, and rendering without network."""
     import numpy as np
     from yt_ascii_renderer import AnsiRenderer
+    from yt_ascii_styles import STYLE_NAMES as IMPLEMENTED_STYLES, StyleProcessor
+
+    if tuple(IMPLEMENTED_STYLES) != STYLE_NAMES:
+        fail("style registry self-test failed")
 
     frame = np.array([[[1, 2, 3]]], dtype=np.uint8)
     expected = b"\x1b[38;2;1;2;3mx\x1b[0m\x1b[K"
     if AnsiRenderer("x").render(frame) != expected:
         fail("renderer self-test failed")
+
+    sample = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
+    processor = StyleProcessor()
+    renderer = AnsiRenderer(" .#")
+    for name in STYLE_NAMES:
+        processor.select(name)
+        styled = processor.apply(sample, 0.25)
+        if styled.shape != sample.shape or styled.dtype != np.uint8:
+            fail(f"{name} style self-test failed")
+        if not renderer.render(styled):
+            fail(f"{name} style renderer self-test failed")
     sys.stdout.write("yt-ascii self-test: ok\n")
 
 

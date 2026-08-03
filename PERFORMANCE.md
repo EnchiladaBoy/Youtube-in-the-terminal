@@ -48,6 +48,36 @@ python benchmarks/benchmark_renderer.py --width 240 --height 68
 Steady truecolor, half-block and grayscale output is byte-for-byte identical to
 the old renderer in differential tests.
 
+## v0.4 style pipeline
+
+The v0.4 candidate adds a NumPy-only transform stage between FFmpeg's RGB frame
+reshape and `AnsiRenderer`. Each transform accepts a `uint8` RGB array and
+returns the same shape and dtype without mutating the decoded frame. `classic`
+is a zero-copy identity path, so the default output and renderer cost remain
+unchanged.
+
+The transform operates on the already scaled terminal-resolution frame rather
+than the source video. Palette selection, character or half-block encoding, and
+the scatter/rain reveal masks remain downstream, which lets every style compose
+with every renderer mode without duplicating ANSI construction. Time-dependent
+styles derive their phase from the decoded playback timestamp, so pause and
+seek behavior is reproducible rather than tied to wall-clock scheduling.
+
+`benchmark_renderer.py` reports each style transform separately at a 240 x 136
+RGB input size as well as the existing renderer cases. The candidate acceptance
+budget is a local median below 2 ms per transform; this timing is reported for
+comparison and is deliberately not a CI gate because hardware variance would
+make that gate flaky. Run the complete benchmark with:
+
+```sh
+python benchmarks/benchmark_renderer.py --width 240 --height 68
+```
+
+The Bayer, duotone, Riso, contour and glitch effects are independent
+implementations of established image-processing techniques. Ladybug supplied
+visual inspiration only; its code, shaders, assets and preset values are not
+used.
+
 ## Baseline that motivated the changes
 
 The original hot path converted RGB channels into fixed-width Unicode arrays
