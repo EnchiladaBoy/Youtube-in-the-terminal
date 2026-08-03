@@ -92,11 +92,17 @@ class ArchiveTests(unittest.TestCase):
         link = zipfile.ZipInfo("repo/link")
         link.create_system = 3
         link.external_attr = (stat.S_IFLNK | 0o777) << 16
+        backslash = zipfile.ZipInfo("repo/outside")
+        # ZipInfo normally rewrites os.sep while it is constructed.  Assign
+        # the stored name afterward so this is a malformed archive member on
+        # Windows too, rather than a normalized test fixture.
+        backslash.filename = r"repo\outside"
+        backslash.orig_filename = backslash.filename
         cases = [
             [("../outside", b"bad")],
             [("/absolute", b"bad")],
             [("D:/outside", b"bad")],
-            [("repo\\outside", b"bad")],
+            [(backslash.filename, backslash)],
             [("repo/CON.txt", b"bad")],
             [("repo/trailing. ", b"bad")],
             [("repo/link", link)],
@@ -566,7 +572,8 @@ class LifecycleTests(unittest.TestCase):
             self.assertEqual((current, current_ref), (first, first_ref))
             self.assertTrue(first.is_dir())
             versions = list((root / "versions").iterdir())
-            self.assertEqual(versions, [first])
+            self.assertEqual(len(versions), 1)
+            self.assertTrue(versions[0].samefile(first))
 
     def test_existing_install_rejects_bin_directory_migration(self):
         with tempfile.TemporaryDirectory() as directory:
