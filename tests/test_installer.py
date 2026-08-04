@@ -69,13 +69,17 @@ def managed_fixture(base, ref, channel, edge_build=None, legacy=False):
         )
     bin_dir.mkdir(parents=True)
     (root / install.ROOT_MARKER).write_text(
-        install.ROOT_MARKER_CONTENT, encoding="ascii"
+        install.ROOT_MARKER_CONTENT, encoding="ascii", newline="\n"
     )
     (root / install.CURRENT_FILE).write_text(
-        f"{current}\n{ref}\n", encoding="utf-8"
+        f"{current}\n{ref}\n", encoding="utf-8", newline="\n"
     )
     launcher = install.launcher_path(bin_dir)
-    launcher.write_text(expected_launcher_content(root, bin_dir), encoding="utf-8")
+    launcher.write_text(
+        expected_launcher_content(root, bin_dir),
+        encoding="utf-8",
+        newline="\n",
+    )
     if os.name != "nt":
         launcher.chmod(0o755)
     install.write_state(
@@ -471,6 +475,12 @@ class LauncherAndPathTests(unittest.TestCase):
             self.assertEqual(destination.read_text(encoding="utf-8"), "managed\n")
             self.assertTrue(predictable.is_symlink())
 
+    def test_atomic_write_uses_protocol_lf_bytes_on_every_platform(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "current"
+            install.write_atomic(destination, "generation\nedge\n")
+            self.assertEqual(destination.read_bytes(), b"generation\nedge\n")
+
     @unittest.skipIf(os.name == "nt", "POSIX profile test")
     def test_posix_profile_management_preserves_existing_content(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -825,7 +835,9 @@ class UpdateTests(unittest.TestCase):
                 base, "v0.4.0", "stable"
             )
             (root / install.CURRENT_FILE).write_text(
-                f"{current}\nv0.4.0\nextra\n", encoding="utf-8"
+                f"{current}\nv0.4.0\nextra\n",
+                encoding="utf-8",
+                newline="\n",
             )
             with self.assertRaisesRegex(install.InstallerError, "current pointer"):
                 install.resolve_update(root, bin_dir)
@@ -885,7 +897,9 @@ class UpdateTests(unittest.TestCase):
             )
             relative = Path("versions") / "installed"
             (root / install.CURRENT_FILE).write_text(
-                f"{relative}\nv0.4.0\n", encoding="utf-8"
+                f"{relative}\nv0.4.0\n",
+                encoding="utf-8",
+                newline="\n",
             )
             state = install.read_state(root)
             state["current"] = str(relative)

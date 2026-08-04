@@ -234,6 +234,15 @@ class DiscoveryTests(unittest.TestCase):
                 with self.assertRaises(update.UpdateError):
                     update.discover_install(self.fixture.module)
 
+    def test_rejects_noncanonical_crlf_current_pointer(self):
+        self.fixture.write_current()
+        current = self.fixture.root / update.CURRENT_FILE
+        current.write_bytes(
+            f"{self.fixture.generation}\r\nv0.4.0\r\n".encode("utf-8")
+        )
+        with self.assertRaisesRegex(update.UpdateError, "current pointer"):
+            update.discover_install(self.fixture.module)
+
     def test_rejects_duplicate_state_keys(self):
         text = json.dumps(self.fixture.state)
         self.fixture.write_state(text[:-1] + ',"root":"duplicate"}\n')
@@ -250,7 +259,9 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaisesRegex(update.UpdateError, "launcher"):
             update.discover_install(self.fixture.module)
         _, content = update._expected_launcher(self.fixture.root, self.fixture.bin_dir)
-        self.fixture.launcher.write_text(content, encoding="utf-8")
+        self.fixture.launcher.write_text(
+            content, encoding="utf-8", newline="\n"
+        )
         if os.name != "nt":
             self.fixture.launcher.chmod(0o644)
             with self.assertRaisesRegex(update.UpdateError, "executable"):
