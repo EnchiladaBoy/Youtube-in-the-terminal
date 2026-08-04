@@ -95,10 +95,12 @@ same effect definitions work with both portable ASCII and opt-in single-cell
 Unicode glyph schemas. `none` must take the original v0.4 path without copying
 the frame or changing its output bytes.
 
-The next shared-engine slice adds `number-field`, `glyph-grid`, and
-`vector-field` through that same cell-plane contract. They respectively encode
-luminance deciles, a tone-weighted seeded lattice, and quantized Sobel gradient
-directions; no new renderer or output path is involved.
+The completed cell/type stage adds `number-field`, `glyph-grid`,
+`vector-field`, `word-field`, `inscription`, and `type-echo` through that same
+cell-plane contract. They cover luminance deciles, a tone-weighted seeded
+lattice, quantized Sobel directions, configurable word density, contour text,
+and stateless time-derived type echoes; no new renderer or output path is
+involved.
 
 Procedural layouts are derived from an explicit integer seed. Animation uses
 decoded video time rather than wall-clock time, and temporal or size-dependent
@@ -117,9 +119,9 @@ The benchmark reports every effect in two forms:
   construction together, including structured glyph output.
 
 For reproducibility, composed cases use the `duotone` style, ASCII effect
-glyphs, a fixed seed, and a requested half-block presentation. Glyph effects
-therefore exercise their character fallback while RGB effects retain the
-half-block renderer.
+glyphs, the default `YTASCII` text, a fixed seed, and a requested half-block
+presentation. Glyph effects therefore exercise their character fallback while
+RGB effects retain the half-block renderer.
 
 The candidate targets at a 240 x 136 RGB input are:
 
@@ -137,21 +139,24 @@ composed column includes `duotone`, the named effect, and ANSI construction:
 
 | Effect | Isolated | Composed |
 |---|---:|---:|
-| `none` | 0.001 ms | 2.128 ms |
-| `geometry` | 0.335 ms | 1.742 ms |
-| `contour-glyph` | 0.207 ms | 1.608 ms |
-| `hatch` | 0.123 ms | 1.498 ms |
-| `dotfield` | 0.123 ms | 1.503 ms |
-| `tile-mosaic` | 0.311 ms | 2.293 ms |
-| `wave-lines` | 0.380 ms | 2.559 ms |
-| `voronoi` | 0.431 ms | 2.495 ms |
-| `afterimage` | 0.515 ms | 2.627 ms |
-| `number-field` | 0.058 ms | 1.423 ms |
-| `glyph-grid` | 0.123 ms | 1.523 ms |
-| `vector-field` | 0.229 ms | 1.640 ms |
+| `none` | 0.001 ms | 2.141 ms |
+| `geometry` | 0.326 ms | 1.709 ms |
+| `contour-glyph` | 0.212 ms | 1.580 ms |
+| `hatch` | 0.125 ms | 1.489 ms |
+| `dotfield` | 0.126 ms | 1.511 ms |
+| `tile-mosaic` | 0.309 ms | 2.293 ms |
+| `wave-lines` | 0.373 ms | 2.592 ms |
+| `voronoi` | 0.439 ms | 2.497 ms |
+| `afterimage` | 0.502 ms | 2.626 ms |
+| `number-field` | 0.062 ms | 1.442 ms |
+| `glyph-grid` | 0.126 ms | 1.491 ms |
+| `vector-field` | 0.234 ms | 1.610 ms |
+| `word-field` | 0.157 ms | 1.523 ms |
+| `inscription` | 0.203 ms | 1.572 ms |
+| `type-echo` | 0.254 ms | 1.654 ms |
 
 The matching `duotone` plus half-block renderer control, without constructing
-or applying an effect processor, measured 2.111 ms. The `none` path was 0.79%
+or applying an effect processor, measured 2.128 ms. The `none` path was 0.63%
 slower in this run, within the 3% overhead budget. Every effect met the
 candidate targets on this host. These results exclude
 FFmpeg, terminal writes, terminal parsing, and pacing, and are not guarantees

@@ -28,7 +28,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from yt_ascii_renderer import AnsiRenderer  # noqa: E402
-from yt_ascii_effects import EFFECT_NAMES, EffectProcessor  # noqa: E402
+from yt_ascii_effects import (  # noqa: E402
+    DEFAULT_EFFECT_TEXT,
+    EFFECT_NAMES,
+    EffectProcessor,
+)
 from yt_ascii_frames import EffectContext, EffectFrame  # noqa: E402
 from yt_ascii_styles import STYLE_NAMES, StyleProcessor  # noqa: E402
 
@@ -220,10 +224,18 @@ def main():
     ))
     for index, name in enumerate(EFFECT_NAMES):
         isolated = EffectProcessor(
-            name, glyph_mode="ascii", speed=1.0, seed=20260804
+            name,
+            glyph_mode="ascii",
+            speed=1.0,
+            seed=20260804,
+            effect_text=DEFAULT_EFFECT_TEXT,
         )
         composed = EffectProcessor(
-            name, glyph_mode="ascii", speed=1.0, seed=20260804
+            name,
+            glyph_mode="ascii",
+            speed=1.0,
+            seed=20260804,
+            effect_text=DEFAULT_EFFECT_TEXT,
         )
         cases.append((
             f"effect/isolated/{name}",

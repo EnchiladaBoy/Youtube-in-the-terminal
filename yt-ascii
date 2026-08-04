@@ -85,6 +85,9 @@ EFFECT_NAMES = (
     "number-field",
     "glyph-grid",
     "vector-field",
+    "word-field",
+    "inscription",
+    "type-echo",
 )
 GLYPH_EFFECT_NAMES = frozenset(
     (
@@ -95,7 +98,14 @@ GLYPH_EFFECT_NAMES = frozenset(
         "number-field",
         "glyph-grid",
         "vector-field",
+        "word-field",
+        "inscription",
+        "type-echo",
     )
+)
+DEFAULT_EFFECT_TEXT = "YTASCII"
+_RTL_EFFECT_TEXT_BIDI_CLASSES = frozenset(
+    ("R", "AL", "AN", "RLE", "RLO", "RLI")
 )
 
 # Terminal character cells are ~2x taller than wide; correct aspect ratio.
@@ -235,6 +245,50 @@ def effect_speed_type(value):
             "--effect-speed must be a positive finite number"
         )
     return speed
+
+
+def validate_effect_text(value, glyph_mode="ascii"):
+    """Return a safe, unchanged terminal-cell inscription.
+
+    This validation deliberately stays in the dependency-free launcher so
+    ``--help`` and argument errors work before NumPy is installed.  The effect
+    engine repeats the same checks for direct programmatic callers.
+    """
+    if not isinstance(value, str):
+        raise TypeError("--effect-text must be text")
+    if glyph_mode not in ("ascii", "unicode"):
+        raise ValueError("effect glyph mode must be 'ascii' or 'unicode'")
+    if not 1 <= len(value) <= 253:
+        raise ValueError("--effect-text must contain 1..253 code points")
+    if all(char == " " for char in value):
+        raise ValueError(
+            "--effect-text must contain at least one non-space character"
+        )
+
+    for position, char in enumerate(value, start=1):
+        category = unicodedata.category(char)
+        unsafe = (
+            (char != " " and char.isspace())
+            or not char.isprintable()
+            or category in ("Cc", "Cf", "Cs")
+            or category.startswith("M")
+            or bool(unicodedata.combining(char))
+            or unicodedata.bidirectional(char) in _RTL_EFFECT_TEXT_BIDI_CLASSES
+            or unicodedata.east_asian_width(char) in ("W", "F")
+        )
+        if unsafe:
+            raise ValueError(
+                "--effect-text contains an unsupported code point at "
+                f"position {position} (U+{ord(char):04X}); only safe "
+                "single-cell left-to-right characters are allowed"
+            )
+        if glyph_mode == "ascii" and not 0x20 <= ord(char) <= 0x7E:
+            raise ValueError(
+                "--effect-text contains a non-ASCII code point at "
+                f"position {position} (U+{ord(char):04X}); use "
+                "--effect-glyphs unicode for safe Unicode text"
+            )
+    return value
 
 
 def fail(msg, code=1):
@@ -779,6 +833,9 @@ def parse_args():
                    default="ascii", metavar="MODE",
                    help="glyph set for structural effects: ascii or unicode "
                         "(default: ascii)")
+    p.add_argument("--effect-text", default=DEFAULT_EFFECT_TEXT, metavar="TEXT",
+                   help="text used by word, inscription, and echo effects "
+                        f"(default: {DEFAULT_EFFECT_TEXT})")
     p.add_argument("--effect-speed", type=effect_speed_type, default=1.0,
                    metavar="N",
                    help="animation-speed multiplier for structural effects "
@@ -786,7 +843,14 @@ def parse_args():
     p.add_argument("--effect-seed", type=int, default=0, metavar="N",
                    help="deterministic procedural-layout seed (default: 0)")
     p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
-    return p.parse_args()
+    args = p.parse_args()
+    try:
+        args.effect_text = validate_effect_text(
+            args.effect_text, args.effect_glyphs
+        )
+    except (TypeError, ValueError) as error:
+        p.error(str(error))
+    return args
 
 
 def prompt_for_url():
@@ -849,6 +913,7 @@ def run(args, automatic_update_check=None):
         glyph_mode=getattr(args, "effect_glyphs", "ascii"),
         speed=getattr(args, "effect_speed", 1.0),
         seed=getattr(args, "effect_seed", 0),
+        effect_text=getattr(args, "effect_text", DEFAULT_EFFECT_TEXT),
     )
     args.effect = effect_processor.name
     effect_processor.reset("source")
@@ -1405,6 +1470,7 @@ def self_test():
     """Exercise bundled NumPy, every style/effect and rendering offline."""
     import numpy as np
     from yt_ascii_effects import (
+        DEFAULT_EFFECT_TEXT as IMPLEMENTED_DEFAULT_EFFECT_TEXT,
         EFFECT_NAMES as IMPLEMENTED_EFFECTS,
         EFFECT_SPECS,
         EffectProcessor,
@@ -1415,6 +1481,8 @@ def self_test():
 
     if tuple(IMPLEMENTED_STYLES) != STYLE_NAMES:
         fail("style registry self-test failed")
+    if IMPLEMENTED_DEFAULT_EFFECT_TEXT != DEFAULT_EFFECT_TEXT:
+        fail("effect text default self-test failed")
     if tuple(IMPLEMENTED_EFFECTS) != EFFECT_NAMES:
         fail("effect registry self-test failed")
     implemented_glyph_effects = frozenset(
@@ -1475,6 +1543,50 @@ def self_test():
             temporal = effect_processor.apply(moved, later)
             if not renderer.render(temporal.rgb, temporal.cells):
                 fail("afterimage temporal self-test failed")
+
+    white_text_sample = np.full((8, 8, 3), 255, dtype=np.uint8)
+    inscription_sample = np.zeros((8, 8, 3), dtype=np.uint8)
+    inscription_sample[:, 4:] = 255
+    text_samples = {
+        "word-field": white_text_sample,
+        "inscription": inscription_sample,
+        "type-echo": white_text_sample,
+    }
+    for name, text_sample in text_samples.items():
+        custom = EffectProcessor(name, effect_text="CODEX").apply(
+            text_sample, context
+        )
+        if custom.cells is None or not set("CODEX").issubset(
+            set(custom.cells.glyphs)
+        ):
+            fail(f"{name} custom text self-test failed")
+        custom_indices = {
+            custom.cells.glyphs.index(glyph) for glyph in "CODEX"
+        }
+        rendered_indices = set(np.unique(custom.cells.glyph_indices).tolist())
+        if (
+            not custom_indices.issubset(rendered_indices)
+            or not renderer.render(custom.rgb, custom.cells)
+        ):
+            fail(f"{name} custom text self-test failed")
+
+    echo_later = EffectContext(
+        video_time=0.5,
+        frame_sequence=1,
+        cell_shape=sample.shape[:2],
+        requested_pixels=False,
+        advance_state=False,
+    )
+    first_echo = EffectProcessor(
+        "type-echo", effect_text="CODEX"
+    ).apply(white_text_sample, context)
+    later_echo = EffectProcessor(
+        "type-echo", effect_text="CODEX"
+    ).apply(white_text_sample, echo_later)
+    if np.array_equal(
+        first_echo.cells.glyph_indices, later_echo.cells.glyph_indices
+    ):
+        fail("type-echo temporal self-test failed")
 
     pixel_sample = np.repeat(sample, 2, axis=0)
     pixel_context = EffectContext(

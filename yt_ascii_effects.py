@@ -8,12 +8,15 @@ input object so enabling the effect engine has no cost in the default path.
 from __future__ import annotations
 
 import math
+import unicodedata
 from dataclasses import dataclass
 
 import numpy as np
 
 from yt_ascii_frames import CellPlane, EffectContext, EffectFrame
 
+
+DEFAULT_EFFECT_TEXT = "YTASCII"
 
 EFFECT_NAMES = (
     "none",
@@ -28,6 +31,9 @@ EFFECT_NAMES = (
     "number-field",
     "glyph-grid",
     "vector-field",
+    "word-field",
+    "inscription",
+    "type-echo",
 )
 GLYPH_EFFECT_NAMES = frozenset(
     (
@@ -38,6 +44,9 @@ GLYPH_EFFECT_NAMES = frozenset(
         "number-field",
         "glyph-grid",
         "vector-field",
+        "word-field",
+        "inscription",
+        "type-echo",
     )
 )
 STATEFUL_EFFECT_NAMES = frozenset(("afterimage",))
@@ -51,6 +60,14 @@ class EffectSpec:
     glyph_owned: bool
     stateful: bool
     pixel_policy: str
+
+
+@dataclass(frozen=True)
+class _TextSchema:
+    """Immutable glyph schema and token indices for a configured text effect."""
+
+    glyphs: str
+    token: np.ndarray
 
 
 EFFECT_SPECS = tuple(
@@ -112,6 +129,106 @@ _WAVE = np.array(
     dtype=np.int16,
 )
 _UINT64_MASK = (1 << 64) - 1
+_TEXT_EFFECT_NAMES = frozenset(("word-field", "inscription", "type-echo"))
+_RTL_BIDI_CLASSES = frozenset(("R", "AL", "AN", "RLE", "RLO", "RLI"))
+
+
+def _validate_effect_text(effect_text, glyph_mode):
+    """Validate exact, single-cell text without rewriting user input."""
+    if not isinstance(effect_text, str):
+        raise TypeError("effect_text must be a string")
+    if not 1 <= len(effect_text) <= 253:
+        raise ValueError("effect_text must contain 1 to 253 code points")
+    if not any(glyph != " " for glyph in effect_text):
+        raise ValueError(
+            "effect_text must contain at least one non-space character"
+        )
+
+    for position, glyph in enumerate(effect_text, 1):
+        category = unicodedata.category(glyph)
+        if (
+            (glyph.isspace() and glyph != " ")
+            or not glyph.isprintable()
+            or category in ("Cc", "Cf", "Cs")
+            or category.startswith("M")
+            or unicodedata.combining(glyph)
+            or unicodedata.bidirectional(glyph) in _RTL_BIDI_CLASSES
+            or unicodedata.east_asian_width(glyph) in ("W", "F")
+        ):
+            raise ValueError(
+                "effect_text contains an unsupported code point at position "
+                f"{position} (U+{ord(glyph):04X}); only safe single-cell "
+                "left-to-right characters are allowed"
+            )
+        if glyph_mode == "ascii" and not 0x20 <= ord(glyph) <= 0x7E:
+            raise ValueError(
+                "effect_text contains a non-ASCII code point at position "
+                f"{position} (U+{ord(glyph):04X}); use glyph_mode='unicode' "
+                "for safe Unicode text"
+            )
+
+
+def _make_text_schema(effect_text, decorations, token_text):
+    glyph_list = [" "]
+    glyph_indices = {" ": 0}
+    # User characters have stable priority over decorations, making schemas
+    # predictable even when the configured text includes punctuation used by
+    # the effect itself.
+    for glyph in effect_text:
+        if glyph not in glyph_indices:
+            glyph_indices[glyph] = len(glyph_list)
+            glyph_list.append(glyph)
+    for glyph in decorations:
+        if glyph not in glyph_indices:
+            glyph_indices[glyph] = len(glyph_list)
+            glyph_list.append(glyph)
+    token = np.fromiter(
+        (glyph_indices[glyph] for glyph in token_text),
+        dtype=np.uint8,
+        count=len(token_text),
+    )
+    token.setflags(write=False)
+    return _TextSchema("".join(glyph_list), token)
+
+
+def _text_schemas(effect_text, glyph_mode):
+    if glyph_mode == "ascii":
+        word_mark, left_mark, right_mark, echo_mark = ".", "[", "]", ":"
+    else:
+        word_mark, left_mark, right_mark, echo_mark = "·", "‹", "›", "∶"
+    return {
+        "word-field": _make_text_schema(
+            effect_text,
+            word_mark,
+            effect_text + word_mark + " ",
+        ),
+        "inscription": _make_text_schema(
+            effect_text,
+            left_mark + right_mark,
+            left_mark + effect_text + right_mark + " ",
+        ),
+        "type-echo": _make_text_schema(
+            effect_text,
+            echo_mark,
+            effect_text + echo_mark + " ",
+        ),
+    }
+
+
+def _effect_tick(video_time, speed, rate):
+    """Return a floor tick, including when finite operands overflow float."""
+    scaled = video_time * speed * rate
+    if math.isfinite(scaled):
+        return math.floor(scaled)
+    # A finite float has a compact exact integer ratio.  The fallback avoids
+    # converting an infinite product while retaining floor semantics for very
+    # large positive and negative inputs.
+    time_numerator, time_denominator = video_time.as_integer_ratio()
+    speed_numerator, speed_denominator = speed.as_integer_ratio()
+    return (
+        time_numerator * speed_numerator * rate
+        // (time_denominator * speed_denominator)
+    )
 
 
 def _validate_frame(frame):
@@ -381,6 +498,89 @@ def _vector_field(frame, shape, glyphs):
     return EffectFrame(frame, CellPlane(indices, glyphs, colors))
 
 
+def _word_field(frame, shape, schema, seed):
+    """Repeat configured text through a seeded luminance stipple."""
+    colors = _cell_rgb(frame, shape)
+    luminance = _luminance(colors)
+    rows, cols = shape
+    if rows == 0 or cols == 0:
+        indices = np.zeros(shape, dtype=np.uint8)
+        return EffectFrame(frame, CellPlane(indices, schema.glyphs, colors))
+
+    token_length = len(schema.token)
+    row_grid = np.arange(rows, dtype=np.int64)[:, None]
+    col_grid = np.arange(cols, dtype=np.int64)[None, :]
+    stagger = max(1, (token_length + 1) // 2)
+    positions = (
+        col_grid + row_grid * stagger + (seed % token_length)
+    ) % token_length
+    candidates = schema.token[positions]
+    hashes = (_hash_grid(rows, cols, seed) >> np.uint64(56)).astype(np.uint16)
+    visible = hashes < luminance
+    visible |= luminance == 255
+    indices = np.where(visible, candidates, 0).astype(np.uint8)
+    return EffectFrame(frame, CellPlane(indices, schema.glyphs, colors))
+
+
+def _inscription(frame, shape, schema, seed):
+    """Write configured text continuously along row-major detected edges."""
+    colors = _cell_rgb(frame, shape)
+    horizontal, vertical = _sobel(_luminance(colors))
+    active = np.abs(horizontal) + np.abs(vertical) >= 96
+    indices = np.zeros(shape, dtype=np.uint8)
+    flat_active = active.ravel()
+    if flat_active.any():
+        ordinals = np.cumsum(flat_active, dtype=np.int64) - 1
+        active_ordinals = ordinals[flat_active]
+        token_length = len(schema.token)
+        positions = (active_ordinals + (seed % token_length)) % token_length
+        indices.ravel()[flat_active] = schema.token[positions]
+    return EffectFrame(frame, CellPlane(indices, schema.glyphs, colors))
+
+
+def _type_echo(frame, shape, schema, video_time, speed, seed):
+    """Render analytic current/prior type bands without retaining history."""
+    colors = _cell_rgb(frame, shape)
+    rows, cols = shape
+    if rows == 0 or cols == 0:
+        indices = np.zeros(shape, dtype=np.uint8)
+        return EffectFrame(frame, CellPlane(indices, schema.glyphs, colors))
+
+    token_length = len(schema.token)
+    period = min(6, rows)
+    echo_count = min(3, period)
+    tick = _effect_tick(video_time, speed, 6)
+    row_grid = np.arange(rows, dtype=np.int64)[:, None]
+    col_grid = np.arange(cols, dtype=np.int64)[None, :]
+    age = ((tick % period) + (seed % period) - row_grid) % period
+    active = np.broadcast_to(age < echo_count, shape)
+
+    # Only small modular residues enter NumPy, so arbitrary-size Python seed
+    # and tick values cannot overflow an array scalar conversion.
+    positions = (
+        col_grid
+        - (tick % token_length)
+        + age
+        + ((seed // period) % token_length)
+    ) % token_length
+    candidates = schema.token[positions]
+
+    weights = np.zeros(shape, dtype=np.uint16)
+    echo_weights = np.array((5, 3, 1), dtype=np.uint16)
+    broadcast_age = np.broadcast_to(age, shape)
+    weights[active] = echo_weights[broadcast_age[active]]
+    luminance = _luminance(colors).astype(np.uint16)
+    thresholds = (luminance * weights) // 5
+    hashes = (_hash_grid(rows, cols, seed) >> np.uint64(56)).astype(np.uint16)
+    visible = active & (hashes < thresholds)
+    visible |= active & (broadcast_age == 0) & (luminance == 255)
+    indices = np.where(visible, candidates, 0).astype(np.uint8)
+    foreground = (
+        colors.astype(np.uint16) * weights[:, :, None] // 5
+    ).astype(np.uint8)
+    return EffectFrame(frame, CellPlane(indices, schema.glyphs, foreground))
+
+
 def _tile_mosaic(frame):
     rows, cols = frame.shape[:2]
     if rows == 0 or cols == 0:
@@ -457,9 +657,17 @@ def _voronoi_layout(rows, cols, seed):
 class EffectProcessor:
     """Select, cycle, and apply deterministic structural terminal effects."""
 
-    def __init__(self, name="none", glyph_mode="ascii", speed=1.0, seed=0):
+    def __init__(
+        self,
+        name="none",
+        glyph_mode="ascii",
+        speed=1.0,
+        seed=0,
+        effect_text=DEFAULT_EFFECT_TEXT,
+    ):
         if glyph_mode not in ("ascii", "unicode"):
             raise ValueError("glyph_mode must be 'ascii' or 'unicode'")
+        _validate_effect_text(effect_text, glyph_mode)
         try:
             speed = float(speed)
         except (TypeError, ValueError) as error:
@@ -471,6 +679,8 @@ class EffectProcessor:
         self.glyph_mode = glyph_mode
         self.speed = speed
         self.seed = int(seed)
+        self.effect_text = effect_text
+        self._text_schemas = _text_schemas(effect_text, glyph_mode)
         self._name = "none"
         self._cache = {}
         self._afterimage_accumulator = None
@@ -586,6 +796,22 @@ class EffectProcessor:
         if self._name == "none":
             return EffectFrame(frame)
         if self._name in GLYPH_EFFECT_NAMES:
+            if self._name in _TEXT_EFFECT_NAMES:
+                schema = self._text_schemas[self._name]
+                if self._name == "word-field":
+                    return _word_field(frame, cell_shape, schema, self.seed)
+                if self._name == "inscription":
+                    return _inscription(frame, cell_shape, schema, self.seed)
+                if self._name == "type-echo":
+                    return _type_echo(
+                        frame,
+                        cell_shape,
+                        schema,
+                        video_time,
+                        self.speed,
+                        self.seed,
+                    )
+                raise RuntimeError(f"unhandled text effect: {self._name}")
             glyphs = _GLYPHS[self._name][self.glyph_mode]
             if self._name == "geometry":
                 return _geometry(frame, cell_shape, glyphs)

@@ -118,6 +118,9 @@ Press `e` during playback to cycle through this fixed order:
 | `number-field` | Labels every cell with its luminance decile from `0` to `9` |
 | `glyph-grid` | Rebuilds the image as a seed-shifted light/heavy cell lattice |
 | `vector-field` | Points directional marks toward increasing image brightness |
+| `word-field` | Repeats a phrase with luminance-controlled text density |
+| `inscription` | Writes a decorated phrase along detected image contours |
+| `type-echo` | Layers deterministic time-offset echoes of a phrase |
 
 The shared controls are:
 
@@ -126,27 +129,45 @@ The shared controls are:
 | `--effect-glyphs ascii|unicode` | Use portable ASCII glyphs (default) or richer Unicode |
 | `--effect-speed N` | Positive finite animation-speed multiplier (default `1.0`) |
 | `--effect-seed N` | Integer seed for reproducible procedural layouts (default `0`) |
+| `--effect-text TEXT` | Phrase used by text effects (default `YTASCII`) |
 
 Static effects ignore the speed multiplier, and effects without a procedural
-layout ignore the seed.
+layout ignore the seed. Effects other than `word-field`, `inscription`, and
+`type-echo` ignore `--effect-text`.
 
 Effect selection composes with `--style`: the style transforms RGB first, then
 the structural effect interprets that styled frame. Seeds and video timestamps
 make procedural and animated output repeatable after seeking. An effect chosen
-with `e` remains active for later videos in the same interactive session.
+with `e` remains active for later videos in the same interactive session, as
+does the configured effect text.
 
 `geometry`, `contour-glyph`, `hatch`, `dotfield`, `number-field`, `glyph-grid`,
-and `vector-field` produce character-cell structures. If `--pixels` is active,
-those seven effects temporarily fall back to character rendering and the
-status line shows `pixels→chars`; cycling to `none` or an RGB-only effect
+`vector-field`, `word-field`, `inscription`, and `type-echo` produce
+character-cell structures. If `--pixels` is active, those ten effects
+temporarily fall back to character rendering and the status line shows
+`pixels→chars`; cycling to `none` or an RGB-only effect
 restores half-block pixels. `--effect-glyphs` selects the schema for those
 glyph effects. `tile-mosaic`, `wave-lines`, `voronoi`, and `afterimage`
 transform RGB and therefore retain pixel mode and the normal `--palette` /
 `--chars` behavior.
 
-Unicode mode excludes full-width, combining, and control characters, but some
-geometric symbols have locale-dependent ambiguous width. Use the default ASCII
-mode if columns drift in a CJK-width terminal configuration.
+`word-field` repeats the configured phrase with a seeded row stagger and uses
+image luminance as its text density: black stays blank and white shows the
+complete field. ASCII rows repeat `TEXT + ". "`; Unicode rows use
+`TEXT + "· "`. `inscription` writes `[TEXT] ` or `‹TEXT› ` across detected
+contours in row-major order. `type-echo` repeats `TEXT + ": "` or `TEXT + "∶ "`
+and analytically derives up to three faded row-band echoes from
+`floor(video_time × speed × 6)`. It is stateless, so seeking to the same time
+reconstructs the same output and pausing freezes it.
+
+`--effect-text` is preserved exactly, without Unicode normalization, and may
+contain 1 to 253 code points, including at least one non-space character.
+ASCII glyph mode accepts portable printable ASCII. Unicode mode accepts
+printable, left-to-right single-cell characters and ordinary spaces but rejects
+control characters, combining or decomposed sequences, and East Asian wide or
+full-width characters with a clear error. Some accepted symbols have
+locale-dependent ambiguous width; use the default ASCII mode if columns drift
+in a CJK-width terminal configuration.
 
 ```sh
 yt-ascii https://youtu.be/jNQXAC9IVRw --effect geometry
@@ -156,6 +177,9 @@ yt-ascii https://youtu.be/jNQXAC9IVRw --effect wave-lines --effect-speed 1.5
 yt-ascii https://youtu.be/jNQXAC9IVRw --effect number-field
 yt-ascii https://youtu.be/jNQXAC9IVRw --effect glyph-grid --effect-seed 5
 yt-ascii https://youtu.be/jNQXAC9IVRw --effect vector-field --effect-glyphs unicode
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect word-field --effect-text TERMINAL --effect-seed 5
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect inscription --effect-text "HELLO WORLD" --effect-glyphs unicode
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect type-echo --effect-text AFTERIMAGE --effect-speed 1.5
 ```
 
 These effects are independent, terminal-native implementations of established
@@ -180,7 +204,7 @@ selected palette.
 | Area | Options |
 |---|---|
 | Display | `--no-color`, `--pixels`, `--palette`, `--chars`, `--style` |
-| Structural effects | `--effect`, `--effect-glyphs`, `--effect-speed`, `--effect-seed` |
+| Structural effects | `--effect`, `--effect-glyphs`, `--effect-speed`, `--effect-seed`, `--effect-text` |
 | Reveals | `--scatter`, `--rain`, `--scatter-secs`, `--rain-secs`, `--rain-chars` |
 | Playback size/rate | `--fps`, `--width`, `--height`, `--max-res` |
 | Audio | `--no-audio`, `--8bit` |

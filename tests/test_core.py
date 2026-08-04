@@ -314,6 +314,7 @@ class CommandAndOutputTests(unittest.TestCase):
             self.assertEqual(args.effect_glyphs, "ascii")
             self.assertEqual(args.effect_speed, 1.0)
             self.assertEqual(args.effect_seed, 0)
+            self.assertEqual(args.effect_text, "YTASCII")
             self.assertFalse(args.update)
             self.assertFalse(args.check_update)
             self.assertFalse(args.no_update_check)
@@ -334,13 +335,52 @@ class CommandAndOutputTests(unittest.TestCase):
                 "yt-ascii", "--effect", "voronoi",
                 "--effect-glyphs", "unicode",
                 "--effect-speed", "1.5", "--effect-seed", "-9",
+                "--effect-text", "YT λ",
             ],
         ):
             args = CORE["parse_args"]()
         self.assertEqual(
-            (args.effect, args.effect_glyphs, args.effect_speed, args.effect_seed),
-            ("voronoi", "unicode", 1.5, -9),
+            (
+                args.effect,
+                args.effect_glyphs,
+                args.effect_speed,
+                args.effect_seed,
+                args.effect_text,
+            ),
+            ("voronoi", "unicode", 1.5, -9, "YT λ"),
         )
+
+    def test_effect_text_cli_validation_is_mode_aware_and_strict(self):
+        globals_ = CORE["parse_args"].__globals__
+        valid = (
+            (["--effect-text", "A B"], "A B"),
+            (["--effect-glyphs", "unicode", "--effect-text", "λ"], "λ"),
+            (["--effect-text", "A" * 253], "A" * 253),
+        )
+        for options, expected in valid:
+            with self.subTest(options=options), mock.patch.object(
+                globals_["sys"], "argv", ["yt-ascii", *options]
+            ):
+                self.assertEqual(CORE["parse_args"]().effect_text, expected)
+
+        invalid = (
+            ["--effect-text", ""],
+            ["--effect-text", "   "],
+            ["--effect-text", "A" * 254],
+            ["--effect-text", "λ"],
+            ["--effect-glyphs", "unicode", "--effect-text", "e\u0301"],
+            ["--effect-glyphs", "unicode", "--effect-text", "A\nB"],
+            ["--effect-glyphs", "unicode", "--effect-text", "A\u200dB"],
+            ["--effect-glyphs", "unicode", "--effect-text", "界"],
+            ["--effect-glyphs", "unicode", "--effect-text", "א"],
+        )
+        for options in invalid:
+            with self.subTest(options=options), mock.patch.object(
+                globals_["sys"], "argv", ["yt-ascii", *options]
+            ), mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    CORE["parse_args"]()
+                self.assertEqual(raised.exception.code, 2)
 
     def test_update_cli_actions_are_explicit_and_mutually_exclusive(self):
         globals_ = CORE["parse_args"].__globals__
@@ -692,6 +732,7 @@ class NonSuspendResizeTests(unittest.TestCase):
             "effect_glyphs": "ascii",
             "effect_speed": 1.0,
             "effect_seed": 0,
+            "effect_text": "YTASCII",
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -748,7 +789,9 @@ class NonSuspendResizeTests(unittest.TestCase):
                     return super().render_scatter(frame, fraction)
 
             class RecordingEffectProcessor:
-                def __init__(self, name, *, glyph_mode, speed, seed):
+                def __init__(
+                    self, name, *, glyph_mode, speed, seed, effect_text
+                ):
                     self.name = name
 
                 def reset(self, reason):
@@ -826,12 +869,14 @@ class NonSuspendResizeTests(unittest.TestCase):
 
         contexts = []
         resets = []
+        configs = []
         key_call = 0
 
         class RecordingEffectProcessor:
-            def __init__(self, name, *, glyph_mode, speed, seed):
+            def __init__(self, name, *, glyph_mode, speed, seed, effect_text):
                 self.name = name
-                self.config = (glyph_mode, speed, seed)
+                self.config = (glyph_mode, speed, seed, effect_text)
+                configs.append(self.config)
 
             def reset(self, reason):
                 resets.append(reason)
@@ -857,7 +902,7 @@ class NonSuspendResizeTests(unittest.TestCase):
         process = self.FakeProcess(video=True)
         args = self.args(
             effect="none", effect_glyphs="unicode", effect_speed=1.5,
-            effect_seed=9,
+            effect_seed=9, effect_text="YT λ",
         )
         globals_ = CORE["run"].__globals__
         replacements = {
@@ -883,6 +928,7 @@ class NonSuspendResizeTests(unittest.TestCase):
             CORE["run"](args)
 
         self.assertEqual(args.effect, "geometry")
+        self.assertEqual(configs, [("unicode", 1.5, 9, "YT λ")])
         self.assertEqual(resets, ["source", "select"])
         self.assertEqual(len(contexts), 2)
         self.assertTrue(contexts[0].advance_state)
@@ -899,7 +945,7 @@ class NonSuspendResizeTests(unittest.TestCase):
         key_call = 0
 
         class RecordingEffectProcessor:
-            def __init__(self, name, *, glyph_mode, speed, seed):
+            def __init__(self, name, *, glyph_mode, speed, seed, effect_text):
                 self.name = name
 
             def reset(self, reason):
@@ -979,7 +1025,7 @@ class NonSuspendResizeTests(unittest.TestCase):
                 return len(target)
 
         class RecordingEffectProcessor:
-            def __init__(self, name, *, glyph_mode, speed, seed):
+            def __init__(self, name, *, glyph_mode, speed, seed, effect_text):
                 self.name = name
 
             def reset(self, reason):
@@ -1042,7 +1088,7 @@ class NonSuspendResizeTests(unittest.TestCase):
         instances = []
 
         class RecordingEffectProcessor:
-            def __init__(self, name, *, glyph_mode, speed, seed):
+            def __init__(self, name, *, glyph_mode, speed, seed, effect_text):
                 self.initial_name = name
                 self.name = name
                 self.resets = []
@@ -1168,7 +1214,7 @@ class NonSuspendResizeTests(unittest.TestCase):
                 return super().render_scatter(frame, fraction)
 
         class RecordingEffectProcessor:
-            def __init__(self, name, *, glyph_mode, speed, seed):
+            def __init__(self, name, *, glyph_mode, speed, seed, effect_text):
                 self.name = name
 
             def reset(self, reason):
@@ -1250,6 +1296,7 @@ class NonSuspendResizeTests(unittest.TestCase):
             effect_glyphs="ascii",
             effect_speed=1.0,
             effect_seed=0,
+            effect_text="YTASCII",
         )
         info = {
             "title": "fixture",

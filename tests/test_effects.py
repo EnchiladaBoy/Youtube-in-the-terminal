@@ -1,10 +1,15 @@
 import math
+from pathlib import Path
+import runpy
 import unicodedata
 import unittest
+from unittest import mock
 
 import numpy as np
+import yt_ascii_effects as effects
 
 from yt_ascii_effects import (
+    DEFAULT_EFFECT_TEXT,
     EFFECT_NAMES,
     EFFECT_SPECS,
     GLYPH_EFFECT_NAMES,
@@ -161,6 +166,9 @@ class EffectProcessorTests(unittest.TestCase):
                 "number-field",
                 "glyph-grid",
                 "vector-field",
+                "word-field",
+                "inscription",
+                "type-echo",
             ),
         )
         self.assertEqual(
@@ -174,6 +182,9 @@ class EffectProcessorTests(unittest.TestCase):
                     "number-field",
                     "glyph-grid",
                     "vector-field",
+                    "word-field",
+                    "inscription",
+                    "type-echo",
                 )
             ),
         )
@@ -205,6 +216,7 @@ class EffectProcessorTests(unittest.TestCase):
         self.assertFalse(processor._cache)
 
     def test_configuration_validation(self):
+        self.assertEqual(DEFAULT_EFFECT_TEXT, "YTASCII")
         with self.assertRaisesRegex(ValueError, "unknown effect"):
             EffectProcessor("missing")
         processor = EffectProcessor()
@@ -221,6 +233,167 @@ class EffectProcessorTests(unittest.TestCase):
             with self.subTest(seed=seed), self.assertRaises(TypeError):
                 EffectProcessor(seed=seed)
         self.assertEqual(EffectProcessor(seed=np.int64(-9)).seed, -9)
+
+    def test_effect_text_validation_preserves_safe_input_exactly(self):
+        accepted = (
+            ("A B", "ascii"),
+            (" A ", "ascii"),
+            ("A" * 253, "ascii"),
+            ("λ", "unicode"),
+            ("é", "unicode"),
+        )
+        for value, mode in accepted:
+            with self.subTest(value=value[:8], mode=mode):
+                processor = EffectProcessor(
+                    effect_text=value, glyph_mode=mode
+                )
+                self.assertEqual(processor.effect_text, value)
+
+        with self.assertRaises(TypeError):
+            EffectProcessor(effect_text=123)
+        invalid = (
+            "",
+            "   ",
+            "A" * 254,
+            "A\tB",
+            "A\nB",
+            "A\x00B",
+            "A\u200dB",
+            "e\u0301",
+            "界",
+            "א",
+        )
+        for value in invalid:
+            with self.subTest(value=repr(value)), self.assertRaises(ValueError):
+                EffectProcessor(effect_text=value, glyph_mode="unicode")
+        with self.assertRaises(ValueError):
+            EffectProcessor(effect_text="λ", glyph_mode="ascii")
+
+    def test_launcher_and_engine_effect_text_validation_stay_in_parity(self):
+        launcher = runpy.run_path(
+            str(Path(__file__).resolve().parents[1] / "yt-ascii"),
+            run_name="yt_ascii_effect_validation_test",
+        )
+        cases = (
+            ("YTASCII", "ascii"),
+            (" A B ", "ascii"),
+            ("λ", "unicode"),
+            ("é", "unicode"),
+            ("", "ascii"),
+            ("   ", "ascii"),
+            ("A" * 254, "ascii"),
+            ("λ", "ascii"),
+            ("e\u0301", "unicode"),
+            ("A\u200dB", "unicode"),
+            ("界", "unicode"),
+            ("א", "unicode"),
+            (123, "ascii"),
+        )
+        for value, mode in cases:
+            with self.subTest(value=repr(value), mode=mode):
+                outcomes = []
+                for validate in (
+                    lambda: launcher["validate_effect_text"](value, mode),
+                    lambda: EffectProcessor(
+                        glyph_mode=mode, effect_text=value
+                    ).effect_text,
+                ):
+                    try:
+                        result = validate()
+                    except (TypeError, ValueError) as error:
+                        outcomes.append(type(error))
+                    else:
+                        outcomes.append(("accepted", result))
+                self.assertEqual(outcomes[0], outcomes[1])
+
+    def test_unicode_inscription_uses_full_256_entry_schema_safely(self):
+        safe = []
+        for codepoint in range(0x21, 0x10000):
+            glyph = chr(codepoint)
+            if glyph in "‹›":
+                continue
+            category = unicodedata.category(glyph)
+            if (
+                not glyph.isprintable()
+                or glyph.isspace()
+                or category in ("Cc", "Cf", "Cs")
+                or category.startswith("M")
+                or unicodedata.combining(glyph)
+                or unicodedata.bidirectional(glyph)
+                in ("R", "AL", "AN", "RLE", "RLO", "RLI")
+                or unicodedata.east_asian_width(glyph) in ("W", "F")
+            ):
+                continue
+            safe.append(glyph)
+            if len(safe) == 253:
+                break
+        self.assertEqual(len(safe), 253)
+
+        processor = EffectProcessor(
+            "inscription",
+            glyph_mode="unicode",
+            effect_text="".join(safe),
+        )
+        schema = processor._text_schemas["inscription"]
+        self.assertEqual(len(schema.glyphs), 256)
+        self.assertEqual(int(schema.token[-2]), 255)
+        self.assertEqual(int(schema.token.max()), 255)
+
+        frame = np.full((1, 256, 3), 127, dtype=np.uint8)
+        gradient = np.full((1, 256), 96, dtype=np.int32)
+        with mock.patch.object(
+            effects,
+            "_sobel",
+            return_value=(gradient, np.zeros_like(gradient)),
+        ):
+            plane = processor.apply(frame).cells
+        self.assertEqual(len(plane.glyphs), 256)
+        self.assertEqual(int(plane.glyph_indices.max()), 255)
+
+    def test_default_text_effect_schemas_and_tokens_are_stable(self):
+        frame = np.full((3, 8, 3), 255, dtype=np.uint8)
+        expected = {
+            "word-field": (" YTASCI.", [1, 2, 3, 4, 5, 6, 6, 7, 0]),
+            "inscription": (" YTASCI[]", [7, 1, 2, 3, 4, 5, 6, 6, 8, 0]),
+            "type-echo": (" YTASCI:", [1, 2, 3, 4, 5, 6, 6, 7, 0]),
+        }
+        for name, (glyphs, token) in expected.items():
+            with self.subTest(effect=name):
+                processor = EffectProcessor(name)
+                plane = processor.apply(frame, context(shape=(3, 8))).cells
+                self.assertEqual(plane.glyphs, glyphs)
+                np.testing.assert_array_equal(
+                    processor._text_schemas[name].token,
+                    np.array(token, dtype=np.uint8),
+                )
+
+        unicode_expected = {
+            "word-field": " YTASCI·",
+            "inscription": " YTASCI‹›",
+            "type-echo": " YTASCI∶",
+        }
+        for name, glyphs in unicode_expected.items():
+            with self.subTest(effect=name):
+                plane = EffectProcessor(
+                    name, glyph_mode="unicode"
+                ).apply(frame, context(shape=(3, 8))).cells
+                self.assertEqual(plane.glyphs, glyphs)
+
+    def test_dynamic_schema_deduplicates_text_and_decorations(self):
+        frame = np.full((2, 8, 3), 255, dtype=np.uint8)
+        cases = (
+            ("word-field", ".I I", " .I"),
+            ("inscription", "[A]", " [A]"),
+            ("type-echo", ":AA", " :A"),
+        )
+        for name, text, expected in cases:
+            with self.subTest(effect=name):
+                processor = EffectProcessor(name, effect_text=text)
+                first = processor.apply(frame).cells
+                self.assertEqual(first.glyphs, expected)
+                processor.reset("seek")
+                second = processor.apply(frame).cells
+                self.assertEqual(second.glyphs, expected)
 
     def test_frame_and_time_validation(self):
         processor = EffectProcessor()
@@ -561,6 +734,206 @@ class EffectProcessorTests(unittest.TestCase):
                     frame
                 ).cells.glyph_indices
                 self.assertEqual(int(indices[1, 1]), expected)
+
+    def test_word_field_repeats_staggered_text_at_white_endpoint(self):
+        frame = np.full((3, 8, 3), 255, dtype=np.uint8)
+        plane = EffectProcessor(
+            "word-field", effect_text="AB", seed=0
+        ).apply(frame).cells
+        self.assertEqual(plane.glyphs, " AB.")
+        np.testing.assert_array_equal(
+            plane.glyph_indices,
+            np.array(
+                (
+                    (1, 2, 3, 0, 1, 2, 3, 0),
+                    (3, 0, 1, 2, 3, 0, 1, 2),
+                    (1, 2, 3, 0, 1, 2, 3, 0),
+                ),
+                dtype=np.uint8,
+            ),
+        )
+        dark = EffectProcessor(
+            "word-field", effect_text="AB"
+        ).apply(np.zeros_like(frame)).cells
+        self.assertFalse(dark.glyph_indices.any())
+
+    def test_word_field_hash_threshold_seed_and_static_contract(self):
+        frame = np.full((1, 2, 3), 100, dtype=np.uint8)
+        hashes = np.array([[99 << 56, 100 << 56]], dtype=np.uint64)
+        with mock.patch.object(effects, "_hash_grid", return_value=hashes):
+            indices = EffectProcessor(
+                "word-field", effect_text="A"
+            ).apply(frame).cells.glyph_indices
+        np.testing.assert_array_equal(indices, np.array([[1, 0]], dtype=np.uint8))
+
+        frame = np.full((12, 20, 3), 137, dtype=np.uint8)
+        first = EffectProcessor(
+            "word-field", effect_text="AB", speed=0.25, seed=7
+        ).apply(frame, 99.0).cells.glyph_indices
+        repeat = EffectProcessor(
+            "word-field", effect_text="AB", speed=8.0, seed=7
+        ).apply(frame, -12.0).cells.glyph_indices
+        changed = EffectProcessor(
+            "word-field", effect_text="AB", seed=8
+        ).apply(frame).cells.glyph_indices
+        np.testing.assert_array_equal(first, repeat)
+        self.assertFalse(np.array_equal(first, changed))
+
+    def test_inscription_writes_decorated_text_only_on_contours(self):
+        frame = np.full((2, 5, 3), 120, dtype=np.uint8)
+        active = np.array(
+            ((1, 1, 0, 1, 1), (0, 1, 1, 1, 0)), dtype=np.int32
+        )
+        with mock.patch.object(
+            effects,
+            "_sobel",
+            return_value=(active * 96, np.zeros_like(active)),
+        ):
+            plane = EffectProcessor(
+                "inscription", effect_text="AB", seed=0
+            ).apply(frame).cells
+        self.assertEqual(plane.glyphs, " AB[]")
+        np.testing.assert_array_equal(
+            plane.glyph_indices,
+            np.array(((3, 1, 0, 2, 4), (0, 0, 3, 1, 0)), dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(plane.fg_rgb, frame)
+
+    def test_inscription_threshold_flat_seed_and_static_contract(self):
+        frame = np.full((1, 2, 3), 100, dtype=np.uint8)
+        for strength, expected_active in ((95, False), (96, True)):
+            gradients = np.full((1, 2), strength, dtype=np.int32)
+            with self.subTest(strength=strength), mock.patch.object(
+                effects,
+                "_sobel",
+                return_value=(gradients, np.zeros_like(gradients)),
+            ):
+                indices = EffectProcessor(
+                    "inscription", effect_text="A"
+                ).apply(frame).cells.glyph_indices
+                self.assertEqual(bool(indices.any()), expected_active)
+
+        flat = np.full((4, 6, 3), 127, dtype=np.uint8)
+        self.assertFalse(
+            EffectProcessor(
+                "inscription", effect_text="AB"
+            ).apply(flat).cells.glyph_indices.any()
+        )
+        self.assertFalse(
+            EffectProcessor("inscription").apply(
+                np.full((1, 1, 3), 255, dtype=np.uint8)
+            ).cells.glyph_indices.any()
+        )
+
+        edge = np.zeros((8, 8, 3), dtype=np.uint8)
+        edge[:, 4:] = 255
+        first = EffectProcessor(
+            "inscription", effect_text="AB", speed=0.25, seed=2
+        ).apply(edge, -50.0).cells.glyph_indices
+        repeat = EffectProcessor(
+            "inscription", effect_text="AB", speed=8.0, seed=2
+        ).apply(edge, 50.0).cells.glyph_indices
+        changed = EffectProcessor(
+            "inscription", effect_text="AB", seed=3
+        ).apply(edge).cells.glyph_indices
+        np.testing.assert_array_equal(first, repeat)
+        self.assertFalse(np.array_equal(first, changed))
+
+    def test_type_echo_has_exact_analytic_bands_and_scroll(self):
+        frame = np.full((4, 8, 3), 255, dtype=np.uint8)
+        hashes = np.zeros((4, 8), dtype=np.uint64)
+        processor = EffectProcessor("type-echo", effect_text="AB", seed=0)
+        with mock.patch.object(effects, "_hash_grid", return_value=hashes):
+            tick_zero = processor.apply(frame, 0.0).cells
+            tick_one = processor.apply(frame, 1 / 6).cells
+        self.assertEqual(tick_zero.glyphs, " AB:")
+        np.testing.assert_array_equal(
+            tick_zero.glyph_indices,
+            np.array(
+                (
+                    (1, 2, 3, 0, 1, 2, 3, 0),
+                    (0, 0, 0, 0, 0, 0, 0, 0),
+                    (3, 0, 1, 2, 3, 0, 1, 2),
+                    (2, 3, 0, 1, 2, 3, 0, 1),
+                ),
+                dtype=np.uint8,
+            ),
+        )
+        np.testing.assert_array_equal(
+            tick_one.glyph_indices,
+            np.array(
+                (
+                    (1, 2, 3, 0, 1, 2, 3, 0),
+                    (0, 1, 2, 3, 0, 1, 2, 3),
+                    (0, 0, 0, 0, 0, 0, 0, 0),
+                    (2, 3, 0, 1, 2, 3, 0, 1),
+                ),
+                dtype=np.uint8,
+            ),
+        )
+
+    def test_type_echo_density_color_timing_and_statelessness(self):
+        frame = np.empty((4, 8, 3), dtype=np.uint8)
+        frame[:] = (100, 150, 200)
+        hashes = np.zeros((4, 8), dtype=np.uint64)
+        processor = EffectProcessor("type-echo", effect_text="AB", seed=0)
+        with mock.patch.object(effects, "_hash_grid", return_value=hashes):
+            plane = processor.apply(frame, context(0.0, 9, (4, 8))).cells
+        expected_rows = (
+            (100, 150, 200),
+            (0, 0, 0),
+            (20, 30, 40),
+            (60, 90, 120),
+        )
+        for row, expected in enumerate(expected_rows):
+            np.testing.assert_array_equal(
+                plane.fg_rgb[row], np.broadcast_to(expected, (8, 3))
+            )
+
+        before = processor.apply(frame, context(0.5, 10, (4, 8))).cells
+        processor.reset("seek")
+        replay = processor.apply(
+            frame, context(0.5, 0, (4, 8), advance=False)
+        ).cells
+        fresh = EffectProcessor(
+            "type-echo", effect_text="AB", seed=0
+        ).apply(frame, context(0.5, 999, (4, 8))).cells
+        np.testing.assert_array_equal(before.glyph_indices, replay.glyph_indices)
+        np.testing.assert_array_equal(before.glyph_indices, fresh.glyph_indices)
+        np.testing.assert_array_equal(before.fg_rgb, replay.fg_rgb)
+
+        fast = EffectProcessor(
+            "type-echo", effect_text="AB", speed=2.0
+        ).apply(frame, 0.5).cells
+        normal = EffectProcessor(
+            "type-echo", effect_text="AB", speed=1.0
+        ).apply(frame, 1.0).cells
+        np.testing.assert_array_equal(fast.glyph_indices, normal.glyph_indices)
+        for time_value in (-1e300, 1e300):
+            with self.subTest(time=time_value):
+                output = processor.apply(frame, time_value).cells
+                self.assertEqual(output.glyph_indices.shape, (4, 8))
+
+    def test_type_echo_hash_threshold_and_white_current_override(self):
+        frame = np.full((3, 1, 3), 100, dtype=np.uint8)
+        # At tick zero rows have ages 0, 2 and 1, whose thresholds are
+        # respectively 100, 20 and 60.
+        hashes = np.array([[100], [20], [60]], dtype=np.uint64) << np.uint64(56)
+        with mock.patch.object(effects, "_hash_grid", return_value=hashes):
+            indices = EffectProcessor(
+                "type-echo", effect_text="A"
+            ).apply(frame, 0.0).cells.glyph_indices
+        self.assertFalse(indices.any())
+
+        white = np.full((3, 1, 3), 255, dtype=np.uint8)
+        maximum_hash = np.full((3, 1), 255, dtype=np.uint64) << np.uint64(56)
+        with mock.patch.object(effects, "_hash_grid", return_value=maximum_hash):
+            indices = EffectProcessor(
+                "type-echo", effect_text="A"
+            ).apply(white, 0.0).cells.glyph_indices
+        self.assertNotEqual(int(indices[0, 0]), 0)
+        self.assertEqual(int(indices[1, 0]), 0)
+        self.assertEqual(int(indices[2, 0]), 0)
 
     def test_tile_mosaic_uses_integer_block_averages(self):
         frame = np.arange(5 * 7 * 3, dtype=np.uint8).reshape(5, 7, 3)
