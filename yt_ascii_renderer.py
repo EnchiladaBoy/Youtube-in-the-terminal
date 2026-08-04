@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from yt_ascii_frames import CellPlane
+
 
 FG = b"\x1b[38;2;"
 BG = b"\x1b[48;2;"
@@ -70,6 +72,8 @@ class AnsiRenderer:
         self.rng = rng if rng is not None else np.random.default_rng()
 
         self._shape = None
+        self._workspace_key = None
+        self._effective_mode = None
         self._rain_workspace = False
         self._template = None
         self._records = None
@@ -82,14 +86,16 @@ class AnsiRenderer:
         self._scatter.clear()
         self._rain.clear()
 
-    def render(self, frame):
+    def render(self, frame, cell_plane=None):
         """Render a complete frame without a reveal mask."""
-        self._fill_cells(frame, rain_workspace=False)
+        plane = self._prepare_cell_plane(frame, cell_plane)
+        self._fill_cells(frame, rain_workspace=False, plane=plane)
         return self._compact()
 
-    def render_scatter(self, frame, fraction):
+    def render_scatter(self, frame, fraction, cell_plane=None):
         """Reveal an exact fraction of cells using a stable random ordering."""
-        rows, cols = self._cell_shape(frame)
+        plane = self._prepare_cell_plane(frame, cell_plane)
+        rows, cols = plane[:2] if plane is not None else self._cell_shape(frame)
         total = rows * cols
         if self._scatter.get("shape") != (rows, cols):
             rank = np.empty(total, dtype=np.int64)
@@ -101,15 +107,16 @@ class AnsiRenderer:
         shown = max(0, min(total, int(round(total * fraction))))
         visible = self._scatter["rank"] < shown
 
-        self._fill_cells(frame, rain_workspace=False)
+        self._fill_cells(frame, rain_workspace=False, plane=plane)
         self._apply_visibility(visible)
         result = self._compact()
         self._dirty = True
         return result
 
-    def render_rain(self, frame, fraction):
+    def render_rain(self, frame, fraction, cell_plane=None):
         """Reveal settled cells behind a sparse, fading rain trail."""
-        rows, cols = self._cell_shape(frame)
+        plane = self._prepare_cell_plane(frame, cell_plane)
+        rows, cols = plane[:2] if plane is not None else self._cell_shape(frame)
         if self._rain.get("cols") != cols:
             duration = self.rng.uniform(0.45, 0.8, cols)
             offset = self.rng.uniform(0.0, 1.0 - duration)
@@ -135,7 +142,7 @@ class AnsiRenderer:
             & (front > 0.0)[None, :]
         )
 
-        self._fill_cells(frame, rain_workspace=True)
+        self._fill_cells(frame, rain_workspace=True, plane=plane)
         self._apply_visibility(settled)
         if in_trail.any():
             self._apply_rain_trail(distance, in_trail, trail)
@@ -160,21 +167,89 @@ class AnsiRenderer:
             return frame.shape[0], frame.shape[1]
         raise ValueError("grayscale frame must be gray (rows, cols) or RGB24")
 
-    def _ensure_workspace(self, rows, cols, rain_workspace):
-        shape = (rows, cols)
-        if self._shape == shape and self._rain_workspace == rain_workspace:
+    def _prepare_cell_plane(self, frame, cell_plane):
+        """Validate and prepare a structured glyph plane for composition."""
+        if cell_plane is None:
+            return None
+        if not isinstance(cell_plane, CellPlane):
+            raise TypeError("cell_plane must be a CellPlane or None")
+
+        rows, cols = self._cell_shape(frame)
+        indices = cell_plane.glyph_indices
+        if not isinstance(indices, np.ndarray):
+            raise TypeError("cell plane glyph_indices must be a NumPy array")
+        if indices.ndim != 2:
+            raise ValueError(
+                "cell plane glyph_indices must have shape (rows, cols)"
+            )
+        if indices.shape != (rows, cols):
+            raise ValueError("cell plane shape must match the rendered cell shape")
+        if indices.dtype.kind not in "iu":
+            raise ValueError("cell plane glyph_indices must have an integer dtype")
+
+        glyphs = cell_plane.glyphs
+        if not isinstance(glyphs, str):
+            raise TypeError("cell plane glyph map must be a string")
+        glyph_lut = _glyph_lut(glyphs, "cell plane glyph map")
+        if indices.size:
+            if indices.dtype.kind == "i" and int(indices.min()) < 0:
+                raise ValueError("cell plane glyph_indices cannot be negative")
+            if int(indices.max()) >= len(glyphs):
+                raise ValueError(
+                    "cell plane glyph_indices contains an out-of-range index"
+                )
+
+        colors = cell_plane.fg_rgb
+        if colors is not None:
+            if not isinstance(colors, np.ndarray):
+                raise TypeError("cell plane fg_rgb must be a NumPy array")
+            if colors.dtype != np.uint8:
+                raise ValueError("cell plane fg_rgb must have dtype uint8")
+            if colors.ndim != 3 or colors.shape[2] != 3:
+                raise ValueError(
+                    "cell plane fg_rgb must have shape (rows, cols, 3)"
+                )
+            if colors.shape[:2] != indices.shape:
+                raise ValueError(
+                    "cell plane fg_rgb shape must match glyph_indices"
+                )
+
+        if self.color and colors is None:
+            if frame.ndim != 3 or frame.shape[:2] != indices.shape:
+                raise ValueError(
+                    "cell plane fg_rgb is required when source pixels do not "
+                    "match the cell shape"
+                )
+            colors = frame
+        if not self.color:
+            colors = None
+
+        return rows, cols, indices, glyph_lut, colors
+
+    def _ensure_workspace(self, rows, cols, rain_workspace, *, mode,
+                          colored, glyph_width):
+        key = (rows, cols, mode, colored, glyph_width, rain_workspace)
+        if self._workspace_key == key:
             return
 
-        row_suffix = RESET + CLEAR_EOL if (self.color or self.half_block) else CLEAR_EOL
-        palette_width = self.palette_lut.shape[1]
+        shape = (rows, cols)
+        row_suffix = RESET + CLEAR_EOL if colored or mode in (
+            "half-block", "fallback-chars"
+        ) else CLEAR_EOL
         rain_width = self.rain_lut.shape[1]
-        if self.half_block:
+        if mode == "half-block":
             normal_width = 41
-        elif self.color:
-            normal_width = 19 + palette_width
+        elif colored:
+            normal_width = 19 + glyph_width
+            if mode == "fallback-chars":
+                normal_width += len(RESET)
         else:
-            normal_width = palette_width
-        rain_prefix = len(RESET) if self.half_block else 0
+            normal_width = glyph_width
+        rain_prefix = (
+            len(RESET)
+            if mode in ("half-block", "plane-chars", "fallback-chars")
+            else 0
+        )
         rain_record_width = (
             rain_prefix + 19 + rain_width + len(RESET)
             if rain_workspace else 0
@@ -183,7 +258,7 @@ class AnsiRenderer:
 
         template = np.zeros((rows, cols + 1, record_width), dtype=np.uint8)
         cells = template[:, :cols]
-        if self.half_block:
+        if mode == "half-block":
             cells[:, :, :7] = tuple(FG)
             cells[:, :, 10] = ord(";")
             cells[:, :, 14] = ord(";")
@@ -193,31 +268,76 @@ class AnsiRenderer:
             cells[:, :, 33] = ord(";")
             cells[:, :, 37] = ord("m")
             cells[:, :, 38:41] = tuple(HALF_BLOCK)
-        elif self.color:
-            cells[:, :, :7] = tuple(FG)
-            cells[:, :, 10] = ord(";")
-            cells[:, :, 14] = ord(";")
-            cells[:, :, 18] = ord("m")
+        elif colored:
+            prefix = len(RESET) if mode == "fallback-chars" else 0
+            if prefix:
+                cells[:, :, :prefix] = tuple(RESET)
+            cells[:, :, prefix:prefix + 7] = tuple(FG)
+            cells[:, :, prefix + 10] = ord(";")
+            cells[:, :, prefix + 14] = ord(";")
+            cells[:, :, prefix + 18] = ord("m")
 
         trailers = template[:, cols]
         trailers[:, :len(row_suffix)] = tuple(row_suffix)
         trailers[:-1, len(row_suffix)] = ord("\n")
 
         self._shape = shape
+        self._workspace_key = key
+        self._effective_mode = mode
         self._rain_workspace = rain_workspace
         self._template = template
         self._records = template.copy()
         self._dirty = False
 
-    def _fill_cells(self, frame, rain_workspace):
-        rows, cols = self._cell_shape(frame)
+    def _fill_cells(self, frame, rain_workspace, plane=None):
+        if plane is None:
+            rows, cols = self._cell_shape(frame)
+            glyph_lut = self.palette_lut
+            mode = (
+                "half-block" if self.half_block
+                else "color-chars" if self.color
+                else "gray-chars"
+            )
+            colored = self.color
+        else:
+            rows, cols, indices, glyph_lut, colors = plane
+            mode = "fallback-chars" if self.half_block else "plane-chars"
+            colored = self.color
         if not frame.flags.c_contiguous:
             frame = np.ascontiguousarray(frame)
-        self._ensure_workspace(rows, cols, rain_workspace)
+        self._ensure_workspace(
+            rows,
+            cols,
+            rain_workspace,
+            mode=mode,
+            colored=colored,
+            glyph_width=glyph_lut.shape[1],
+        )
         if self._dirty:
             np.copyto(self._records, self._template)
             self._dirty = False
         cells = self._records[:, :cols]
+
+        if plane is not None:
+            indices = indices.astype(np.intp, copy=False)
+            glyph_start = (
+                len(RESET) if mode == "fallback-chars" else 0
+            ) + (19 if colored else 0)
+            if colored:
+                color_start = len(RESET) if mode == "fallback-chars" else 0
+                cells[:, :, color_start + 7:color_start + 10] = DECIMAL[
+                    colors[:, :, 0]
+                ]
+                cells[:, :, color_start + 11:color_start + 14] = DECIMAL[
+                    colors[:, :, 1]
+                ]
+                cells[:, :, color_start + 15:color_start + 18] = DECIMAL[
+                    colors[:, :, 2]
+                ]
+            cells[:, :, glyph_start:glyph_start + glyph_lut.shape[1]] = (
+                glyph_lut[indices]
+            )
+            return
 
         if self.half_block:
             top = frame[0::2]
@@ -260,7 +380,11 @@ class AnsiRenderer:
         if not hidden.any():
             return
         cells = self._records[:, :self._shape[1]]
-        blank = RESET + b" " if self.half_block else b" "
+        blank = (
+            RESET + b" "
+            if self._effective_mode in ("half-block", "fallback-chars")
+            else b" "
+        )
         blank_record = np.zeros(self._records.shape[2], dtype=np.uint8)
         blank_record[:len(blank)] = tuple(blank)
         cells[hidden] = blank_record
@@ -275,7 +399,9 @@ class AnsiRenderer:
         width = self._records.shape[2]
         rain = np.zeros((ys.size, width), dtype=np.uint8)
         position = 0
-        if self.half_block:
+        if self._effective_mode in (
+            "half-block", "plane-chars", "fallback-chars"
+        ):
             rain[:, :len(RESET)] = tuple(RESET)
             position += len(RESET)
         rain[:, position:position + len(FG)] = tuple(FG)

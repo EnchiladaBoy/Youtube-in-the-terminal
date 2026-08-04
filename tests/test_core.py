@@ -1,3 +1,4 @@
+import argparse
 import io
 import os
 from pathlib import Path
@@ -154,7 +155,7 @@ class ProcessTests(unittest.TestCase):
 
 
 class CommandAndOutputTests(unittest.TestCase):
-    def test_help_is_dependency_free_and_lists_styles(self):
+    def test_help_is_dependency_free_and_lists_styles_and_effects(self):
         output = io.StringIO()
         globals_ = CORE["main"].__globals__
         dependency_check = mock.Mock()
@@ -168,6 +169,7 @@ class CommandAndOutputTests(unittest.TestCase):
                 CORE["main"]()
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("--style", output.getvalue())
+        self.assertIn("--effect", output.getvalue())
         dependency_check.assert_not_called()
 
     def test_version_defaults_to_source_and_skips_dependency_checks(self):
@@ -184,11 +186,13 @@ class CommandAndOutputTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 CORE["main"]()
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(output.getvalue(), "yt-ascii 0.4.0 (source)\n")
+        self.assertEqual(output.getvalue(), "yt-ascii 0.5.0 (source)\n")
         dependency_check.assert_not_called()
 
     def test_interactive_style_selection_persists_to_the_next_video(self):
-        args = SimpleNamespace(url=None, style="classic", self_test=False)
+        args = SimpleNamespace(
+            url=None, style="classic", effect="none", self_test=False
+        )
         seen = []
         urls = iter(("first", "second"))
         globals_ = CORE["main"].__globals__
@@ -200,9 +204,10 @@ class CommandAndOutputTests(unittest.TestCase):
                 raise SystemExit(0) from error
 
         def run(current):
-            seen.append((current.url, current.style))
+            seen.append((current.url, current.style, current.effect))
             if current.url == "first":
                 current.style = "bayer"
+                current.effect = "geometry"
 
         with mock.patch.dict(globals_, {
             "parse_args": lambda: args,
@@ -213,7 +218,13 @@ class CommandAndOutputTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 CORE["main"]()
         self.assertEqual(raised.exception.code, 0)
-        self.assertEqual(seen, [("first", "classic"), ("second", "bayer")])
+        self.assertEqual(
+            seen,
+            [
+                ("first", "classic", "none"),
+                ("second", "bayer", "geometry"),
+            ],
+        )
 
     def test_version_reports_valid_installer_refs(self):
         for install_ref in ("v0.3.0", "v12.34.567", "edge"):
@@ -222,7 +233,7 @@ class CommandAndOutputTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     CORE["version_text"](),
-                    f"yt-ascii 0.4.0 ({install_ref})",
+                    f"yt-ascii 0.5.0 ({install_ref})",
                 )
 
     def test_version_rejects_untrusted_installer_refs(self):
@@ -242,7 +253,7 @@ class CommandAndOutputTests(unittest.TestCase):
             ):
                 self.assertEqual(
                     CORE["version_text"](),
-                    "yt-ascii 0.4.0 (source)",
+                    "yt-ascii 0.5.0 (source)",
                 )
 
     def test_spawn_video_emits_scaled_rgb24(self):
@@ -287,7 +298,7 @@ class CommandAndOutputTests(unittest.TestCase):
         self.assertEqual(binary.flushes, 1)
         output.write.assert_not_called()
 
-    def test_style_and_palette_cli_contract(self):
+    def test_style_effect_and_palette_cli_contract(self):
         self.assertEqual(CORE["PALETTES"]["binary"], " 01")
         self.assertEqual(CORE["PALETTES"]["numbers"], " 123456789")
         self.assertEqual(CORE["PALETTES"]["symbols"], " .,:;!|?*#@")
@@ -295,14 +306,45 @@ class CommandAndOutputTests(unittest.TestCase):
 
         globals_ = CORE["parse_args"].__globals__
         with mock.patch.object(globals_["sys"], "argv", ["yt-ascii"]):
-            self.assertEqual(CORE["parse_args"]().style, "classic")
+            args = CORE["parse_args"]()
+            self.assertEqual(args.style, "classic")
+            self.assertEqual(args.effect, "none")
+            self.assertEqual(args.effect_glyphs, "ascii")
+            self.assertEqual(args.effect_speed, 1.0)
+            self.assertEqual(args.effect_seed, 0)
         for style in CORE["STYLE_NAMES"]:
             with self.subTest(style=style), mock.patch.object(
                 globals_["sys"], "argv", ["yt-ascii", "--style", style]
             ):
                 self.assertEqual(CORE["parse_args"]().style, style)
+        for effect in CORE["EFFECT_NAMES"]:
+            with self.subTest(effect=effect), mock.patch.object(
+                globals_["sys"], "argv", ["yt-ascii", "--effect", effect]
+            ):
+                self.assertEqual(CORE["parse_args"]().effect, effect)
+        with mock.patch.object(
+            globals_["sys"],
+            "argv",
+            [
+                "yt-ascii", "--effect", "voronoi",
+                "--effect-glyphs", "unicode",
+                "--effect-speed", "1.5", "--effect-seed", "-9",
+            ],
+        ):
+            args = CORE["parse_args"]()
+        self.assertEqual(
+            (args.effect, args.effect_glyphs, args.effect_speed, args.effect_seed),
+            ("voronoi", "unicode", 1.5, -9),
+        )
 
-    def test_status_shows_style_and_style_control(self):
+    def test_effect_speed_rejects_nonpositive_and_nonfinite_values(self):
+        for value in ("0", "-1", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaises(
+                argparse.ArgumentTypeError
+            ):
+                CORE["effect_speed_type"](value)
+
+    def test_status_shows_style_effect_and_controls(self):
         for width in (120, 80):
             with self.subTest(width=width):
                 status = CORE["build_status"](
@@ -312,11 +354,14 @@ class CommandAndOutputTests(unittest.TestCase):
                     width,
                     paused=False,
                     style="riso",
+                    effect="geometry",
                 )
                 visible = status.removeprefix("\x1b[0m")
                 self.assertLessEqual(len(visible), width)
                 self.assertIn("style:riso", visible)
+                self.assertIn("effect:geometry", visible)
                 self.assertIn("s:style", visible)
+                self.assertIn("e:effect", visible)
 
     def test_status_accounts_for_wide_combining_and_control_characters(self):
         title = "界e\u0301🙂\x1b[2J" * 20
@@ -333,12 +378,25 @@ class CommandAndOutputTests(unittest.TestCase):
         self.assertIn("界e\u0301🙂", visible)
         self.assertNotIn("\x1b", visible)
 
-    def test_keyboard_backends_accept_only_lowercase_style_key(self):
+    def test_status_labels_pixel_to_character_fallback(self):
+        status = CORE["build_status"](
+            30,
+            12.0,
+            {"duration": 60.0, "title": "fixture"},
+            160,
+            paused=False,
+            style="classic",
+            effect="geometry",
+            pixel_fallback=True,
+        )
+        self.assertIn("effect:geometry pixels→chars", status)
+
+    def test_keyboard_backends_accept_only_lowercase_style_and_effect_keys(self):
         globals_ = CORE["_read_keys_windows"].__globals__
 
         class FakeMsvcrt:
             def __init__(self):
-                self.chars = iter(("s", "S", "1"))
+                self.chars = iter(("s", "S", "e", "E", "1"))
                 self.pending = True
 
             def kbhit(self):
@@ -353,14 +411,16 @@ class CommandAndOutputTests(unittest.TestCase):
 
         fake = FakeMsvcrt()
         with mock.patch.dict(globals_, {"msvcrt": fake}):
-            self.assertEqual(CORE["_read_keys_windows"](), ["s", "1"])
+            self.assertEqual(CORE["_read_keys_windows"](), ["s", "e", "1"])
 
         readiness = iter((([0], [], []), ([], [], [])))
         fake_select = SimpleNamespace(select=lambda *_args: next(readiness))
         posix_globals = CORE["_read_keys_posix"].__globals__
         with mock.patch.dict(posix_globals, {"select": fake_select}), \
-                mock.patch.object(posix_globals["os"], "read", return_value=b"sS1"):
-            self.assertEqual(CORE["_read_keys_posix"](0), ["s", "1"])
+                mock.patch.object(
+                    posix_globals["os"], "read", return_value=b"sSeE1"
+                ):
+            self.assertEqual(CORE["_read_keys_posix"](0), ["s", "e", "1"])
 
 
 class NonSuspendResizeTests(unittest.TestCase):
@@ -411,6 +471,10 @@ class NonSuspendResizeTests(unittest.TestCase):
             "palette": "simple",
             "chars": None,
             "style": "classic",
+            "effect": "none",
+            "effect_glyphs": "ascii",
+            "effect_speed": 1.0,
+            "effect_seed": 0,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -427,8 +491,10 @@ class NonSuspendResizeTests(unittest.TestCase):
         }
 
     def test_style_cycle_redraws_paused_frame_without_restarting_reveal(self):
+        import yt_ascii_effects
         import yt_ascii_renderer
         import yt_ascii_styles
+        from yt_ascii_frames import EffectFrame
 
         base_renderer = yt_ascii_renderer.AnsiRenderer
         globals_ = CORE["run"].__globals__
@@ -437,6 +503,7 @@ class NonSuspendResizeTests(unittest.TestCase):
             apply_calls = []
             reveal_fractions = []
             reveal_resets = []
+            effect_resets = []
             key_call = 0
 
             class RecordingStyleProcessor:
@@ -463,6 +530,19 @@ class NonSuspendResizeTests(unittest.TestCase):
                     reveal_fractions.append(fraction)
                     return super().render_scatter(frame, fraction)
 
+            class RecordingEffectProcessor:
+                def __init__(self, name, *, glyph_mode, speed, seed):
+                    self.name = name
+
+                def reset(self, reason):
+                    effect_resets.append(reason)
+
+                def cycle(self):
+                    raise AssertionError("unexpected effect cycle")
+
+                def apply(self, frame, _context):
+                    return EffectFrame(frame)
+
             def read_keys(_fd):
                 nonlocal key_call
                 key_call += 1
@@ -488,15 +568,32 @@ class NonSuspendResizeTests(unittest.TestCase):
                     mock.patch.object(globals_["time"], "sleep"), \
                     mock.patch.object(yt_ascii_renderer, "AnsiRenderer", RecordingRenderer), \
                     mock.patch.object(yt_ascii_styles, "StyleProcessor", RecordingStyleProcessor), \
+                    mock.patch.object(
+                        yt_ascii_effects,
+                        "EffectProcessor",
+                        RecordingEffectProcessor,
+                    ), \
                     mock.patch.object(globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)), \
                     mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
                     mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
                 CORE["run"](args)
-            return args, apply_calls, reveal_fractions, reveal_resets
+            return (
+                args,
+                apply_calls,
+                reveal_fractions,
+                reveal_resets,
+                effect_resets,
+            )
 
         for key_batch in (["space", "s"], ["s", "space"]):
             with self.subTest(key_batch=key_batch):
-                args, apply_calls, reveal_fractions, reveal_resets = exercise(key_batch)
+                (
+                    args,
+                    apply_calls,
+                    reveal_fractions,
+                    reveal_resets,
+                    effect_resets,
+                ) = exercise(key_batch)
                 self.assertEqual(args.style, "bayer")
                 self.assertEqual(
                     apply_calls, [("classic", 0.0), ("bayer", 0.0)]
@@ -504,6 +601,279 @@ class NonSuspendResizeTests(unittest.TestCase):
                 self.assertEqual(len(reveal_fractions), 2)
                 self.assertEqual(reveal_fractions[0], reveal_fractions[1])
                 self.assertEqual(len(reveal_resets), 1)
+                self.assertEqual(effect_resets, ["source", "style"])
+
+    def test_effect_cycle_redraws_pause_without_advancing_effect_state(self):
+        import yt_ascii_effects
+        from yt_ascii_frames import EffectFrame
+
+        contexts = []
+        resets = []
+        key_call = 0
+
+        class RecordingEffectProcessor:
+            def __init__(self, name, *, glyph_mode, speed, seed):
+                self.name = name
+                self.config = (glyph_mode, speed, seed)
+
+            def reset(self, reason):
+                resets.append(reason)
+
+            def cycle(self):
+                self.name = "geometry"
+                resets.append("select")
+                return self.name
+
+            def apply(self, frame, context):
+                contexts.append(context)
+                return EffectFrame(frame)
+
+        def read_keys(_fd):
+            nonlocal key_call
+            key_call += 1
+            if key_call == 1:
+                return []
+            if key_call == 2:
+                return ["space", "e"]
+            return ["q"]
+
+        process = self.FakeProcess(video=True)
+        args = self.args(
+            effect="none", effect_glyphs="unicode", effect_speed=1.5,
+            effect_seed=9,
+        )
+        globals_ = CORE["run"].__globals__
+        replacements = {
+            "_CAN_SUSPEND": False,
+            "IS_WINDOWS": True,
+            "probe": lambda *_args: self.info(),
+            "spawn_video": lambda *_args: process,
+            "find_ffplay": lambda: None,
+            "read_keys": read_keys,
+        }
+        with mock.patch.dict(globals_, replacements), \
+                mock.patch.object(globals_["os"], "isatty", return_value=True), \
+                mock.patch.object(globals_["time"], "monotonic", return_value=0.0), \
+                mock.patch.object(globals_["time"], "sleep"), \
+                mock.patch.object(
+                    yt_ascii_effects, "EffectProcessor", RecordingEffectProcessor
+                ), \
+                mock.patch.object(
+                    globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)
+                ), \
+                mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
+                mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+            CORE["run"](args)
+
+        self.assertEqual(args.effect, "geometry")
+        self.assertEqual(resets, ["source", "select"])
+        self.assertEqual(len(contexts), 2)
+        self.assertTrue(contexts[0].advance_state)
+        self.assertFalse(contexts[1].advance_state)
+        self.assertEqual(contexts[0].video_time, contexts[1].video_time)
+
+    def test_seek_resets_effect_history_and_presentation_sequence(self):
+        import yt_ascii_effects
+        from yt_ascii_frames import EffectFrame
+
+        resets = []
+        contexts = []
+        spawned = []
+        key_call = 0
+
+        class RecordingEffectProcessor:
+            def __init__(self, name, *, glyph_mode, speed, seed):
+                self.name = name
+
+            def reset(self, reason):
+                resets.append(reason)
+
+            def cycle(self):
+                raise AssertionError("unexpected effect cycle")
+
+            def apply(self, frame, context):
+                contexts.append(context)
+                return EffectFrame(frame)
+
+        def spawn_video(*_args):
+            process = self.FakeProcess(video=True)
+            spawned.append(process)
+            return process
+
+        def read_keys(_fd):
+            nonlocal key_call
+            key_call += 1
+            if key_call == 1:
+                return []
+            if key_call == 2:
+                return ["right"]
+            return ["q"]
+
+        info = self.info()
+        info["duration"] = 60.0
+        globals_ = CORE["run"].__globals__
+        replacements = {
+            "_CAN_SUSPEND": False,
+            "IS_WINDOWS": True,
+            "probe": lambda *_args: dict(info),
+            "spawn_video": spawn_video,
+            "find_ffplay": lambda: None,
+            "read_keys": read_keys,
+        }
+        with mock.patch.dict(globals_, replacements), \
+                mock.patch.object(globals_["os"], "isatty", return_value=True), \
+                mock.patch.object(globals_["time"], "monotonic", return_value=0.0), \
+                mock.patch.object(globals_["time"], "sleep"), \
+                mock.patch.object(
+                    yt_ascii_effects, "EffectProcessor", RecordingEffectProcessor
+                ), \
+                mock.patch.object(
+                    globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)
+                ), \
+                mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
+                mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+            CORE["run"](self.args())
+
+        self.assertEqual(len(spawned), 2)
+        self.assertEqual(resets, ["source", "seek"])
+        self.assertEqual(
+            [(item.frame_sequence, item.video_time) for item in contexts],
+            [(0, 0.0), (0, 5.0)],
+        )
+
+    def test_same_source_reconnect_preserves_effect_history_and_sequence(self):
+        import yt_ascii_effects
+        from yt_ascii_frames import EffectFrame
+
+        resets = []
+        contexts = []
+        spawned = []
+        key_call = 0
+
+        class OneFrameThenEof:
+            def __init__(self):
+                self.remaining = 1
+
+            def readinto(self, target):
+                if not self.remaining:
+                    return 0
+                self.remaining -= 1
+                target[:] = b"\x00" * len(target)
+                return len(target)
+
+        class RecordingEffectProcessor:
+            def __init__(self, name, *, glyph_mode, speed, seed):
+                self.name = name
+
+            def reset(self, reason):
+                resets.append(reason)
+
+            def cycle(self):
+                raise AssertionError("unexpected effect cycle")
+
+            def apply(self, frame, context):
+                contexts.append(context)
+                return EffectFrame(frame)
+
+        def spawn_video(*_args):
+            process = self.FakeProcess(video=True)
+            if not spawned:
+                process.stdout = OneFrameThenEof()
+            spawned.append(process)
+            return process
+
+        def read_keys(_fd):
+            nonlocal key_call
+            key_call += 1
+            return ["q"] if key_call == 4 else []
+
+        info = self.info()
+        info["duration"] = 60.0
+        globals_ = CORE["run"].__globals__
+        replacements = {
+            "_CAN_SUSPEND": False,
+            "IS_WINDOWS": True,
+            "probe": lambda *_args: dict(info),
+            "spawn_video": spawn_video,
+            "find_ffplay": lambda: None,
+            "read_keys": read_keys,
+        }
+        with mock.patch.dict(globals_, replacements), \
+                mock.patch.object(globals_["os"], "isatty", return_value=True), \
+                mock.patch.object(globals_["time"], "monotonic", return_value=0.0), \
+                mock.patch.object(globals_["time"], "sleep"), \
+                mock.patch.object(
+                    yt_ascii_effects, "EffectProcessor", RecordingEffectProcessor
+                ), \
+                mock.patch.object(
+                    globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)
+                ), \
+                mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
+                mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+            CORE["run"](self.args())
+
+        self.assertEqual(len(spawned), 2)
+        self.assertEqual(resets, ["source"])
+        self.assertEqual(
+            [(item.frame_sequence, item.video_time) for item in contexts],
+            [(0, 0.0), (1, 0.1)],
+        )
+
+    def test_new_media_preserves_effect_selection_but_resets_its_state(self):
+        import yt_ascii_effects
+
+        instances = []
+
+        class RecordingEffectProcessor:
+            def __init__(self, name, *, glyph_mode, speed, seed):
+                self.initial_name = name
+                self.name = name
+                self.resets = []
+                instances.append(self)
+
+            def reset(self, reason):
+                self.resets.append(reason)
+
+            def cycle(self):
+                self.name = "geometry"
+                return self.name
+
+            def apply(self, _frame, _context):
+                raise AssertionError("quit batches should not render")
+
+        args = self.args()
+        key_batches = iter((("e", "q"), ("q",)))
+        globals_ = CORE["run"].__globals__
+        replacements = {
+            "_CAN_SUSPEND": False,
+            "IS_WINDOWS": True,
+            "probe": lambda *_args: self.info(),
+            "spawn_video": lambda *_args: self.FakeProcess(video=True),
+            "find_ffplay": lambda: None,
+        }
+        with mock.patch.dict(globals_, replacements), \
+                mock.patch.object(globals_["os"], "isatty", return_value=True), \
+                mock.patch.object(globals_["time"], "monotonic", return_value=0.0), \
+                mock.patch.object(globals_["time"], "sleep"), \
+                mock.patch.object(
+                    yt_ascii_effects, "EffectProcessor", RecordingEffectProcessor
+                ), \
+                mock.patch.object(
+                    globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)
+                ), \
+                mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
+                mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+            with mock.patch.dict(globals_, {
+                "read_keys": lambda _fd: list(next(key_batches)),
+            }):
+                CORE["run"](args)
+                CORE["run"](args)
+
+        self.assertEqual(args.effect, "geometry")
+        self.assertEqual(
+            [item.initial_name for item in instances], ["none", "geometry"]
+        )
+        self.assertEqual([item.resets for item in instances], [["source"], ["source"]])
 
     def test_style_receives_decoded_frame_timestamps(self):
         import yt_ascii_styles
@@ -559,12 +929,16 @@ class NonSuspendResizeTests(unittest.TestCase):
         key_call = 0
         winch = None
 
+        import yt_ascii_effects
         import yt_ascii_renderer
         import yt_ascii_styles
+        from yt_ascii_frames import EffectFrame
 
         base_renderer = yt_ascii_renderer.AnsiRenderer
         base_style_processor = yt_ascii_styles.StyleProcessor
         style_resets = []
+        effect_resets = []
+        effect_contexts = []
 
         class RecordingStyleProcessor(base_style_processor):
             def reset(self):
@@ -575,6 +949,20 @@ class NonSuspendResizeTests(unittest.TestCase):
             def render_scatter(self, frame, fraction):
                 reveal_fractions.append(fraction)
                 return super().render_scatter(frame, fraction)
+
+        class RecordingEffectProcessor:
+            def __init__(self, name, *, glyph_mode, speed, seed):
+                self.name = name
+
+            def reset(self, reason):
+                effect_resets.append(reason)
+
+            def cycle(self):
+                raise AssertionError("unexpected effect cycle")
+
+            def apply(self, frame, context):
+                effect_contexts.append(context)
+                return EffectFrame(frame)
 
         class FakeSignal:
             SIGWINCH = object()
@@ -641,6 +1029,10 @@ class NonSuspendResizeTests(unittest.TestCase):
             palette="simple",
             chars=None,
             style="classic",
+            effect="none",
+            effect_glyphs="ascii",
+            effect_speed=1.0,
+            effect_seed=0,
         )
         info = {
             "title": "fixture",
@@ -668,6 +1060,11 @@ class NonSuspendResizeTests(unittest.TestCase):
                 mock.patch.object(globals_["time"], "sleep", sleep), \
                 mock.patch.object(yt_ascii_renderer, "AnsiRenderer", RecordingRenderer), \
                 mock.patch.object(yt_ascii_styles, "StyleProcessor", RecordingStyleProcessor), \
+                mock.patch.object(
+                    yt_ascii_effects,
+                    "EffectProcessor",
+                    RecordingEffectProcessor,
+                ), \
                 mock.patch.object(globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)), \
                 mock.patch.object(globals_["sys"], "stdout", output), \
                 mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
@@ -678,6 +1075,10 @@ class NonSuspendResizeTests(unittest.TestCase):
         self.assertEqual(len(spawned), 2)
         self.assertTrue(all(process.exited for process in spawned))
         self.assertEqual(style_resets, ["classic", "classic"])
+        self.assertEqual(effect_resets, ["source", "resize"])
+        self.assertEqual(
+            [context.frame_sequence for context in effect_contexts], [0, 0]
+        )
         self.assertGreaterEqual(len(reveal_fractions), 2)
         self.assertLess(max(reveal_fractions), 0.25)
 

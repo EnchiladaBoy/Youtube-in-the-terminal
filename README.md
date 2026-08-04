@@ -4,7 +4,7 @@ Watch YouTube videos as terminal art on Linux, macOS, and Windows. The
 `yt-ascii` command provides:
 
 - ASCII rendering in 24-bit color or grayscale, plus color half-block pixels;
-- six live video styles and two animated reveal effects;
+- six live video styles, structural terminal effects, and two animated reveals;
 - optional audio and an 8-bit audio mode; and
 - pause, seek, and percentage-jump controls during playback.
 
@@ -42,6 +42,17 @@ links and play multiple videos. The default installer uses the stable source
 tag recorded in [`STABLE_VERSION`](STABLE_VERSION), not a mutable branch or a
 GitHub Release asset.
 
+The v0.5.0 structural-effect candidate is currently available from the
+development channel while the default installer remains on stable v0.4.0:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 - --edge
+```
+
+```powershell
+irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 - --edge
+```
+
 ## Usage
 
 ### Controls
@@ -50,6 +61,7 @@ GitHub Release asset.
 |---|---|
 | `space` | pause / resume |
 | `s` | cycle video style |
+| `e` | cycle structural effect |
 | `←` / `→` | seek -5s / +5s |
 | `↓` / `↑` | seek -30s / +30s |
 | `0`–`9` | jump to 0%–90% |
@@ -85,6 +97,73 @@ These styles are independent implementations of established image-processing
 techniques. `ladybug.app` provided visual inspiration; no Ladybug code,
 shaders, assets, or presets are included.
 
+### Structural effects
+
+Styles recolor or transform the RGB picture. Structural effects rebuild its
+terminal cells using glyphs, lines, dots, regions, or frame history. Select one
+with `--effect NAME`; `none` preserves the normal style-and-renderer path.
+Press `e` during playback to cycle through this fixed order:
+
+| Effect | Terminal treatment |
+|---|---|
+| `none` | No structural effect (default) |
+| `geometry` | Maps tone bands to geometric cells |
+| `contour-glyph` | Draws detected contours with directional glyphs |
+| `hatch` | Builds light and shade from directional hatch marks |
+| `dotfield` | Represents tone with a deterministic field of dots |
+| `tile-mosaic` | Reconstructs the frame from averaged rectangular tiles |
+| `wave-lines` | Draws an animated wave-line field bent by image tone |
+| `voronoi` | Samples the picture into seeded Voronoi regions |
+| `afterimage` | Retains a fading history of motion between frames |
+
+The shared controls are:
+
+| Option | Meaning |
+|---|---|
+| `--effect-glyphs ascii|unicode` | Use portable ASCII glyphs (default) or richer Unicode |
+| `--effect-speed N` | Positive finite animation-speed multiplier (default `1.0`) |
+| `--effect-seed N` | Integer seed for reproducible procedural layouts (default `0`) |
+
+Static effects ignore the speed multiplier, and effects without a procedural
+layout ignore the seed.
+
+Effect selection composes with `--style`: the style transforms RGB first, then
+the structural effect interprets that styled frame. Seeds and video timestamps
+make procedural and animated output repeatable after seeking. An effect chosen
+with `e` remains active for later videos in the same interactive session.
+
+`geometry`, `contour-glyph`, `hatch`, and `dotfield` produce character-cell
+structures. If `--pixels` is active, those four effects temporarily fall back
+to character rendering and the status line shows `pixels→chars`; cycling to
+`none` or an RGB-only effect restores half-block pixels. `--effect-glyphs`
+selects the schema for those glyph effects. `tile-mosaic`, `wave-lines`,
+`voronoi`, and `afterimage` transform RGB and therefore retain pixel mode and
+the normal `--palette` / `--chars` behavior.
+
+Unicode mode excludes full-width, combining, and control characters, but some
+geometric symbols have locale-dependent ambiguous width. Use the default ASCII
+mode if columns drift in a CJK-width terminal configuration.
+
+```sh
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect geometry
+yt-ascii https://youtu.be/jNQXAC9IVRw --style duotone --effect hatch
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect voronoi --effect-seed 42
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect wave-lines --effect-speed 1.5
+```
+
+These effects are independent, terminal-native implementations of established
+generative-art techniques. They do not copy another application's code,
+shaders, assets, presets, or control recipes. See [`EFFECTS.md`](EFFECTS.md)
+for compatibility and the living implementation roadmap.
+
+### Reveals
+
+`--scatter` and `--rain` are entrance animations, not persistent structural
+effects. They uncover the composed live picture once at playback start and
+restart after a seek. The flags are mutually exclusive, and their timing and
+rain glyphs are controlled by `--scatter-secs`, `--rain-secs`, and
+`--rain-chars`.
+
 ### Palettes and other options
 
 Built-in character palettes are `simple`, `dense`, `blocks`, `binary`,
@@ -94,7 +173,8 @@ selected palette.
 | Area | Options |
 |---|---|
 | Display | `--no-color`, `--pixels`, `--palette`, `--chars`, `--style` |
-| Reveal effects | `--scatter`, `--rain`, `--scatter-secs`, `--rain-secs`, `--rain-chars` |
+| Structural effects | `--effect`, `--effect-glyphs`, `--effect-speed`, `--effect-seed` |
+| Reveals | `--scatter`, `--rain`, `--scatter-secs`, `--rain-secs`, `--rain-chars` |
 | Playback size/rate | `--fps`, `--width`, `--height`, `--max-res` |
 | Audio | `--no-audio`, `--8bit` |
 

@@ -7,6 +7,7 @@ Usage:
 Keys (while playing):
     space        pause / resume
     s            cycle visual style
+    e            cycle structural effect
     ← / →        seek -5s / +5s
     ↓ / ↑        seek -30s / +30s
     0..9         jump to 0%..90% of the video
@@ -30,7 +31,7 @@ import sys
 import time
 import unicodedata
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 INSTALL_REF_ENV = "YTASCII_INSTALL_REF"
 _MAX_INSTALL_REF_LENGTH = 64
 _VERSION_REF_RE = re.compile(
@@ -71,6 +72,18 @@ PALETTES = {
 # installed. ``run`` and ``self_test`` statically import the implementation
 # only after dependency checks have succeeded.
 STYLE_NAMES = ("classic", "bayer", "duotone", "riso", "contour", "glitch")
+EFFECT_NAMES = (
+    "none",
+    "geometry",
+    "contour-glyph",
+    "hatch",
+    "dotfield",
+    "tile-mosaic",
+    "wave-lines",
+    "voronoi",
+    "afterimage",
+)
+GLYPH_EFFECT_NAMES = frozenset(("geometry", "contour-glyph", "hatch", "dotfield"))
 
 # Terminal character cells are ~2x taller than wide; correct aspect ratio.
 CHAR_ASPECT = 2.0
@@ -194,6 +207,21 @@ def fps_type(value):
             f"use '--fps max' to request the cap"
         )
     return n
+
+
+def effect_speed_type(value):
+    """Validate the shared multiplier used by animated effects."""
+    try:
+        speed = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--effect-speed must be a positive number (got {value!r})"
+        )
+    if not (0.0 < speed < float("inf")):
+        raise argparse.ArgumentTypeError(
+            "--effect-speed must be a positive finite number"
+        )
+    return speed
 
 
 def fail(msg, code=1):
@@ -429,6 +457,8 @@ def _read_keys_windows():
             keys.append("esc")
         elif ch == "s":
             keys.append("s")
+        elif ch == "e":
+            keys.append("e")
         elif ch.isdigit():
             keys.append(ch)
     return keys
@@ -467,6 +497,8 @@ def _read_keys_posix(fd):
                 keys.append("q"); i += 1; continue
             if ch == "s":
                 keys.append("s"); i += 1; continue
+            if ch == "e":
+                keys.append("e"); i += 1; continue
             if ch.isdigit():
                 keys.append(ch); i += 1; continue
             i += 1
@@ -650,6 +682,7 @@ def parse_args():
             "Keys while playing:\n"
             "  space        pause / resume\n"
             "  s            cycle visual style\n"
+            "  e            cycle structural effect\n"
             "  ←/→          seek ±5s\n"
             "  ↓/↑          seek ±30s\n"
             "  0..9         jump to 0%..90%\n"
@@ -671,7 +704,8 @@ def parse_args():
                    help="render with half-block pixels (▀) instead of ASCII "
                         "characters — packs two colored pixels per cell, "
                         "giving 2x vertical resolution and a sharper image. "
-                        "Ignored when --no-color is set.")
+                        "Glyph effects temporarily switch to character cells; "
+                        "ignored when --no-color is set.")
     reveal = p.add_mutually_exclusive_group()
     reveal.add_argument("--scatter", action="store_true",
                         help="reveal the picture with a random pop-in: ASCII "
@@ -710,6 +744,18 @@ def parse_args():
     p.add_argument("--chars", help="custom palette, dark→light")
     p.add_argument("--style", choices=STYLE_NAMES, default="classic",
                    help="visual style (default: classic)")
+    p.add_argument("--effect", choices=EFFECT_NAMES, default="none",
+                   help="structural effect (default: none)")
+    p.add_argument("--effect-glyphs", choices=("ascii", "unicode"),
+                   default="ascii", metavar="MODE",
+                   help="glyph set for structural effects: ascii or unicode "
+                        "(default: ascii)")
+    p.add_argument("--effect-speed", type=effect_speed_type, default=1.0,
+                   metavar="N",
+                   help="animation-speed multiplier for structural effects "
+                        "(default: 1.0)")
+    p.add_argument("--effect-seed", type=int, default=0, metavar="N",
+                   help="deterministic procedural-layout seed (default: 0)")
     p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
 
@@ -728,7 +774,7 @@ def prompt_for_url():
         f"{reset}\n\n"
         f"{gray}   Paste a YouTube link and press Enter to play it.\n"
         "   While playing:  space=pause  <-/-> +-5s  up/down +-30s  "
-        "0-9=jump  s=style  q=quit\n"
+        "0-9=jump  s=style  e=effect  q=quit\n"
         "   Run with --help for color / audio / effect options."
         f"{reset}\n\n"
     )
@@ -761,12 +807,22 @@ def run(args):
         reveal_secs = 0.0
 
     import numpy as np
+    from yt_ascii_effects import EffectProcessor
+    from yt_ascii_frames import EffectContext
     from yt_ascii_renderer import AnsiRenderer
     from yt_ascii_styles import StyleProcessor
 
     style_processor = StyleProcessor(args.style)
     args.style = style_processor.name
     style_processor.reset()  # each new media item starts with fresh style state
+    effect_processor = EffectProcessor(
+        getattr(args, "effect", "none"),
+        glyph_mode=getattr(args, "effect_glyphs", "ascii"),
+        speed=getattr(args, "effect_speed", 1.0),
+        seed=getattr(args, "effect_seed", 0),
+    )
+    args.effect = effect_processor.name
+    effect_processor.reset("source")
 
     chars = args.chars or PALETTES[args.palette]
     if not chars:
@@ -799,7 +855,13 @@ def run(args):
     cols, rows, ow, oh = compute_dims()
     pix_h = oh * 2 if half_block else oh   # source-pixel height ffmpeg scales to
 
-    mode_label = "pixels" if half_block else ("color-chars" if not args.no_color else "gray-chars")
+    pixel_fallback = half_block and args.effect in GLYPH_EFFECT_NAMES
+    mode_label = (
+        "pixels→chars" if pixel_fallback
+        else "pixels" if half_block
+        else "color-chars" if not args.no_color
+        else "gray-chars"
+    )
     audio_enabled = not args.no_audio and bool(find_ffplay())
     audio_label = (
         "8-bit audio" if (audio_enabled and args.eight_bit)
@@ -820,6 +882,7 @@ def run(args):
     seek_pos = 0.0
     seek_at = time.monotonic()
     frame_no = 0          # frames consumed within current segment
+    presented_sequence = 0
     paused = False
     pause_started = 0.0
     # Reveal animation: wall-clock time the current segment's reveal began
@@ -847,7 +910,7 @@ def run(args):
         state["video"] = state["audio"] = None
 
     def seek_to(new_pos):
-        nonlocal seek_pos, seek_at, frame_no, paused, last_frame
+        nonlocal seek_pos, seek_at, frame_no, presented_sequence, paused, last_frame
         if info["duration"]:
             new_pos = max(0.0, min(new_pos, info["duration"] - 0.5))
         else:
@@ -857,9 +920,11 @@ def run(args):
         seek_pos = new_pos
         seek_at = time.monotonic()
         frame_no = 0
+        presented_sequence = 0
         paused = False  # resume on seek so the user sees the new position
         last_frame = None
         style_processor.reset()
+        effect_processor.reset("seek")
         begin_reveal()  # replay the reveal from the new position
 
     def toggle_pause():
@@ -895,7 +960,8 @@ def run(args):
         Audio is left running so there's no audible gap on resize."""
         nonlocal cols, rows, ow, oh, pix_h, frame_size
         nonlocal frame_buffer, discard_buffer, reveal_start
-        nonlocal seek_pos, seek_at, frame_no, pause_started, last_frame
+        nonlocal seek_pos, seek_at, frame_no, presented_sequence
+        nonlocal pause_started, last_frame
         new_cols, new_rows, new_ow, new_oh = compute_dims()
         if (new_ow, new_oh, new_cols) == (ow, oh, cols):
             return
@@ -920,8 +986,10 @@ def run(args):
         seek_pos = pos
         seek_at = resize_at
         frame_no = 0
+        presented_sequence = 0
         last_frame = None
         style_processor.reset()
+        effect_processor.reset("resize")
         if paused:
             pause_started = resize_at
             if _CAN_SUSPEND:
@@ -1006,33 +1074,60 @@ def run(args):
         rain_chars=rain_chars,
     )
 
-    def render_frame(frame, video_time, reveal_fraction):
-        """Apply the active visual style before the renderer/reveal stage."""
+    def render_frame(
+        frame, video_time, reveal_fraction, *, advance_state, sequence
+    ):
+        """Compose style, structural effect, reveal, then terminal bytes."""
         styled = style_processor.apply(frame, video_time)
+        context = EffectContext(
+            video_time=video_time,
+            frame_sequence=sequence,
+            cell_shape=(oh, ow),
+            requested_pixels=half_block,
+            advance_state=advance_state,
+        )
+        effected = effect_processor.apply(styled, context)
         if reveal_fraction < 1.0:
-            return (
-                renderer.render_rain(styled, reveal_fraction)
+            reveal_method = (
+                renderer.render_rain
                 if reveal_style == "rain"
-                else renderer.render_scatter(styled, reveal_fraction)
+                else renderer.render_scatter
             )
-        return renderer.render(styled)
+            if effected.cells is None:
+                return reveal_method(effected.rgb, reveal_fraction)
+            return reveal_method(
+                effected.rgb, reveal_fraction, effected.cells
+            )
+        if effected.cells is None:
+            return renderer.render(effected.rgb)
+        return renderer.render(effected.rgb, effected.cells)
 
     def redraw_paused_frame():
         """Render the retained raw frame with the current paused state."""
         if last_frame is None:
             return
         body = render_frame(
-            last_frame, last_frame_time, last_reveal_fraction
+            last_frame,
+            last_frame_time,
+            last_reveal_fraction,
+            advance_state=False,
+            sequence=presented_sequence,
         )
         status = build_status(
             args.fps, current_pos(), info, cols, paused=True,
-            style=args.style,
+            style=args.style, effect=args.effect,
+            pixel_fallback=half_block and args.effect in GLYPH_EFFECT_NAMES,
         )
         write_terminal_frame(body, status)
 
     def cycle_style():
         """Select the next style; the caller coordinates any paused redraw."""
         args.style = style_processor.cycle()
+        effect_processor.reset("style")
+
+    def cycle_effect():
+        """Select the next structural effect without restarting playback."""
+        args.effect = effect_processor.cycle()
 
     def begin_reveal():
         """Start (or restart, after a seek) the current reveal animation: clear
@@ -1054,6 +1149,7 @@ def run(args):
             # ── Handle keyboard ──────────────────────────────────────────
             quit_now = False
             style_changed = False
+            effect_changed = False
             pending_seek = None  # final target after applying all queued keys
             if is_tty:
                 for key in read_keys(fd):
@@ -1066,6 +1162,10 @@ def run(args):
                     if key == "s":
                         cycle_style()
                         style_changed = True
+                        continue
+                    if key == "e":
+                        cycle_effect()
+                        effect_changed = True
                         continue
                     base = pending_seek if pending_seek is not None else current_pos()
                     if key == "left":
@@ -1085,7 +1185,7 @@ def run(args):
             # Key reads are batches. Redraw after the whole batch so both
             # ``space, s`` and ``s, space`` end with a correctly styled frozen
             # frame rather than a new label over the previous style.
-            if style_changed and paused:
+            if (style_changed or effect_changed) and paused:
                 redraw_paused_frame()
 
             if resize_flag[0]:
@@ -1096,7 +1196,11 @@ def run(args):
             if paused:
                 pos = current_pos()
                 status = build_status(
-                    args.fps, pos, info, cols, paused=True, style=args.style
+                    args.fps, pos, info, cols, paused=True,
+                    style=args.style, effect=args.effect,
+                    pixel_fallback=(
+                        half_block and args.effect in GLYPH_EFFECT_NAMES
+                    ),
                 )
                 sys.stdout.write(f"\x1b[{oh + 1};1H" + status + "\x1b[K")
                 sys.stdout.flush()
@@ -1138,14 +1242,25 @@ def run(args):
                 frac = (rnow - reveal_start) / reveal_secs
             else:
                 frac = 1.0
-            body = render_frame(frame, frame_time, frac)
+            body = render_frame(
+                frame,
+                frame_time,
+                frac,
+                advance_state=True,
+                sequence=presented_sequence,
+            )
             last_frame = frame
             last_frame_time = frame_time
             last_reveal_fraction = frac
+            presented_sequence += 1
 
             pos = seek_pos + seg_elapsed
             status = build_status(
-                args.fps, pos, info, cols, paused=False, style=args.style
+                args.fps, pos, info, cols, paused=False,
+                style=args.style, effect=args.effect,
+                pixel_fallback=(
+                    half_block and args.effect in GLYPH_EFFECT_NAMES
+                ),
             )
 
             write_terminal_frame(body, status)
@@ -1189,39 +1304,58 @@ def _truncate_terminal_cells(text, limit):
     return "".join(result)
 
 
-def build_status(fps, pos, info, cols, paused, style="classic"):
+def build_status(
+    fps, pos, info, cols, paused, style="classic", effect="none",
+    pixel_fallback=False,
+):
     if info["duration"]:
         clock = f"{fmt_time(pos)} / {fmt_time(info['duration'])}"
     else:
         clock = fmt_time(pos)
     tag = "‖ PAUSED" if paused else "▶"
     width = max(0, int(cols))
+    effect_label = f"effect:{effect}"
+    if pixel_fallback:
+        effect_label += " pixels→chars"
     head_options = (
-        f"  {tag}  {clock}  {fps}fps  style:{style}",
-        f"  {tag}  {clock}  style:{style}",
-        f"  {clock}  style:{style}",
-        f"  style:{style}",
+        f"  {tag}  {clock}  {fps}fps  style:{style}  {effect_label}",
+        f"  {tag}  {clock}  style:{style}  {effect_label}",
+        f"  {clock}  style:{style}  {effect_label}",
+        f"  style:{style}  {effect_label}",
+        f"  {effect_label}",
     )
-    head = next(
-        (value for value in head_options if _terminal_cell_width(value) <= width),
-        "",
+    control_options = (
+        "space:pause  s:style  e:effect  ←→±5s  ↑↓±30s  0-9:jump  q:quit",
+        "space:pause  s:style  e:effect  arrows:seek  0-9:jump  q:quit",
+        "space  s:style  e:effect  arrows:seek  q:quit",
+        "s:style  e:effect  q:quit",
     )
+    head = controls = fallback_head = ""
+    title_reserve = min(12, _terminal_cell_width(info.get("title", "")))
+    for reserve in ((title_reserve, 0) if title_reserve else (0,)):
+        for candidate_head in head_options:
+            candidate_width = _terminal_cell_width(candidate_head)
+            if candidate_width > width:
+                continue
+            if not fallback_head:
+                fallback_head = candidate_head
+            candidate_controls = next(
+                (
+                    value for value in control_options
+                    if candidate_width + 2 + _terminal_cell_width(value) + reserve
+                    <= width
+                ),
+                "",
+            )
+            if candidate_controls:
+                head, controls = candidate_head, candidate_controls
+                break
+        if controls:
+            break
+    if not head:
+        head = fallback_head
     if not head:
         return "\x1b[0m" + _truncate_terminal_cells(head_options[-1], width)
-
-    control_options = (
-        "space:pause  s:style  ←→±5s  ↑↓±30s  0-9:jump  q:quit",
-        "space:pause  s:style  arrows:seek  0-9:jump  q:quit",
-        "space  s:style  arrows:seek  q:quit",
-        "s:style  q:quit",
-    )
-    controls = next(
-        (
-            value for value in control_options
-            if _terminal_cell_width(head) + 2 + _terminal_cell_width(value) <= width
-        ),
-        "",
-    )
     head_width = _terminal_cell_width(head)
     controls_width = _terminal_cell_width(controls) + 2 if controls else 0
     title_room = max(0, width - head_width - controls_width - 2)
@@ -1238,13 +1372,26 @@ def build_status(fps, pos, info, cols, paused, style="classic"):
 
 
 def self_test():
-    """Exercise bundled NumPy, every style, and rendering without network."""
+    """Exercise bundled NumPy, every style/effect and rendering offline."""
     import numpy as np
+    from yt_ascii_effects import (
+        EFFECT_NAMES as IMPLEMENTED_EFFECTS,
+        EFFECT_SPECS,
+        EffectProcessor,
+    )
+    from yt_ascii_frames import EffectContext
     from yt_ascii_renderer import AnsiRenderer
     from yt_ascii_styles import STYLE_NAMES as IMPLEMENTED_STYLES, StyleProcessor
 
     if tuple(IMPLEMENTED_STYLES) != STYLE_NAMES:
         fail("style registry self-test failed")
+    if tuple(IMPLEMENTED_EFFECTS) != EFFECT_NAMES:
+        fail("effect registry self-test failed")
+    implemented_glyph_effects = frozenset(
+        spec.name for spec in EFFECT_SPECS if spec.glyph_owned
+    )
+    if implemented_glyph_effects != GLYPH_EFFECT_NAMES:
+        fail("effect pixel-policy self-test failed")
 
     frame = np.array([[[1, 2, 3]]], dtype=np.uint8)
     expected = b"\x1b[38;2;1;2;3mx\x1b[0m\x1b[K"
@@ -1261,6 +1408,49 @@ def self_test():
             fail(f"{name} style self-test failed")
         if not renderer.render(styled):
             fail(f"{name} style renderer self-test failed")
+
+    effect_processor = EffectProcessor()
+    context = EffectContext(
+        video_time=0.25,
+        frame_sequence=0,
+        cell_shape=sample.shape[:2],
+        requested_pixels=False,
+        advance_state=True,
+    )
+    for name in EFFECT_NAMES:
+        effect_processor.select(name)
+        effected = effect_processor.apply(sample, context)
+        if effected.rgb.dtype != np.uint8 or effected.rgb.ndim != 3:
+            fail(f"{name} effect self-test failed")
+        output = renderer.render(effected.rgb, effected.cells)
+        if not output:
+            fail(f"{name} effect renderer self-test failed")
+        if name == "afterimage":
+            moved = np.roll(sample, 1, axis=1)
+            later = EffectContext(
+                video_time=0.5,
+                frame_sequence=1,
+                cell_shape=sample.shape[:2],
+                requested_pixels=False,
+                advance_state=True,
+            )
+            temporal = effect_processor.apply(moved, later)
+            if not renderer.render(temporal.rgb, temporal.cells):
+                fail("afterimage temporal self-test failed")
+
+    effect_processor.select("geometry")
+    pixel_sample = np.repeat(sample, 2, axis=0)
+    pixel_context = EffectContext(
+        video_time=0.25,
+        frame_sequence=0,
+        cell_shape=sample.shape[:2],
+        requested_pixels=True,
+        advance_state=True,
+    )
+    geometry = effect_processor.apply(pixel_sample, pixel_context)
+    pixel_renderer = AnsiRenderer(" .#", half_block=True)
+    if not pixel_renderer.render(geometry.rgb, geometry.cells):
+        fail("effect pixel fallback self-test failed")
     sys.stdout.write("yt-ascii self-test: ok\n")
 
 

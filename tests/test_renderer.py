@@ -2,6 +2,7 @@ import unittest
 
 import numpy as np
 
+from yt_ascii_frames import CellPlane
 from yt_ascii_renderer import AnsiRenderer, CLEAR_EOL, RESET
 
 
@@ -56,6 +57,15 @@ def legacy_half(frame):
     return "\n".join(
         "".join(row) + "\x1b[0m\x1b[K" for row in output
     ).encode("utf-8")
+
+
+def unsafe_cell_plane(glyph_indices, glyphs, fg_rgb=None):
+    """Build a plane without dataclass validation to test renderer boundaries."""
+    plane = object.__new__(CellPlane)
+    object.__setattr__(plane, "glyph_indices", glyph_indices)
+    object.__setattr__(plane, "glyphs", glyphs)
+    object.__setattr__(plane, "fg_rgb", fg_rgb)
+    return plane
 
 
 class RendererTests(unittest.TestCase):
@@ -125,6 +135,146 @@ class RendererTests(unittest.TestCase):
             AnsiRenderer(" .:-=+*#%@", color=False).render(frame),
             legacy_chars(frame, " .:-=+*#%@", color=False),
         )
+
+    def test_ascii_cell_plane_uses_explicit_and_derived_foreground(self):
+        frame = np.array([[[1, 2, 3], [4, 5, 6]]], dtype=np.uint8)
+        explicit = np.array([[[7, 8, 9], [10, 11, 12]]], dtype=np.uint8)
+        plane = CellPlane(
+            np.array([[0, 1]], dtype=np.uint8), "XO", explicit
+        )
+        self.assertEqual(
+            AnsiRenderer("ignored").render(frame, plane),
+            (
+                b"\x1b[38;2;7;8;9mX"
+                b"\x1b[38;2;10;11;12mO"
+                + RESET + CLEAR_EOL
+            ),
+        )
+
+        derived = CellPlane(np.array([[1, 0]], dtype=np.uint8), "ab")
+        self.assertEqual(
+            AnsiRenderer("ignored").render(frame, derived),
+            (
+                b"\x1b[38;2;1;2;3mb"
+                b"\x1b[38;2;4;5;6ma"
+                + RESET + CLEAR_EOL
+            ),
+        )
+
+    def test_multibyte_cell_plane_and_grayscale_color_policy(self):
+        frame = np.array(
+            [[[1, 2, 3], [4, 5, 6], [7, 8, 9]]], dtype=np.uint8
+        )
+        plane = CellPlane(
+            np.array([[0, 1, 0]], dtype=np.uint16),
+            "λ▀",
+            np.full((1, 3, 3), 255, dtype=np.uint8),
+        )
+        self.assertEqual(
+            AnsiRenderer("x", color=False).render(frame, plane),
+            "λ▀λ".encode("utf-8") + CLEAR_EOL,
+        )
+
+    def test_cell_plane_schema_switch_rebuilds_only_ansi_workspace(self):
+        frame = np.zeros((3, 4, 3), dtype=np.uint8)
+        renderer = AnsiRenderer("x", rng=np.random.default_rng(31))
+        ascii_plane = CellPlane(
+            np.resize(np.array([0, 1], dtype=np.uint8), (3, 4)), "AB"
+        )
+        unicode_plane = CellPlane(
+            np.resize(np.array([1, 0], dtype=np.uint8), (3, 4)), "λЖ"
+        )
+
+        renderer.render_scatter(frame, 0.5, ascii_plane)
+        rank = renderer._scatter["rank"].copy()
+        first_rain = renderer.render_rain(frame, 0.4, ascii_plane)
+        rain_duration = renderer._rain["duration"].copy()
+        second_rain = renderer.render_rain(frame, 0.4, unicode_plane)
+
+        np.testing.assert_array_equal(renderer._scatter["rank"], rank)
+        np.testing.assert_array_equal(renderer._rain["duration"], rain_duration)
+        first_rain.decode("utf-8")
+        second_rain.decode("utf-8")
+        self.assertNotIn(b"\x00", second_rain)
+        self.assertEqual(renderer._workspace_key[4], len("λ".encode("utf-8")))
+
+    def test_cell_plane_forces_half_block_fallback_and_resets_background(self):
+        frame = np.zeros((4, 2, 3), dtype=np.uint8)
+        colors = np.array(
+            [
+                [[1, 2, 3], [4, 5, 6]],
+                [[7, 8, 9], [10, 11, 12]],
+            ],
+            dtype=np.uint8,
+        )
+        plane = CellPlane(
+            np.array([[0, 1], [1, 0]], dtype=np.uint8), "AB", colors
+        )
+        output = AnsiRenderer("x", half_block=True).render(frame, plane)
+        self.assertNotIn(b"\x1b[48;2;", output)
+        self.assertNotIn("▀".encode("utf-8"), output)
+        self.assertEqual(output.count(RESET + b"\x1b[38;2;"), 4)
+        self.assertIn(RESET + b"\x1b[38;2;1;2;3mA", output)
+
+        with self.assertRaises(ValueError):
+            AnsiRenderer("x", half_block=True).render(
+                frame,
+                CellPlane(np.zeros((2, 2), dtype=np.uint8), "x"),
+            )
+
+    def test_renderer_revalidates_mutated_cell_plane_contract(self):
+        frame = np.zeros((2, 3, 3), dtype=np.uint8)
+        renderer = AnsiRenderer("x")
+        valid_indices = np.zeros((2, 3), dtype=np.uint8)
+        valid_colors = np.zeros((2, 3, 3), dtype=np.uint8)
+        invalid_planes = (
+            unsafe_cell_plane([[0]], "x", valid_colors),
+            unsafe_cell_plane(np.zeros((2, 3, 1), dtype=np.uint8), "x", valid_colors),
+            unsafe_cell_plane(np.zeros((2, 2), dtype=np.uint8), "x", np.zeros((2, 2, 3), dtype=np.uint8)),
+            unsafe_cell_plane(valid_indices.astype(np.float32), "x", valid_colors),
+            unsafe_cell_plane(valid_indices, "", valid_colors),
+            unsafe_cell_plane(valid_indices, "x\x00", valid_colors),
+            unsafe_cell_plane(np.full((2, 3), 1, dtype=np.uint8), "x", valid_colors),
+            unsafe_cell_plane(np.full((2, 3), -1, dtype=np.int8), "x", valid_colors),
+            unsafe_cell_plane(valid_indices, "x", valid_colors.astype(np.int16)),
+            unsafe_cell_plane(valid_indices, "x", np.zeros((2, 3), dtype=np.uint8)),
+            unsafe_cell_plane(valid_indices, "x", np.zeros((3, 2, 3), dtype=np.uint8)),
+        )
+        with self.assertRaises(TypeError):
+            renderer.render(frame, object())
+        for position, plane in enumerate(invalid_planes):
+            with self.subTest(position=position), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                renderer.render(frame, plane)
+
+    def test_cell_plane_reveal_completion_matches_normal_render(self):
+        frame = np.arange(6 * 5 * 3, dtype=np.uint8).reshape(6, 5, 3)
+        plane = CellPlane(
+            np.resize(np.arange(3, dtype=np.uint8), (6, 5)), "Aλ#"
+        )
+        renderer = AnsiRenderer("x", rain_chars="R", rng=np.random.default_rng(4))
+        normal = renderer.render(frame, plane)
+        self.assertEqual(renderer.render_scatter(frame, 1, plane), normal)
+        renderer.reset_reveal()
+        self.assertEqual(renderer.render_rain(frame, 1, plane), normal)
+
+    def test_cell_plane_rain_override_is_reset_and_foreground_bounded(self):
+        frame = np.zeros((8, 2, 3), dtype=np.uint8)
+        plane = CellPlane(np.zeros((8, 2), dtype=np.uint8), "P")
+        renderer = AnsiRenderer(
+            "x", rain_chars="R", rng=np.random.default_rng(13)
+        )
+        renderer._rain = {
+            "cols": 2,
+            "duration": np.ones(2),
+            "offset": np.zeros(2),
+        }
+        output = renderer.render_rain(frame, 0.5, plane)
+        self.assertIn(RESET + b"\x1b[38;2;", output)
+        self.assertIn(b"mR" + RESET, output)
+        self.assertIn(b"mP", output)
+        self.assertNotIn(b"\x00", output)
 
     def test_rows_have_one_separator_and_no_trailing_newline(self):
         frame = np.zeros((2, 2), dtype=np.uint8)

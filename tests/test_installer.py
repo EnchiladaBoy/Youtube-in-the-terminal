@@ -42,6 +42,8 @@ def minimal_source(root):
     (root / "yt-ascii").write_text("print('ok')\n", encoding="utf-8")
     (root / "yt_ascii_renderer.py").write_text("# renderer\n", encoding="utf-8")
     (root / "yt_ascii_styles.py").write_text("# styles\n", encoding="utf-8")
+    (root / "yt_ascii_effects.py").write_text("# effects\n", encoding="utf-8")
+    (root / "yt_ascii_frames.py").write_text("# frames\n", encoding="utf-8")
     (root / "requirements.txt").write_text("# none\n", encoding="utf-8")
     return root
 
@@ -176,7 +178,7 @@ class ArchiveTests(unittest.TestCase):
             self.assertTrue((app / "yt-ascii").is_file())
             self.assertFalse((app / "yt_ascii_styles.py").exists())
 
-    def test_v04_and_edge_archives_require_style_module(self):
+    def test_v04_and_newer_archives_require_style_module(self):
         payload = zip_payload([
             ("repo/yt-ascii", b"entry"),
             ("repo/yt_ascii_renderer.py", b"# renderer\n"),
@@ -184,6 +186,7 @@ class ArchiveTests(unittest.TestCase):
         ])
         cases = [
             {"ref": "v0.4.0"},
+            {"ref": "v0.5.0"},
             {"ref": "edge", "edge": True},
         ]
         for index, options in enumerate(cases):
@@ -194,6 +197,62 @@ class ArchiveTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     install.InstallerError, "yt_ascii_styles.py"
                 ):
+                    install.stage_source(version_dir, **options)
+
+    def test_v04_archive_remains_installable_without_effect_modules(self):
+        payload = zip_payload([
+            ("repo/yt-ascii", b"entry"),
+            ("repo/yt_ascii_renderer.py", b"# renderer\n"),
+            ("repo/yt_ascii_styles.py", b"# styles\n"),
+            ("repo/requirements.txt", b"# requirements\n"),
+        ])
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            install, "fetch_bytes", return_value=payload
+        ):
+            version_dir = Path(directory) / "version"
+            version_dir.mkdir()
+            app = install.stage_source(version_dir, ref="v0.4.0")
+            self.assertTrue((app / "yt_ascii_styles.py").is_file())
+            self.assertFalse((app / "yt_ascii_effects.py").exists())
+            self.assertFalse((app / "yt_ascii_frames.py").exists())
+
+    def test_source_requires_effect_and_frame_modules(self):
+        for missing in ("yt_ascii_effects.py", "yt_ascii_frames.py"):
+            with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                source = minimal_source(base / "source")
+                (source / missing).unlink()
+                with self.assertRaisesRegex(install.InstallerError, missing):
+                    install.stage_source(base / "version", source_dir=source)
+
+    def test_v05_and_edge_archives_require_effect_and_frame_modules(self):
+        base_entries = [
+            ("repo/yt-ascii", b"entry"),
+            ("repo/yt_ascii_renderer.py", b"# renderer\n"),
+            ("repo/yt_ascii_styles.py", b"# styles\n"),
+            ("repo/requirements.txt", b"# requirements\n"),
+        ]
+        cases = [
+            ({"ref": "v0.5.0"}, "yt_ascii_effects.py"),
+            ({"ref": "v0.5.0"}, "yt_ascii_frames.py"),
+            ({"ref": "edge", "edge": True}, "yt_ascii_effects.py"),
+            ({"ref": "edge", "edge": True}, "yt_ascii_frames.py"),
+        ]
+        for index, (options, missing) in enumerate(cases):
+            entries = list(base_entries)
+            present = (
+                "yt_ascii_frames.py"
+                if missing == "yt_ascii_effects.py"
+                else "yt_ascii_effects.py"
+            )
+            entries.append((f"repo/{present}", b"# present\n"))
+            payload = zip_payload(entries)
+            with self.subTest(options=options, missing=missing), \
+                 tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.object(install, "fetch_bytes", return_value=payload):
+                version_dir = Path(directory) / f"version-{index}"
+                version_dir.mkdir()
+                with self.assertRaisesRegex(install.InstallerError, missing):
                     install.stage_source(version_dir, **options)
 
 

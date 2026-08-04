@@ -310,8 +310,9 @@ def stage_source(version_dir, source_dir=None, ref=None, edge=False):
         app_dir / "yt_ascii_renderer.py",
         app_dir / "requirements.txt",
     ]
-    # v0.3.x predates the style pipeline and remains installable by exact tag.
-    # Local source, edge, and v0.4+ archives must carry the style module.
+    # Historical tags remain installable with the source layout they shipped:
+    # v0.4 adds styles, and v0.5 adds structured frames and terminal effects.
+    # Local source, edge, and unknown refs are always held to the latest layout.
     tag_version = (
         tuple(int(part) for part in ref[1:].split("."))
         if TAG_RE.fullmatch(ref or "")
@@ -325,6 +326,17 @@ def stage_source(version_dir, source_dir=None, ref=None, edge=False):
     )
     if requires_style_module:
         required.append(app_dir / "yt_ascii_styles.py")
+    requires_effect_modules = (
+        source_dir is not None
+        or edge
+        or tag_version is None
+        or tag_version >= (0, 5, 0)
+    )
+    if requires_effect_modules:
+        required.extend([
+            app_dir / "yt_ascii_effects.py",
+            app_dir / "yt_ascii_frames.py",
+        ])
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise InstallerError("source is missing required files: " + ", ".join(missing))

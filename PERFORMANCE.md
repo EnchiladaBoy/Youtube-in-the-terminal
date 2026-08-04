@@ -73,10 +73,87 @@ make that gate flaky. Run the complete benchmark with:
 python benchmarks/benchmark_renderer.py --width 240 --height 68
 ```
 
-The Bayer, duotone, Riso, contour and glitch effects are independent
+The Bayer, duotone, Riso, contour and glitch styles are independent
 implementations of established image-processing techniques. Ladybug supplied
 visual inspiration only; its code, shaders, assets and preset values are not
 used.
+
+## v0.5 structural-effect pipeline
+
+The v0.5 edge candidate adds a structural stage after RGB styling and before
+ANSI composition:
+
+```text
+decoded terminal-size RGB → style → structural effect → renderer → reveal
+```
+
+An effect may retain the styled RGB frame, replace it, and/or provide a
+structured cell plane containing its glyph choices and foreground colors. The
+renderer remains responsible for ANSI encoding, color/grayscale policy, row
+suffixes, and reveal masks. This avoids a second terminal encoder and lets the
+same effect definitions work with both portable ASCII and opt-in single-cell
+Unicode glyph schemas. `none` must take the original v0.4 path without copying
+the frame or changing its output bytes.
+
+Procedural layouts are derived from an explicit integer seed. Animation uses
+decoded video time rather than wall-clock time, and temporal or size-dependent
+state resets on seek/jump, resize, style or effect selection, and new media. A
+continuous same-source reconnect preserves the effect state and presentation
+sequence. Caches must be proportional to terminal cells; effects must not
+allocate Python objects per cell on every frame. The initial temporal effect
+retains one reusable floating-point trail accumulator and one previous-frame
+RGB buffer.
+
+The benchmark reports every effect in two forms:
+
+- **isolated**, measuring only structural processing of one terminal-size RGB
+  input; and
+- **composed**, measuring style processing, effect processing, and ANSI
+  construction together, including structured glyph output.
+
+For reproducibility, composed cases use the `duotone` style, ASCII effect
+glyphs, a fixed seed, and a requested half-block presentation. Glyph effects
+therefore exercise their character fallback while RGB effects retain the
+half-block renderer.
+
+The candidate targets at a 240 x 136 RGB input are:
+
+| Target | Budget |
+|---|---:|
+| `none` path | Byte-identical output and no more than 3% median regression |
+| Each stateless effect in isolation | Below 2.0 ms median |
+| `afterimage` in isolation | Below 2.5 ms median |
+| Style plus effect processing | Below 4.0 ms median |
+| Full composed processing and ANSI construction | Below 6.0 ms median |
+
+On 4 August 2026, a 50-round-per-group run on the local four-core Apple AArch64
+Linux host with Python 3.14.6 and NumPy 2.5.1 produced these median times. The
+composed column includes `duotone`, the named effect, and ANSI construction:
+
+| Effect | Isolated | Composed |
+|---|---:|---:|
+| `none` | 0.001 ms | 2.098 ms |
+| `geometry` | 0.326 ms | 1.758 ms |
+| `contour-glyph` | 0.210 ms | 1.586 ms |
+| `hatch` | 0.119 ms | 1.489 ms |
+| `dotfield` | 0.123 ms | 1.491 ms |
+| `tile-mosaic` | 0.315 ms | 2.275 ms |
+| `wave-lines` | 0.378 ms | 2.540 ms |
+| `voronoi` | 0.429 ms | 2.477 ms |
+| `afterimage` | 0.501 ms | 2.626 ms |
+
+The matching `duotone` plus half-block renderer control, without constructing
+or applying an effect processor, measured 2.108 ms. The `none` path was 0.47%
+faster in this run (measurement noise rather than an expected speedup), so it
+showed no measurable regression and met the 3% overhead budget. Every effect
+met the candidate targets on this host. These results exclude
+FFmpeg, terminal writes, terminal parsing, and pacing, and are not guarantees
+for other machines. Absolute timings remain informational rather than CI gates
+because host variance would make a millisecond threshold flaky; deterministic
+output, shape/dtype contracts, bounded state, and legacy-byte equality are CI
+gates. Future recorded results must likewise name the hardware and
+NumPy/Python versions. The authoritative effect list and promotion rules are
+in [`EFFECTS.md`](EFFECTS.md).
 
 ## Baseline that motivated the changes
 

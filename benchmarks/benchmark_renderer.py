@@ -6,7 +6,8 @@ Run from the repository root after installing ``requirements.txt``:
     python benchmarks/benchmark_renderer.py
     python benchmarks/benchmark_renderer.py --width 240 --height 68 --json
 
-Absolute timings vary by machine. The legacy/new ratio is the useful signal.
+Absolute timings vary by machine. Renderer ratios and isolated/composed effect
+medians are the useful signals.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import argparse
 import gc
 import json
 from pathlib import Path
+import platform
 import statistics
 import sys
 import time
@@ -26,6 +28,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from yt_ascii_renderer import AnsiRenderer  # noqa: E402
+from yt_ascii_effects import EFFECT_NAMES, EffectProcessor  # noqa: E402
+from yt_ascii_frames import EffectContext, EffectFrame  # noqa: E402
 from yt_ascii_styles import STYLE_NAMES, StyleProcessor  # noqa: E402
 
 
@@ -104,6 +108,58 @@ def measure(function, rounds):
     }
 
 
+def output_size(output):
+    """Return the referenced frame/output footprint for benchmark reporting."""
+    if isinstance(output, np.ndarray):
+        return output.nbytes
+    if isinstance(output, EffectFrame):
+        total = output.rgb.nbytes
+        if output.cells is not None:
+            total += output.cells.glyph_indices.nbytes
+            if output.cells.fg_rgb is not None:
+                total += output.cells.fg_rgb.nbytes
+            total += len(output.cells.glyphs.encode("utf-8"))
+        return total
+    return len(output)
+
+
+def effect_case(processor, frame, cell_shape, *, renderer=None, style=None):
+    """Build a stateful benchmark call matching one playback presentation."""
+    sequence = 0
+
+    def run():
+        nonlocal sequence
+        video_time = 12.375 + sequence / 60.0
+        source = style.apply(frame, video_time) if style is not None else frame
+        context = EffectContext(
+            video_time=video_time,
+            frame_sequence=sequence,
+            cell_shape=cell_shape,
+            requested_pixels=True,
+            advance_state=True,
+        )
+        effected = processor.apply(source, context)
+        sequence += 1
+        if renderer is None:
+            return effected
+        return renderer.render(effected.rgb, effected.cells)
+
+    return run
+
+
+def composed_baseline_case(frame, renderer, style):
+    """Build the style-plus-renderer control for ``effect=none`` overhead."""
+    sequence = 0
+
+    def run():
+        nonlocal sequence
+        video_time = 12.375 + sequence / 60.0
+        sequence += 1
+        return renderer.render(style.apply(frame, video_time))
+
+    return run
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--width", type=int, default=120)
@@ -152,17 +208,59 @@ def main():
         )
         for name, processor in styles.items()
     )
+    cases.append((
+        "effect/composed/baseline-no-engine",
+        composed_baseline_case(
+            half_frame,
+            AnsiRenderer(
+                DENSE, half_block=True, rng=np.random.default_rng(99)
+            ),
+            StyleProcessor("duotone"),
+        ),
+    ))
+    for index, name in enumerate(EFFECT_NAMES):
+        isolated = EffectProcessor(
+            name, glyph_mode="ascii", speed=1.0, seed=20260804
+        )
+        composed = EffectProcessor(
+            name, glyph_mode="ascii", speed=1.0, seed=20260804
+        )
+        cases.append((
+            f"effect/isolated/{name}",
+            effect_case(isolated, half_frame, (args.height, args.width)),
+        ))
+        cases.append((
+            f"effect/composed/{name}",
+            effect_case(
+                composed,
+                half_frame,
+                (args.height, args.width),
+                renderer=AnsiRenderer(
+                    DENSE,
+                    half_block=True,
+                    rng=np.random.default_rng(100 + index),
+                ),
+                style=StyleProcessor("duotone"),
+            ),
+        ))
 
     results = {
         "width": args.width,
         "height": args.height,
         "rounds": args.rounds,
+        "environment": {
+            "python": platform.python_version(),
+            "numpy": np.__version__,
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+        },
         "cases": {},
     }
     for name, function in cases:
         output = function()
         timing = measure(function, args.rounds)
-        output_bytes = output.nbytes if isinstance(output, np.ndarray) else len(output)
+        output_bytes = output_size(output)
         results["cases"][name] = {
             **timing,
             "bytes_per_frame": output_bytes,
@@ -173,21 +271,35 @@ def main():
         legacy = results["cases"][f"{mode}/legacy" if mode != "grayscale" else "grayscale/legacy-rgb"]
         new = results["cases"][f"{mode}/new" if mode != "grayscale" else "grayscale/new-rgb"]
         new["speedup_vs_legacy"] = legacy["median_ms"] / new["median_ms"]
+    baseline = results["cases"]["effect/composed/baseline-no-engine"]
+    none = results["cases"]["effect/composed/none"]
+    none["overhead_vs_baseline_percent"] = (
+        none["median_ms"] / baseline["median_ms"] - 1.0
+    ) * 100.0
 
     if args.json:
         print(json.dumps(results, indent=2, sort_keys=True))
         return
 
     print(f"renderer benchmark: {args.width}x{args.height}, {args.rounds} rounds/group")
-    print(f"{'case':24} {'median':>10} {'worst grp':>10} {'bytes/frame':>14} {'speedup':>10}")
+    environment = results["environment"]
+    print(
+        f"Python {environment['python']}, NumPy {environment['numpy']}, "
+        f"{environment['platform']}"
+    )
+    print(f"{'case':34} {'median':>10} {'worst grp':>10} {'bytes/frame':>14} {'speedup':>10}")
     for name, values in results["cases"].items():
         speedup = values.get("speedup_vs_legacy")
         speedup_text = f"{speedup:.2f}x" if speedup else "-"
         print(
-            f"{name:24} {values['median_ms']:9.3f}ms "
+            f"{name:34} {values['median_ms']:9.3f}ms "
             f"{values['worst_group_ms']:9.3f}ms {values['bytes_per_frame']:14,d} "
             f"{speedup_text:>10}"
         )
+    print(
+        "effect/composed/none overhead vs baseline: "
+        f"{none['overhead_vs_baseline_percent']:+.2f}%"
+    )
 
 
 if __name__ == "__main__":
