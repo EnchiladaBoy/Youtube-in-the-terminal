@@ -8,6 +8,7 @@ from yt_ascii_effects import (
     EFFECT_NAMES,
     EFFECT_SPECS,
     GLYPH_EFFECT_NAMES,
+    STATEFUL_EFFECT_NAMES,
     EffectProcessor,
     EffectSpec,
 )
@@ -157,12 +158,27 @@ class EffectProcessorTests(unittest.TestCase):
                 "wave-lines",
                 "voronoi",
                 "afterimage",
+                "number-field",
+                "glyph-grid",
+                "vector-field",
             ),
         )
         self.assertEqual(
             GLYPH_EFFECT_NAMES,
-            frozenset(("geometry", "contour-glyph", "hatch", "dotfield")),
+            frozenset(
+                (
+                    "geometry",
+                    "contour-glyph",
+                    "hatch",
+                    "dotfield",
+                    "number-field",
+                    "glyph-grid",
+                    "vector-field",
+                )
+            ),
         )
+        self.assertEqual(STATEFUL_EFFECT_NAMES, frozenset(("afterimage",)))
+        self.assertEqual(len(EFFECT_NAMES), len(set(EFFECT_NAMES)))
         self.assertEqual(tuple(spec.name for spec in EFFECT_SPECS), EFFECT_NAMES)
         self.assertTrue(all(isinstance(spec, EffectSpec) for spec in EFFECT_SPECS))
         for spec in EFFECT_SPECS:
@@ -171,7 +187,7 @@ class EffectProcessorTests(unittest.TestCase):
                 spec.pixel_policy,
                 "char-cells" if spec.glyph_owned else "native",
             )
-            self.assertEqual(spec.stateful, spec.name == "afterimage")
+            self.assertEqual(spec.stateful, spec.name in STATEFUL_EFFECT_NAMES)
             self.assertEqual(EffectProcessor(spec.name).spec, spec)
 
     def test_select_cycle_wrap_and_reset_preserve_selection(self):
@@ -421,6 +437,130 @@ class EffectProcessorTests(unittest.TestCase):
         changed = EffectProcessor("dotfield", seed=8).apply(middle).cells.glyph_indices
         np.testing.assert_array_equal(first, repeat)
         self.assertFalse(np.array_equal(first, changed))
+
+    def test_number_field_reports_exact_luminance_deciles(self):
+        values = np.array(
+            (0, 25, 26, 51, 52, 127, 128, 230, 231, 255),
+            dtype=np.uint8,
+        )
+        frame = np.repeat(values[None, :, None], 3, axis=2)
+        plane = EffectProcessor("number-field").apply(frame).cells
+        self.assertEqual(plane.glyphs, "0123456789")
+        np.testing.assert_array_equal(
+            plane.glyph_indices,
+            np.array([[0, 0, 1, 1, 2, 4, 5, 8, 9, 9]], dtype=np.uint8),
+        )
+        unicode_plane = EffectProcessor(
+            "number-field", glyph_mode="unicode"
+        ).apply(frame).cells
+        self.assertEqual(unicode_plane.glyphs, "⓪①②③④⑤⑥⑦⑧⑨")
+        np.testing.assert_array_equal(
+            unicode_plane.glyph_indices, plane.glyph_indices
+        )
+        for processor, time_value in (
+            (EffectProcessor("number-field", speed=0.25, seed=-10**30), 0.0),
+            (EffectProcessor("number-field", speed=8.0, seed=10**30), 99.0),
+        ):
+            with self.subTest(speed=processor.speed, seed=processor.seed):
+                np.testing.assert_array_equal(
+                    processor.apply(frame, time_value).cells.glyph_indices,
+                    plane.glyph_indices,
+                )
+
+    def test_glyph_grid_combines_tone_lattice_and_seed_phase(self):
+        dark = EffectProcessor("glyph-grid").apply(
+            np.zeros((8, 16, 3), dtype=np.uint8)
+        ).cells.glyph_indices
+        self.assertFalse(dark.any())
+
+        light_frame = np.full((8, 16, 3), 100, dtype=np.uint8)
+        light = EffectProcessor("glyph-grid", seed=0).apply(
+            light_frame
+        ).cells.glyph_indices
+        self.assertEqual(set(np.unique(light).tolist()), {1, 2, 4, 6})
+        self.assertTrue(np.all(light[0::4, 0::8] == 6))
+        self.assertTrue(np.all(light[0::4, 1:8] == 2))
+        self.assertTrue(np.all(light[1:4, 0::8] == 4))
+
+        heavy = EffectProcessor("glyph-grid", seed=0).apply(
+            np.full((8, 16, 3), 220, dtype=np.uint8)
+        ).cells.glyph_indices
+        self.assertEqual(set(np.unique(heavy).tolist()), {3, 5, 7, 8})
+
+        shifted_row = EffectProcessor("glyph-grid", seed=1).apply(
+            light_frame
+        ).cells.glyph_indices
+        shifted_col = EffectProcessor("glyph-grid", seed=4).apply(
+            light_frame
+        ).cells.glyph_indices
+        wrapped = EffectProcessor("glyph-grid", seed=32).apply(
+            light_frame
+        ).cells.glyph_indices
+        np.testing.assert_array_equal(light, np.roll(shifted_row, -1, axis=0))
+        np.testing.assert_array_equal(light, np.roll(shifted_col, -1, axis=1))
+        np.testing.assert_array_equal(light, wrapped)
+
+    def test_glyph_grid_disables_degenerate_axes_on_tiny_planes(self):
+        frame = np.full((3, 7, 3), 100, dtype=np.uint8)
+        for seed in (0, 1, -1, 10**30):
+            with self.subTest(seed=seed):
+                indices = EffectProcessor("glyph-grid", seed=seed).apply(
+                    frame
+                ).cells.glyph_indices
+                self.assertTrue(np.all(indices == 1))
+        heavy = EffectProcessor("glyph-grid", seed=-10**30).apply(
+            np.full((1, 1, 3), 255, dtype=np.uint8)
+        ).cells.glyph_indices
+        self.assertEqual(int(heavy[0, 0]), 8)
+
+    def test_vector_field_quantizes_cardinal_and_diagonal_gradients(self):
+        y, x = np.indices((9, 9), dtype=np.int16)
+        cases = (
+            (1, 0, 1),
+            (-1, 0, 5),
+            (0, 1, 3),
+            (0, -1, 7),
+            (1, 1, 2),
+            (-1, 1, 4),
+            (-1, -1, 6),
+            (1, -1, 8),
+        )
+        for x_direction, y_direction, expected in cases:
+            with self.subTest(
+                x_direction=x_direction, y_direction=y_direction
+            ):
+                values = np.clip(
+                    128
+                    + (x - 4) * 20 * x_direction
+                    + (y - 4) * 20 * y_direction,
+                    0,
+                    255,
+                ).astype(np.uint8)
+                frame = np.repeat(values[:, :, None], 3, axis=2)
+                indices = EffectProcessor("vector-field").apply(
+                    frame
+                ).cells.glyph_indices
+                self.assertEqual(int(indices[4, 4]), expected)
+
+        flat = EffectProcessor("vector-field").apply(
+            np.full((9, 9, 3), 127, dtype=np.uint8)
+        ).cells.glyph_indices
+        self.assertFalse(flat.any())
+        tiny = EffectProcessor("vector-field").apply(
+            np.full((1, 1, 3), 255, dtype=np.uint8)
+        ).cells.glyph_indices
+        self.assertFalse(tiny.any())
+
+    def test_vector_field_threshold_is_exact(self):
+        for value, expected in ((47, 0), (48, 1)):
+            with self.subTest(value=value):
+                luminance = np.zeros((3, 3), dtype=np.uint8)
+                luminance[1, 2] = value
+                frame = np.repeat(luminance[:, :, None], 3, axis=2)
+                indices = EffectProcessor("vector-field").apply(
+                    frame
+                ).cells.glyph_indices
+                self.assertEqual(int(indices[1, 1]), expected)
 
     def test_tile_mosaic_uses_integer_block_averages(self):
         frame = np.arange(5 * 7 * 3, dtype=np.uint8).reshape(5, 7, 3)

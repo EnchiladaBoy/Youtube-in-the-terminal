@@ -115,6 +115,9 @@ Press `e` during playback to cycle through this fixed order:
 | `wave-lines` | Draws an animated wave-line field bent by image tone |
 | `voronoi` | Samples the picture into seeded Voronoi regions |
 | `afterimage` | Retains a fading history of motion between frames |
+| `number-field` | Labels every cell with its luminance decile from `0` to `9` |
+| `glyph-grid` | Rebuilds the image as a seed-shifted light/heavy cell lattice |
+| `vector-field` | Points directional marks toward increasing image brightness |
 
 The shared controls are:
 
@@ -132,13 +135,14 @@ the structural effect interprets that styled frame. Seeds and video timestamps
 make procedural and animated output repeatable after seeking. An effect chosen
 with `e` remains active for later videos in the same interactive session.
 
-`geometry`, `contour-glyph`, `hatch`, and `dotfield` produce character-cell
-structures. If `--pixels` is active, those four effects temporarily fall back
-to character rendering and the status line shows `pixels→chars`; cycling to
-`none` or an RGB-only effect restores half-block pixels. `--effect-glyphs`
-selects the schema for those glyph effects. `tile-mosaic`, `wave-lines`,
-`voronoi`, and `afterimage` transform RGB and therefore retain pixel mode and
-the normal `--palette` / `--chars` behavior.
+`geometry`, `contour-glyph`, `hatch`, `dotfield`, `number-field`, `glyph-grid`,
+and `vector-field` produce character-cell structures. If `--pixels` is active,
+those seven effects temporarily fall back to character rendering and the
+status line shows `pixels→chars`; cycling to `none` or an RGB-only effect
+restores half-block pixels. `--effect-glyphs` selects the schema for those
+glyph effects. `tile-mosaic`, `wave-lines`, `voronoi`, and `afterimage`
+transform RGB and therefore retain pixel mode and the normal `--palette` /
+`--chars` behavior.
 
 Unicode mode excludes full-width, combining, and control characters, but some
 geometric symbols have locale-dependent ambiguous width. Use the default ASCII
@@ -149,6 +153,9 @@ yt-ascii https://youtu.be/jNQXAC9IVRw --effect geometry
 yt-ascii https://youtu.be/jNQXAC9IVRw --style duotone --effect hatch
 yt-ascii https://youtu.be/jNQXAC9IVRw --effect voronoi --effect-seed 42
 yt-ascii https://youtu.be/jNQXAC9IVRw --effect wave-lines --effect-speed 1.5
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect number-field
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect glyph-grid --effect-seed 5
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect vector-field --effect-glyphs unicode
 ```
 
 These effects are independent, terminal-native implementations of established

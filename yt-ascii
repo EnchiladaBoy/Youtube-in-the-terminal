@@ -82,8 +82,21 @@ EFFECT_NAMES = (
     "wave-lines",
     "voronoi",
     "afterimage",
+    "number-field",
+    "glyph-grid",
+    "vector-field",
 )
-GLYPH_EFFECT_NAMES = frozenset(("geometry", "contour-glyph", "hatch", "dotfield"))
+GLYPH_EFFECT_NAMES = frozenset(
+    (
+        "geometry",
+        "contour-glyph",
+        "hatch",
+        "dotfield",
+        "number-field",
+        "glyph-grid",
+        "vector-field",
+    )
+)
 
 # Terminal character cells are ~2x taller than wide; correct aspect ratio.
 CHAR_ASPECT = 2.0
@@ -1415,7 +1428,7 @@ def self_test():
     if AnsiRenderer("x").render(frame) != expected:
         fail("renderer self-test failed")
 
-    sample = np.arange(4 * 4 * 3, dtype=np.uint8).reshape(4, 4, 3)
+    sample = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
     processor = StyleProcessor()
     renderer = AnsiRenderer(" .#")
     for name in STYLE_NAMES:
@@ -1442,6 +1455,14 @@ def self_test():
         output = renderer.render(effected.rgb, effected.cells)
         if not output:
             fail(f"{name} effect renderer self-test failed")
+        if name in GLYPH_EFFECT_NAMES:
+            unicode_effected = EffectProcessor(
+                name, glyph_mode="unicode"
+            ).apply(sample, context)
+            if unicode_effected.cells is None or not renderer.render(
+                unicode_effected.rgb, unicode_effected.cells
+            ):
+                fail(f"{name} Unicode effect self-test failed")
         if name == "afterimage":
             moved = np.roll(sample, 1, axis=1)
             later = EffectContext(
@@ -1455,7 +1476,6 @@ def self_test():
             if not renderer.render(temporal.rgb, temporal.cells):
                 fail("afterimage temporal self-test failed")
 
-    effect_processor.select("geometry")
     pixel_sample = np.repeat(sample, 2, axis=0)
     pixel_context = EffectContext(
         video_time=0.25,
@@ -1464,10 +1484,21 @@ def self_test():
         requested_pixels=True,
         advance_state=True,
     )
-    geometry = effect_processor.apply(pixel_sample, pixel_context)
     pixel_renderer = AnsiRenderer(" .#", half_block=True)
-    if not pixel_renderer.render(geometry.rgb, geometry.cells):
-        fail("effect pixel fallback self-test failed")
+    for name in EFFECT_NAMES:
+        if name not in GLYPH_EFFECT_NAMES:
+            continue
+        effect_processor.select(name)
+        effected = effect_processor.apply(pixel_sample, pixel_context)
+        if (
+            effected.cells is None
+            or effected.cells.glyph_indices.shape != pixel_context.cell_shape
+            or effected.cells.fg_rgb is None
+            or effected.cells.fg_rgb.shape != pixel_context.cell_shape + (3,)
+        ):
+            fail(f"{name} pixel fallback contract self-test failed")
+        if not pixel_renderer.render(effected.rgb, effected.cells):
+            fail(f"{name} pixel fallback self-test failed")
     sys.stdout.write("yt-ascii self-test: ok\n")
 
 

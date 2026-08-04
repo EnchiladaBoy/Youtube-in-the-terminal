@@ -27,7 +27,7 @@ in [`README.md`](README.md); renderer and pipeline budgets live in
 
 Stable v0.4.0 provides the `classic`, `bayer`, `duotone`, `riso`, `contour`, and
 `glitch` RGB styles plus the `scatter` and `rain` reveals. The v0.5.0 edge
-candidate adds these eight effects in this exact cycle order after `none`:
+candidate adds these eleven effects in this exact cycle order after `none`:
 
 | Order | CLI name | Status | Terminal interpretation |
 |---:|---|---|---|
@@ -40,11 +40,23 @@ candidate adds these eight effects in this exact cycle order after `none`:
 | 6 | `wave-lines` | Edge candidate | Animate a line field bent by tone and video time |
 | 7 | `voronoi` | Edge candidate | Sample the frame into deterministic seeded regions |
 | 8 | `afterimage` | Edge candidate | Blend motion into a fading frame-history trail |
+| 9 | `number-field` | Edge candidate | Label each cell with its exact luminance decile |
+| 10 | `glyph-grid` | Edge candidate | Reconstruct the image as a seeded light/heavy cell lattice |
+| 11 | `vector-field` | Edge candidate | Point directional data marks toward increasing luminance |
 
 Public controls are `--effect`, `--effect-glyphs ascii|unicode`,
 `--effect-speed`, and `--effect-seed`. ASCII is the portable glyph default;
 Unicode is an opt-in richer schema. The speed must be positive and finite, and
 the integer seed makes procedural layouts reproducible.
+
+The cell/type slice has explicit terminal-native behavior. `number-field`
+quantizes cell luminance into the ten deciles `0` through `9`. `glyph-grid`
+uses an approximately square 4-row by 8-column lattice whose seed shifts its
+phase; source tone selects blank, light, or heavy interiors and line glyphs.
+`vector-field` applies a cell-space Sobel operator, suppresses weak gradients,
+and quantizes the direction of increasing luminance into eight marks. Its ASCII
+schema shares slash glyphs for opposite diagonals, while Unicode mode exposes
+eight distinct arrows.
 
 ## Compatibility contract
 
@@ -60,11 +72,12 @@ the integer seed makes procedural layouts reproducible.
   use the ASCII default if columns drift.
 - Color and `--no-color` are supported. Structural glyph and region choices
   remain meaningful without RGB color.
-- `geometry`, `contour-glyph`, `hatch`, and `dotfield` provide character-cell
-  planes. They temporarily force character rendering when `--pixels` is set,
-  with `pixels→chars` shown in the status line. `none`, `tile-mosaic`,
-  `wave-lines`, `voronoi`, and `afterimage` retain half-block pixel mode and
-  the ordinary palette behavior because they return RGB frames.
+- `geometry`, `contour-glyph`, `hatch`, `dotfield`, `number-field`,
+  `glyph-grid`, and `vector-field` provide character-cell planes. They
+  temporarily force character rendering when `--pixels` is set, with
+  `pixels→chars` shown in the status line. `none`, `tile-mosaic`, `wave-lines`,
+  `voronoi`, and `afterimage` retain half-block pixel mode and the ordinary
+  palette behavior because they return RGB frames.
 - Effect state and size-dependent layouts reset on seek/jump, resize, style or
   effect selection, and new media. A continuous same-source reconnect preserves
   state and presentation sequence. Pausing freezes video-time animation and
@@ -83,7 +96,7 @@ formats.
 
 | Stage | Status | Capability families |
 |---|---|---|
-| Cell and type | Planned | Word/number fields, grid glyphs, inscriptions, directional data marks, and ghosted type |
+| Cell and type | In progress | Number fields, grid glyphs, and directional data marks are edge candidates; word fields, inscriptions, and ghosted type remain planned |
 | Print and textile | Planned | Error diffusion, halftone patterns, pixel press/poster treatments, crosshatch, stitch, weave, and kilim-like cell patterns |
 | Adaptive regions | Planned | Block mosaics, quadtree subdivision, threshold/edge families, and additional seeded region maps |
 | Temporal structure | Planned | Full-frame digital rain, drifting lines, ribbon scans, pixel sorting, stardust, and longer motion traces |

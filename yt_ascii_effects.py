@@ -25,10 +25,22 @@ EFFECT_NAMES = (
     "wave-lines",
     "voronoi",
     "afterimage",
+    "number-field",
+    "glyph-grid",
+    "vector-field",
 )
 GLYPH_EFFECT_NAMES = frozenset(
-    ("geometry", "contour-glyph", "hatch", "dotfield")
+    (
+        "geometry",
+        "contour-glyph",
+        "hatch",
+        "dotfield",
+        "number-field",
+        "glyph-grid",
+        "vector-field",
+    )
 )
+STATEFUL_EFFECT_NAMES = frozenset(("afterimage",))
 
 
 @dataclass(frozen=True)
@@ -45,7 +57,7 @@ EFFECT_SPECS = tuple(
     EffectSpec(
         name,
         glyph_owned=name in GLYPH_EFFECT_NAMES,
-        stateful=name == "afterimage",
+        stateful=name in STATEFUL_EFFECT_NAMES,
         pixel_policy=(
             "char-cells" if name in GLYPH_EFFECT_NAMES else "native"
         ),
@@ -73,6 +85,25 @@ _GLYPHS = {
     "dotfield": {
         "ascii": " .:*#",
         "unicode": " ⠂⠒⠤⠶",
+    },
+    "number-field": {
+        "ascii": "0123456789",
+        "unicode": "⓪①②③④⑤⑥⑦⑧⑨",
+    },
+    # Grid schemas are ordered as blank, light interior, light/heavy
+    # horizontal, light/heavy vertical, light/heavy intersection, and heavy
+    # interior.  Keeping one code point per role lets the same index plane use
+    # either the portable or richer presentation.
+    "glyph-grid": {
+        "ascii": " .-=|!+@#",
+        "unicode": " ·─━│┃┼╋█",
+    },
+    # Direction order is east, southeast, south, southwest, west, northwest,
+    # north, northeast.  ASCII necessarily shares slash glyphs between
+    # opposite diagonal directions; Unicode preserves all eight arrows.
+    "vector-field": {
+        "ascii": " >\\v/<\\^/",
+        "unicode": " →↘↓↙←↖↑↗",
     },
 }
 
@@ -281,6 +312,73 @@ def _dotfield(frame, shape, glyphs, seed):
     return EffectFrame(
         frame, CellPlane(indices.astype(np.uint8), glyphs, colors)
     )
+
+
+def _number_field(frame, shape, glyphs):
+    """Label every terminal cell with its exact luminance decile."""
+    colors = _cell_rgb(frame, shape)
+    indices = ((_luminance(colors) * 10) // 256).astype(np.uint8)
+    return EffectFrame(frame, CellPlane(indices, glyphs, colors))
+
+
+def _glyph_grid(frame, shape, glyphs, seed):
+    """Rebuild the image as a tone-weighted, seed-shifted cell lattice."""
+    colors = _cell_rgb(frame, shape)
+    luminance = _luminance(colors)
+    rows, cols = shape
+    indices = np.zeros(shape, dtype=np.uint8)
+
+    light = luminance >= 48
+    heavy = luminance >= 176
+    indices[light] = 1
+    indices[heavy] = 8
+
+    # A 4x8 cell lattice is approximately square after terminal cell aspect
+    # ratio is taken into account.  Tiny planes disable an axis rather than
+    # degenerating into one all-line row or column.
+    horizontal = np.zeros(shape, dtype=bool)
+    vertical = np.zeros(shape, dtype=bool)
+    if rows >= 4:
+        row_lines = (np.arange(rows) % 4) == (seed % 4)
+        horizontal = np.broadcast_to(row_lines[:, None], shape)
+    if cols >= 8:
+        col_lines = (np.arange(cols) % 8) == ((seed // 4) % 8)
+        vertical = np.broadcast_to(col_lines[None, :], shape)
+
+    light_horizontal = light & horizontal & ~vertical
+    light_vertical = light & vertical & ~horizontal
+    light_intersection = light & horizontal & vertical
+    indices[light_horizontal] = 2
+    indices[light_vertical] = 4
+    indices[light_intersection] = 6
+    indices[heavy & horizontal & ~vertical] = 3
+    indices[heavy & vertical & ~horizontal] = 5
+    indices[heavy & horizontal & vertical] = 7
+    return EffectFrame(frame, CellPlane(indices, glyphs, colors))
+
+
+def _vector_field(frame, shape, glyphs):
+    """Show the direction of increasing luminance as terminal data marks."""
+    colors = _cell_rgb(frame, shape)
+    horizontal, vertical = _sobel(_luminance(colors))
+    abs_horizontal = np.abs(horizontal)
+    abs_vertical = np.abs(vertical)
+    active = abs_horizontal + abs_vertical >= 96
+    indices = np.zeros(shape, dtype=np.uint8)
+
+    horizontal_major = active & (abs_horizontal > abs_vertical * 2)
+    vertical_major = active & (abs_vertical > abs_horizontal * 2)
+    diagonal = active & ~horizontal_major & ~vertical_major
+
+    indices[horizontal_major & (horizontal >= 0)] = 1
+    indices[horizontal_major & (horizontal < 0)] = 5
+    indices[vertical_major & (vertical >= 0)] = 3
+    indices[vertical_major & (vertical < 0)] = 7
+    indices[diagonal & (horizontal >= 0) & (vertical >= 0)] = 2
+    indices[diagonal & (horizontal < 0) & (vertical >= 0)] = 4
+    indices[diagonal & (horizontal < 0) & (vertical < 0)] = 6
+    indices[diagonal & (horizontal >= 0) & (vertical < 0)] = 8
+    return EffectFrame(frame, CellPlane(indices, glyphs, colors))
 
 
 def _tile_mosaic(frame):
@@ -495,7 +593,15 @@ class EffectProcessor:
                 return _contour_glyph(frame, cell_shape, glyphs)
             if self._name == "hatch":
                 return _hatch(frame, cell_shape, glyphs, self.seed)
-            return _dotfield(frame, cell_shape, glyphs, self.seed)
+            if self._name == "dotfield":
+                return _dotfield(frame, cell_shape, glyphs, self.seed)
+            if self._name == "number-field":
+                return _number_field(frame, cell_shape, glyphs)
+            if self._name == "glyph-grid":
+                return _glyph_grid(frame, cell_shape, glyphs, self.seed)
+            if self._name == "vector-field":
+                return _vector_field(frame, cell_shape, glyphs)
+            raise RuntimeError(f"unhandled glyph effect: {self._name}")
         if self._name == "tile-mosaic":
             return EffectFrame(_tile_mosaic(frame))
         if self._name == "wave-lines":
@@ -504,6 +610,8 @@ class EffectProcessor:
             )
         if self._name == "voronoi":
             return EffectFrame(self._voronoi(frame))
-        return EffectFrame(
-            self._afterimage(frame, video_time, sequence, advance_state)
-        )
+        if self._name == "afterimage":
+            return EffectFrame(
+                self._afterimage(frame, video_time, sequence, advance_state)
+            )
+        raise RuntimeError(f"unhandled effect: {self._name}")

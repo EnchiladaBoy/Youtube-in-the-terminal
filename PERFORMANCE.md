@@ -95,6 +95,11 @@ same effect definitions work with both portable ASCII and opt-in single-cell
 Unicode glyph schemas. `none` must take the original v0.4 path without copying
 the frame or changing its output bytes.
 
+The next shared-engine slice adds `number-field`, `glyph-grid`, and
+`vector-field` through that same cell-plane contract. They respectively encode
+luminance deciles, a tone-weighted seeded lattice, and quantized Sobel gradient
+directions; no new renderer or output path is involved.
+
 Procedural layouts are derived from an explicit integer seed. Animation uses
 decoded video time rather than wall-clock time, and temporal or size-dependent
 state resets on seek/jump, resize, style or effect selection, and new media. A
@@ -126,27 +131,29 @@ The candidate targets at a 240 x 136 RGB input are:
 | Style plus effect processing | Below 4.0 ms median |
 | Full composed processing and ANSI construction | Below 6.0 ms median |
 
-On 4 August 2026, a 50-round-per-group run on the local four-core Apple AArch64
+On 5 August 2026, a 50-round-per-group run on the local four-core Apple AArch64
 Linux host with Python 3.14.6 and NumPy 2.5.1 produced these median times. The
 composed column includes `duotone`, the named effect, and ANSI construction:
 
 | Effect | Isolated | Composed |
 |---|---:|---:|
-| `none` | 0.001 ms | 2.098 ms |
-| `geometry` | 0.326 ms | 1.758 ms |
-| `contour-glyph` | 0.210 ms | 1.586 ms |
-| `hatch` | 0.119 ms | 1.489 ms |
-| `dotfield` | 0.123 ms | 1.491 ms |
-| `tile-mosaic` | 0.315 ms | 2.275 ms |
-| `wave-lines` | 0.378 ms | 2.540 ms |
-| `voronoi` | 0.429 ms | 2.477 ms |
-| `afterimage` | 0.501 ms | 2.626 ms |
+| `none` | 0.001 ms | 2.128 ms |
+| `geometry` | 0.335 ms | 1.742 ms |
+| `contour-glyph` | 0.207 ms | 1.608 ms |
+| `hatch` | 0.123 ms | 1.498 ms |
+| `dotfield` | 0.123 ms | 1.503 ms |
+| `tile-mosaic` | 0.311 ms | 2.293 ms |
+| `wave-lines` | 0.380 ms | 2.559 ms |
+| `voronoi` | 0.431 ms | 2.495 ms |
+| `afterimage` | 0.515 ms | 2.627 ms |
+| `number-field` | 0.058 ms | 1.423 ms |
+| `glyph-grid` | 0.123 ms | 1.523 ms |
+| `vector-field` | 0.229 ms | 1.640 ms |
 
 The matching `duotone` plus half-block renderer control, without constructing
-or applying an effect processor, measured 2.108 ms. The `none` path was 0.47%
-faster in this run (measurement noise rather than an expected speedup), so it
-showed no measurable regression and met the 3% overhead budget. Every effect
-met the candidate targets on this host. These results exclude
+or applying an effect processor, measured 2.111 ms. The `none` path was 0.79%
+slower in this run, within the 3% overhead budget. Every effect met the
+candidate targets on this host. These results exclude
 FFmpeg, terminal writes, terminal parsing, and pacing, and are not guarantees
 for other machines. Absolute timings remain informational rather than CI gates
 because host variance would make a millisecond threshold flaky; deterministic
