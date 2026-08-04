@@ -32,6 +32,7 @@ REPOSITORY = "EnchiladaBoy/Youtube-in-the-terminal"
 RAW_MAIN = f"https://raw.githubusercontent.com/{REPOSITORY}/main"
 ARCHIVE_ROOT = f"https://github.com/{REPOSITORY}/archive"
 STABLE_FILE = "STABLE_VERSION"
+EDGE_BUILD_FILE = "EDGE_BUILD"
 MANAGED_MARKER = "yt-ascii managed installer"
 ROOT_MARKER = ".yt-ascii-managed"
 ROOT_MARKER_CONTENT = "yt-ascii managed installer v1\n"
@@ -43,6 +44,8 @@ LOCK_SUFFIX = ".install.lock"
 TAG_RE = re.compile(
     r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\Z"
 )
+EDGE_BUILD_RE = re.compile(r"[1-9][0-9]*\Z")
+CHANNELS = frozenset({"stable", "edge", "pinned", "source"})
 MIN_INSTALLABLE_TAG = (0, 3, 0)
 MAX_DOWNLOAD = 50 * 1024 * 1024
 MAX_EXTRACTED = 100 * 1024 * 1024
@@ -76,6 +79,59 @@ def validate_tag(value):
     if version < MIN_INSTALLABLE_TAG:
         raise InstallerError("versions before v0.3.0 do not support the source installer")
     return value
+
+
+def parse_stable_tag(raw, label=STABLE_FILE):
+    try:
+        if isinstance(raw, bytes):
+            text = raw.decode("ascii")
+        elif isinstance(raw, str):
+            text = raw
+            text.encode("ascii")
+        else:
+            raise TypeError
+    except (TypeError, UnicodeError) as exc:
+        raise InstallerError(f"{label} must contain one ASCII version tag") from exc
+    if len(text.encode("ascii")) > 128:
+        raise InstallerError(f"{label} exceeded the 128-byte safety limit")
+    if text.endswith("\r\n"):
+        value = text[:-2]
+    elif text.endswith("\n"):
+        value = text[:-1]
+    else:
+        value = text
+    if "\r" in value or "\n" in value:
+        raise InstallerError(f"{label} must contain exactly one version tag")
+    return validate_tag(value)
+
+
+def tag_version(value):
+    validate_tag(value)
+    return tuple(int(part) for part in value[1:].split("."))
+
+
+def parse_edge_build(raw, label=EDGE_BUILD_FILE):
+    try:
+        if isinstance(raw, bytes):
+            text = raw.decode("ascii")
+        elif isinstance(raw, str):
+            text = raw
+            text.encode("ascii")
+        else:
+            raise TypeError
+    except (TypeError, UnicodeError) as exc:
+        raise InstallerError(f"{label} must be an ASCII positive integer") from exc
+    if len(text.encode("ascii")) > 128:
+        raise InstallerError(f"{label} exceeded the 128-byte safety limit")
+    if text.endswith("\r\n"):
+        value = text[:-2]
+    elif text.endswith("\n"):
+        value = text[:-1]
+    else:
+        value = text
+    if "\r" in value or "\n" in value or not EDGE_BUILD_RE.fullmatch(value):
+        raise InstallerError(f"{label} must contain exactly one positive integer")
+    return int(value)
 
 
 def validate_path(path, label):
@@ -162,7 +218,7 @@ def selected_locations(args):
 
 
 def fetch_bytes(url, limit=MAX_DOWNLOAD):
-    request = urllib.request.Request(url, headers={"User-Agent": "yt-ascii-installer/0.4"})
+    request = urllib.request.Request(url, headers={"User-Agent": "yt-ascii-installer/0.5"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             data = response.read(limit + 1)
@@ -181,19 +237,37 @@ def local_stable_file():
     return candidate if candidate.is_file() else None
 
 
-def stable_tag():
-    local = local_stable_file()
+def stable_tag(remote=False):
+    local = None if remote else local_stable_file()
     try:
         if local is not None:
-            raw = local.read_text(encoding="ascii")
+            with local.open("rb") as stream:
+                raw = stream.read(129)
         else:
-            raw = fetch_bytes(f"{RAW_MAIN}/{STABLE_FILE}", limit=128).decode("ascii")
-    except (OSError, UnicodeError) as exc:
+            raw = fetch_bytes(f"{RAW_MAIN}/{STABLE_FILE}", limit=128)
+    except OSError as exc:
         raise InstallerError(f"could not read a valid {STABLE_FILE}: {exc}") from exc
-    lines = raw.splitlines()
-    if len(lines) != 1:
-        raise InstallerError(f"{STABLE_FILE} must contain exactly one version tag")
-    return validate_tag(lines[0].strip())
+    return parse_stable_tag(raw)
+
+
+def edge_build():
+    raw = fetch_bytes(f"{RAW_MAIN}/{EDGE_BUILD_FILE}", limit=128)
+    return parse_edge_build(raw)
+
+
+def read_staged_edge_build(app_dir, expected=None):
+    try:
+        with (app_dir / EDGE_BUILD_FILE).open("rb") as stream:
+            raw = stream.read(129)
+    except OSError as exc:
+        raise InstallerError(f"could not read staged {EDGE_BUILD_FILE}: {exc}") from exc
+    build = parse_edge_build(raw, f"staged {EDGE_BUILD_FILE}")
+    if expected is not None and build < expected:
+        raise InstallerError(
+            "downloaded edge archive is older than the update check "
+            f"({build} < {expected}); retry the update"
+        )
+    return build
 
 
 def archive_url(ref, edge=False):
@@ -291,7 +365,10 @@ def source_ignore(_directory, names):
     return ignored
 
 
-def stage_source(version_dir, source_dir=None, ref=None, edge=False):
+def stage_source(
+    version_dir, source_dir=None, ref=None, edge=False,
+    expected_edge_build=None,
+):
     app_dir = version_dir / "app"
     if source_dir is not None:
         source = Path(source_dir).expanduser().resolve()
@@ -337,9 +414,23 @@ def stage_source(version_dir, source_dir=None, ref=None, edge=False):
             app_dir / "yt_ascii_effects.py",
             app_dir / "yt_ascii_frames.py",
         ])
+    requires_update_assets = (
+        source_dir is not None
+        or edge
+        or tag_version is None
+        or tag_version >= (0, 5, 0)
+    )
+    if requires_update_assets:
+        required.extend([
+            app_dir / "install.py",
+            app_dir / "yt_ascii_update.py",
+            app_dir / EDGE_BUILD_FILE,
+        ])
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise InstallerError("source is missing required files: " + ", ".join(missing))
+    if edge:
+        read_staged_edge_build(app_dir, expected_edge_build)
     return app_dir
 
 
@@ -431,6 +522,9 @@ def launcher_collisions(bin_dir, expected_content):
 
 
 def posix_launcher(root):
+    # Update protocol v1: these launcher bytes are intentionally immutable.
+    # An older bundled installer stages a newer app without rewriting its
+    # launcher, so a future protocol must accept and migrate this exact form.
     quoted_root = shlex.quote(str(root))
     return f"""#!/bin/sh
 # {MANAGED_MARKER}
@@ -525,7 +619,7 @@ def read_current(root):
 
 def write_state(
     root, current, previous, ref, launcher, bin_dir, path_files,
-    windows_path_added,
+    windows_path_added, channel, installed_edge_build,
 ):
     state = {
         "schema": 1,
@@ -533,6 +627,8 @@ def write_state(
         "current": str(current),
         "previous": str(previous) if previous is not None else None,
         "ref": ref,
+        "channel": channel,
+        "edge_build": installed_edge_build,
         "launcher": str(launcher),
         "bin_dir": str(bin_dir),
         "path_files": [str(path) for path in path_files],
@@ -548,6 +644,37 @@ def read_state(root):
     except (OSError, UnicodeError, ValueError, TypeError):
         return {}
     return data if isinstance(data, dict) and data.get("schema") == 1 else {}
+
+
+def read_update_state(root):
+    """Read bounded, duplicate-free state for a mutating update."""
+    path = root / STATE_FILE
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise InstallerError(
+                    f"installer state contains duplicate key {key!r}"
+                )
+            result[key] = value
+        return result
+
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(64 * 1024 + 1)
+        if len(payload) > 64 * 1024:
+            raise InstallerError("installer state exceeds the safety limit")
+        data = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object)
+    except InstallerError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError) as exc:
+        raise InstallerError(f"could not read valid installer state: {path}") from exc
+    if not isinstance(data, dict) or type(data.get("schema")) is not int:
+        raise InstallerError(f"could not read valid installer state: {path}")
+    if data["schema"] != 1:
+        raise InstallerError("unsupported installer state schema")
+    return data
 
 
 def replace_marked_block(text, block, markers=None):
@@ -756,6 +883,176 @@ def cleanup_versions(versions_dir, keep):
             warn(f"could not remove superseded version {entry}: {exc}")
 
 
+def infer_channel(state, ref):
+    """Read additive channel metadata while safely classifying legacy state."""
+    if "channel" not in state:
+        if ref == "edge":
+            return "edge"
+        if ref == "source":
+            return "source"
+        return "pinned"
+    channel = state["channel"]
+    if not isinstance(channel, str) or channel not in CHANNELS:
+        raise InstallerError("installer state contains an invalid update channel")
+    return channel
+
+
+def validate_update_state(root, bin_dir):
+    """Return trusted managed-install metadata for an in-place update."""
+    marker = root / ROOT_MARKER
+    if not valid_root_marker(marker):
+        raise InstallerError(
+            f"no valid managed installation found at {root}; rerun the installer"
+        )
+    versions_dir = root / "versions"
+    if (
+        not path_lexists(versions_dir)
+        or versions_dir.is_symlink()
+        or not versions_dir.is_dir()
+    ):
+        raise InstallerError(f"refusing an unexpected versions directory: {versions_dir}")
+    current_path = root / CURRENT_FILE
+    if (
+        not path_lexists(current_path)
+        or current_path.is_symlink()
+        or not current_path.is_file()
+    ):
+        raise InstallerError(f"could not read a valid current pointer: {current_path}")
+    try:
+        with current_path.open("rb") as stream:
+            current_payload = stream.read(4097)
+        current_text = current_payload.decode("utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise InstallerError(f"could not read a valid current pointer: {exc}") from exc
+    lines = current_text.splitlines()
+    if (
+        len(current_payload) > 4096
+        or len(lines) != 2
+        or current_text != f"{lines[0]}\n{lines[1]}\n"
+        or not lines[1]
+    ):
+        raise InstallerError(f"could not read a valid current pointer: {current_path}")
+    current, ref = Path(lines[0]), lines[1]
+    if not current.is_absolute():
+        raise InstallerError("the active generation path is not absolute")
+    state_path = root / STATE_FILE
+    if (
+        not path_lexists(state_path)
+        or state_path.is_symlink()
+        or not state_path.is_file()
+    ):
+        raise InstallerError(f"could not read valid installer state: {state_path}")
+    state = read_update_state(root)
+    if state.get("root") != str(root):
+        raise InstallerError("the existing installation has no valid ownership metadata")
+    if state.get("current") != str(current) or state.get("ref") != ref:
+        raise InstallerError("installer state does not match the active generation")
+    try:
+        current_resolved = current.resolve(strict=True)
+        versions_resolved = versions_dir.resolve(strict=True)
+    except OSError as exc:
+        raise InstallerError(f"the active generation is missing or unreadable: {exc}") from exc
+    if (
+        current.is_symlink()
+        or not current.is_dir()
+        or current != current_resolved
+        or current.parent != versions_resolved
+        or current_resolved.parent != versions_resolved
+    ):
+        raise InstallerError("the active generation is outside the managed versions directory")
+    if state.get("bin_dir") != str(bin_dir):
+        raise InstallerError(
+            "the selected bin directory does not match this installation; "
+            "pass its recorded --bin-dir"
+        )
+    launcher = launcher_path(bin_dir)
+    expected_content = (
+        windows_launcher(root, bin_dir)
+        if os.name == "nt" else posix_launcher(root)
+    )
+    if state.get("launcher") != str(launcher) or not managed_launcher(
+        launcher, expected_content
+    ):
+        raise InstallerError("the managed launcher is missing, changed, or belongs to another root")
+    channel = infer_channel(state, ref)
+    explicit_channel = "channel" in state
+    if explicit_channel and "edge_build" not in state:
+        raise InstallerError("installer state is missing edge build metadata")
+    channel_matches_ref = (
+        (channel in {"stable", "pinned"} and TAG_RE.fullmatch(ref or ""))
+        or (channel == "edge" and ref == "edge")
+        or (channel == "source" and ref == "source")
+    )
+    if not channel_matches_ref:
+        raise InstallerError("installer state channel does not match its installed ref")
+    recorded_build = state.get("edge_build")
+    if channel == "edge" and explicit_channel:
+        if type(recorded_build) is not int or recorded_build <= 0:
+            raise InstallerError("installer state contains an invalid edge build")
+    elif channel != "edge" and recorded_build is not None:
+        raise InstallerError("non-edge installer state contains edge build metadata")
+    return state, current, ref, channel
+
+
+def installed_edge_build(state, current):
+    value = state.get("edge_build")
+    if value is not None:
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise InstallerError("installer state contains an invalid edge build")
+        return value
+    marker = current / "app" / EDGE_BUILD_FILE
+    if not path_lexists(marker):
+        # Pre-feature edge installs have no build marker. They are refreshed
+        # once, then gain authoritative metadata from the staged archive.
+        return 0
+    if marker.is_symlink() or not marker.is_file():
+        raise InstallerError(f"installed {EDGE_BUILD_FILE} is unsafe")
+    try:
+        with marker.open("rb") as stream:
+            raw = stream.read(129)
+        return parse_edge_build(raw, f"installed {EDGE_BUILD_FILE}")
+    except OSError as exc:
+        raise InstallerError(f"could not read installed {EDGE_BUILD_FILE}: {exc}") from exc
+
+
+def resolve_update(root, bin_dir):
+    state, current, ref, channel = validate_update_state(root, bin_dir)
+    if channel == "pinned":
+        raise InstallerError(
+            f"{ref} is pinned; reinstall with --version NEW_TAG to move the "
+            "pin; reinstall without --version for stable, or with --edge"
+        )
+    if channel == "source":
+        raise InstallerError(
+            "local source installations do not have an update channel; "
+            "rerun the installer with --source-dir"
+        )
+    if channel == "stable":
+        installed = tag_version(ref)
+        target_ref = stable_tag(remote=True)
+        target = tag_version(target_ref)
+        if target < installed:
+            raise InstallerError(
+                f"refusing to downgrade stable from {ref} to {target_ref}"
+            )
+        if target == installed:
+            log(f"already up to date ({ref})")
+            return None
+        return target_ref, False, "stable", None
+
+    current_build = installed_edge_build(state, current)
+    target_build = edge_build()
+    if target_build < current_build:
+        raise InstallerError(
+            "refusing to downgrade edge from build "
+            f"{current_build} to {target_build}"
+        )
+    if target_build == current_build:
+        log(f"already up to date (edge build {current_build})")
+        return None
+    return "edge", True, "edge", target_build
+
+
 def install(args):
     if sys.version_info < MIN_PYTHON:
         raise InstallerError("Python 3.10 or newer is required")
@@ -763,6 +1060,32 @@ def install(args):
         raise InstallerError("--source-dir cannot be combined with --edge or --version")
 
     root, bin_dir = selected_locations(args)
+    if args.update:
+        selection = resolve_update(root, bin_dir)
+        if selection is None:
+            return
+        ref, edge, channel, expected_edge_build = selection
+    elif args.source_dir:
+        ref = "source"
+        edge = False
+        channel = "source"
+        expected_edge_build = None
+    elif args.edge:
+        ref = "edge"
+        edge = True
+        channel = "edge"
+        expected_edge_build = edge_build()
+    elif args.version:
+        ref = validate_tag(args.version)
+        edge = False
+        channel = "pinned"
+        expected_edge_build = None
+    else:
+        ref = stable_tag()
+        edge = False
+        channel = "stable"
+        expected_edge_build = None
+
     launcher = launcher_path(bin_dir)
     launcher_content = (
         windows_launcher(root, bin_dir)
@@ -772,16 +1095,6 @@ def install(args):
     if collisions:
         joined = ", ".join(str(path) for path in collisions)
         raise InstallerError(f"refusing launcher collision: {joined}")
-
-    if args.source_dir:
-        ref = "source"
-        edge = False
-    elif args.edge:
-        ref = "edge"
-        edge = True
-    else:
-        ref = validate_tag(args.version) if args.version else stable_tag()
-        edge = False
 
     if args.source_dir:
         source = Path(args.source_dir).expanduser().resolve()
@@ -845,13 +1158,21 @@ def install(args):
         and old_state.get("bin_dir") == str(bin_dir)
         and old_state.get("windows_path_added") is True
     )
+    old_path_files = (
+        list(old_state.get("path_files", []))
+        if state_valid
+        and isinstance(old_state.get("path_files", []), list)
+        and all(isinstance(path, str) for path in old_state.get("path_files", []))
+        else []
+    )
     prefix = re.sub(r"[^A-Za-z0-9_.-]", "-", ref) + "-"
     version_dir = Path(tempfile.mkdtemp(prefix=prefix, dir=versions_dir))
     launcher_existed = path_lexists(launcher)
     launcher_created = False
     pointer_changed = False
     state_write_attempted = False
-    path_files = []
+    added_path_files = []
+    path_files = list(old_path_files)
     windows_path_added = False
     activated = False
     try:
@@ -860,6 +1181,11 @@ def install(args):
             source_dir=args.source_dir,
             ref=ref if ref != "source" else None,
             edge=edge,
+            expected_edge_build=expected_edge_build,
+        )
+        staged_edge_build = (
+            read_staged_edge_build(app_dir, expected_edge_build)
+            if edge else None
         )
         build_environment(version_dir, app_dir, ref)
 
@@ -878,9 +1204,12 @@ def install(args):
         write_atomic(current_path, f"{version_dir}\n{ref}\n")
         pointer_changed = True
         try:
-            path_files, windows_path_added = configure_path(
-                bin_dir, args.no_modify_path
+            added_path_files, windows_path_added = configure_path(
+                bin_dir, args.no_modify_path or args.update
             )
+            path_files = list(dict.fromkeys(
+                str(path) for path in (*old_path_files, *added_path_files)
+            ))
         except (InstallerError, OSError) as exc:
             warn(f"installed successfully but PATH was not changed: {exc}")
         try:
@@ -888,7 +1217,7 @@ def install(args):
             state_write_attempted = True
             write_state(
                 root, version_dir, old_current, ref, launcher, bin_dir,
-                path_files, windows_path_added,
+                path_files, windows_path_added, channel, staged_edge_build,
             )
         except (OSError, UnicodeError) as exc:
             raise InstallerError(
@@ -901,9 +1230,9 @@ def install(args):
             path_cleanup_ok = True
             if windows_path_added and not old_windows_path_owned:
                 path_cleanup_ok = remove_windows_path(bin_dir)
-            if path_files:
+            if added_path_files:
                 path_cleanup_ok = (
-                    remove_posix_path(path_files, bin_dir) and path_cleanup_ok
+                    remove_posix_path(added_path_files, bin_dir) and path_cleanup_ok
                 )
 
             rollback_ok = path_cleanup_ok
@@ -932,7 +1261,8 @@ def install(args):
                 try:
                     write_state(
                         root, version_dir, old_current, ref, launcher, bin_dir,
-                        path_files, windows_path_added,
+                        path_files, windows_path_added, channel,
+                        staged_edge_build,
                     )
                 except (OSError, UnicodeError) as exc:
                     warn(f"could not record PATH cleanup recovery metadata: {exc}")
@@ -958,7 +1288,9 @@ def install(args):
 
     log(f"installed {ref}")
     log(f"launcher: {launcher}")
-    if args.no_modify_path:
+    if args.update:
+        log("PATH settings were preserved")
+    elif args.no_modify_path:
         log("PATH was left unchanged; use the launcher path above")
     elif str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         log("open a new terminal for the PATH change to take effect")
@@ -1056,6 +1388,8 @@ def parse_args(argv=None):
                         help="do not add the launcher directory to the user PATH")
     parser.add_argument("--uninstall", action="store_true",
                         help="remove installer-managed files and PATH entries")
+    parser.add_argument("--update", action="store_true",
+                        help="update an existing managed installation on its current channel")
     parser.add_argument("--source-dir", type=Path, metavar="DIR",
                         help="install a local checkout (for development and CI)")
     parser.add_argument("--install-root", type=Path, metavar="DIR",
@@ -1067,8 +1401,11 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    if args.uninstall and (args.edge or args.version or args.source_dir):
-        raise InstallerError("--uninstall cannot be combined with a source selection")
+    selectors = bool(args.edge or args.version or args.source_dir)
+    if args.uninstall and (selectors or args.update):
+        raise InstallerError("--uninstall cannot be combined with an update or source selection")
+    if args.update and selectors:
+        raise InstallerError("--update cannot be combined with a source selection")
     root, _bin_dir = selected_locations(args)
     with installer_lock(root):
         if args.uninstall:

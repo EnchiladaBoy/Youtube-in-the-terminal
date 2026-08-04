@@ -155,7 +155,7 @@ class ProcessTests(unittest.TestCase):
 
 
 class CommandAndOutputTests(unittest.TestCase):
-    def test_help_is_dependency_free_and_lists_styles_and_effects(self):
+    def test_help_is_dependency_free_and_lists_styles_effects_and_updates(self):
         output = io.StringIO()
         globals_ = CORE["main"].__globals__
         dependency_check = mock.Mock()
@@ -170,6 +170,8 @@ class CommandAndOutputTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 0)
         self.assertIn("--style", output.getvalue())
         self.assertIn("--effect", output.getvalue())
+        self.assertIn("--check-update", output.getvalue())
+        self.assertIn("--update", output.getvalue())
         dependency_check.assert_not_called()
 
     def test_version_defaults_to_source_and_skips_dependency_checks(self):
@@ -312,6 +314,9 @@ class CommandAndOutputTests(unittest.TestCase):
             self.assertEqual(args.effect_glyphs, "ascii")
             self.assertEqual(args.effect_speed, 1.0)
             self.assertEqual(args.effect_seed, 0)
+            self.assertFalse(args.update)
+            self.assertFalse(args.check_update)
+            self.assertFalse(args.no_update_check)
         for style in CORE["STYLE_NAMES"]:
             with self.subTest(style=style), mock.patch.object(
                 globals_["sys"], "argv", ["yt-ascii", "--style", style]
@@ -336,6 +341,218 @@ class CommandAndOutputTests(unittest.TestCase):
             (args.effect, args.effect_glyphs, args.effect_speed, args.effect_seed),
             ("voronoi", "unicode", 1.5, -9),
         )
+
+    def test_update_cli_actions_are_explicit_and_mutually_exclusive(self):
+        globals_ = CORE["parse_args"].__globals__
+        cases = (
+            ("--update", (True, False, False)),
+            ("--check-update", (False, True, False)),
+            ("--no-update-check", (False, False, True)),
+        )
+        for option, expected in cases:
+            with self.subTest(option=option), mock.patch.object(
+                globals_["sys"], "argv", ["yt-ascii", option]
+            ):
+                args = CORE["parse_args"]()
+                self.assertEqual(
+                    (args.update, args.check_update, args.no_update_check),
+                    expected,
+                )
+        with mock.patch.object(
+            globals_["sys"],
+            "argv",
+            ["yt-ascii", "--update", "--check-update"],
+        ), mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                CORE["parse_args"]()
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_explicit_update_runs_before_dependency_checks(self):
+        args = SimpleNamespace(
+            url=None,
+            update=True,
+            check_update=False,
+            self_test=False,
+        )
+        globals_ = CORE["main"].__globals__
+        update_action = mock.Mock(return_value=7)
+        dependency_check = mock.Mock()
+        with mock.patch.dict(globals_, {
+            "parse_args": lambda: args,
+            "run_update_action": update_action,
+            "check_deps": dependency_check,
+        }):
+            with self.assertRaises(SystemExit) as raised:
+                CORE["main"]()
+        self.assertEqual(raised.exception.code, 7)
+        update_action.assert_called_once_with(args)
+        dependency_check.assert_not_called()
+
+    def test_normal_launch_starts_one_best_effort_update_check(self):
+        args = SimpleNamespace(
+            url="fixture",
+            update=False,
+            check_update=False,
+            self_test=False,
+        )
+        handle = object()
+        globals_ = CORE["main"].__globals__
+        starter = mock.Mock(return_value=handle)
+        runner = mock.Mock()
+        with mock.patch.dict(globals_, {
+            "parse_args": lambda: args,
+            "start_automatic_update": starter,
+            "check_deps": lambda: None,
+            "run": runner,
+        }):
+            CORE["main"]()
+        starter.assert_called_once_with(args)
+        runner.assert_called_once_with(args, handle)
+
+    def test_self_test_does_not_start_an_automatic_update_check(self):
+        args = SimpleNamespace(
+            url=None,
+            update=False,
+            check_update=False,
+            self_test=True,
+        )
+        globals_ = CORE["main"].__globals__
+        starter = mock.Mock()
+        self_test = mock.Mock()
+        with mock.patch.dict(globals_, {
+            "parse_args": lambda: args,
+            "start_automatic_update": starter,
+            "check_deps": lambda: None,
+            "self_test": self_test,
+        }):
+            CORE["main"]()
+        starter.assert_not_called()
+        self_test.assert_called_once_with()
+
+    def test_automatic_update_opt_outs_do_not_import_the_updater(self):
+        args = SimpleNamespace(no_update_check=True)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(CORE["start_automatic_update"](args))
+        args.no_update_check = False
+        with mock.patch.dict(
+            os.environ, {"YTASCII_NO_UPDATE_CHECK": "1"}, clear=True
+        ):
+            self.assertIsNone(CORE["start_automatic_update"](args))
+
+    def test_ready_automatic_update_notice_is_plain_stderr_text(self):
+        status = SimpleNamespace(display="update available: v0.4.0 -> v0.5.0")
+        check = SimpleNamespace(consume=mock.Mock(return_value=status))
+        output = io.StringIO()
+        globals_ = CORE["report_automatic_update"].__globals__
+        with mock.patch.object(globals_["sys"], "stderr", output):
+            CORE["report_automatic_update"](check)
+        self.assertEqual(
+            output.getvalue(),
+            "yt-ascii: update available: v0.4.0 -> v0.5.0; "
+            "run yt-ascii --update\n",
+        )
+        check.consume.assert_called_once_with()
+
+    def test_manual_update_check_uses_managed_install_and_long_timeout(self):
+        class FakeUpdateError(RuntimeError):
+            pass
+
+        installation = object()
+        status = SimpleNamespace(
+            ok=True,
+            supported=True,
+            display="up to date (v0.4.0)",
+        )
+        updater = SimpleNamespace(
+            UpdateError=FakeUpdateError,
+            discover_install=mock.Mock(return_value=installation),
+            check_for_update=mock.Mock(return_value=status),
+        )
+        args = SimpleNamespace(url=None, check_update=True)
+        output = io.StringIO()
+        errors = io.StringIO()
+        globals_ = CORE["run_update_action"].__globals__
+        with mock.patch.dict(sys.modules, {"yt_ascii_update": updater}), \
+                mock.patch.object(globals_["sys"], "stdout", output), \
+                mock.patch.object(globals_["sys"], "stderr", errors):
+            result = CORE["run_update_action"](args)
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            output.getvalue(),
+            "yt-ascii: up to date (v0.4.0)\n",
+        )
+        self.assertEqual(errors.getvalue(), "")
+        updater.discover_install.assert_called_once_with()
+        updater.check_for_update.assert_called_once_with(
+            installation, timeout=10.0
+        )
+
+    def test_manual_update_delegates_and_propagates_installer_status(self):
+        class FakeUpdateError(RuntimeError):
+            pass
+
+        installation = object()
+        updater = SimpleNamespace(
+            UpdateError=FakeUpdateError,
+            discover_install=mock.Mock(return_value=installation),
+            delegate_update=mock.Mock(return_value=9),
+        )
+        args = SimpleNamespace(url=None, check_update=False)
+        with mock.patch.dict(sys.modules, {"yt_ascii_update": updater}):
+            result = CORE["run_update_action"](args)
+        self.assertEqual(result, 9)
+        updater.delegate_update.assert_called_once_with(installation)
+
+    def test_incomplete_updater_module_is_a_clean_explicit_failure(self):
+        args = SimpleNamespace(url=None, check_update=True)
+        errors = io.StringIO()
+        globals_ = CORE["run_update_action"].__globals__
+        with mock.patch.dict(
+            sys.modules, {"yt_ascii_update": SimpleNamespace()}
+        ), mock.patch.object(globals_["sys"], "stderr", errors):
+            result = CORE["run_update_action"](args)
+        self.assertEqual(result, 1)
+        self.assertIn("updater failed", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+
+    def test_automatic_update_starts_with_short_timeout(self):
+        class FakeUpdateError(RuntimeError):
+            pass
+
+        installation = object()
+        handle = object()
+        updater = SimpleNamespace(
+            UpdateError=FakeUpdateError,
+            discover_install=mock.Mock(return_value=installation),
+            start_auto_check=mock.Mock(return_value=handle),
+        )
+        args = SimpleNamespace(no_update_check=False)
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
+            sys.modules, {"yt_ascii_update": updater}
+        ):
+            result = CORE["start_automatic_update"](args)
+        self.assertIs(result, handle)
+        updater.discover_install.assert_called_once_with()
+        updater.start_auto_check.assert_called_once_with(
+            installation, timeout=2.0
+        )
+
+    def test_automatic_update_setup_failures_never_abort_playback(self):
+        class FakeUpdateError(RuntimeError):
+            pass
+
+        updater = SimpleNamespace(
+            UpdateError=FakeUpdateError,
+            discover_install=mock.Mock(return_value=object()),
+            start_auto_check=mock.Mock(
+                side_effect=RuntimeError("thread unavailable")
+            ),
+        )
+        args = SimpleNamespace(no_update_check=False)
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.dict(
+            sys.modules, {"yt_ascii_update": updater}
+        ):
+            self.assertIsNone(CORE["start_automatic_update"](args))
 
     def test_effect_speed_rejects_nonpositive_and_nonfinite_values(self):
         for value in ("0", "-1", "nan", "inf"):

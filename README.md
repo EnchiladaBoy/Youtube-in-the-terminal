@@ -200,19 +200,71 @@ effect with `--no-audio`.
 
 ## Install channels and maintenance
 
+### In-app updates
+
+Installer-managed stable and edge installations can check for and install an
+update without returning to the copy-paste installer command:
+
+```sh
+yt-ascii --check-update
+yt-ascii --update
+```
+
+`--check-update` waits for the channel check and reports whether the installed
+version is current. `--update` installs an available update immediately and
+preserves the installation's recorded channel:
+
+| Installed channel | In-app update behavior |
+|---|---|
+| Stable | Follows the tagged version named by `STABLE_VERSION` |
+| Edge | Follows development `main` when its edge build number increases |
+| Pinned tag | Refuses to move the pin and explains how to choose a new version |
+| Local source install | Refuses and points back to its original checkout |
+
+Normal URL playback and the no-URL paste prompt also start a best-effort update
+check in the background. If it finds a newer build before terminal playback
+begins, it prints a notice suggesting `yt-ascii --update`; it never installs an
+update automatically or delays playback to wait for the result. Automatic
+checks stay silent when the installation is current or the network, server, or
+response is unavailable. Explicit `--check-update` and `--update` commands
+instead report failures and return a nonzero status.
+
+Use `--no-update-check` to suppress the automatic check for one launch. Set
+`YTASCII_NO_UPDATE_CHECK=1` in your shell profile or user environment to keep
+automatic checks disabled across launches. These opt-outs do not disable the
+two explicit update commands.
+
+Updates use the same GitHub source archives as the installer; the project does
+not publish or download GitHub Release assets. Installations created before
+the updater—including v0.4.0 stable and earlier v0.5.0 edge builds—need the
+external copy-paste installer once to bootstrap onto a build that includes it.
+Today that is the v0.5.0 edge candidate shown in Quick start; stable remains
+v0.4.0 until v0.5 is promoted.
+
+### Installer channels
+
 Append an installer argument to either quick-start command to choose a channel
 or change installation behavior:
 
 | Goal | Argument | Behavior |
 |---|---|---|
-| Install/update stable | none | Uses the tag in `STABLE_VERSION` |
+| Install/reinstall stable | none | Uses the tag in `STABLE_VERSION` |
 | Pin a source tag | `--version v0.4.0` | Installs that exact source tag |
 | Follow development | `--edge` | Installs mutable development `main` |
 | Leave `PATH` unchanged | `--no-modify-path` | Skips `PATH` changes; still prints the launcher path |
 
-Rerun the same command to update that installation. Installer-supported tags
-begin at `v0.3.0`. Run `yt-ascii --version` to see both the application version
-and installed source reference.
+Rerun the same command to reinstall or change channels when needed. Stable and
+edge installations can normally use `yt-ascii --update` instead.
+Installer-supported tags begin at `v0.3.0`. Run `yt-ascii --version` to see
+both the application version and installed source reference.
+
+Maintainer note: `EDGE_BUILD` is the monotonic update marker for `main`.
+Increment it in the same commit whenever the installable edge application or
+installer changes; never reuse or decrease a published value. Change
+`STABLE_VERSION` only when promoting an existing version tag to stable. The
+two-line `current` pointer and v1 launcher templates are also update-protocol
+contracts: keep their bytes compatible, or make a new updater accept and
+migrate every previously published form before changing them.
 
 Default locations:
 
