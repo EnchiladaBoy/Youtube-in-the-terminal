@@ -8,6 +8,8 @@ import unicodedata
 
 import numpy as np
 
+from yt_ascii_backends import get_render_backend
+
 
 def _validate_rgb(frame, label="rgb"):
     if not isinstance(frame, np.ndarray):
@@ -45,7 +47,7 @@ class EffectContext:
     video_time: float
     frame_sequence: int
     cell_shape: tuple[int, int]
-    requested_pixels: bool = False
+    render_mode: str = "chars"
     advance_state: bool = True
 
     def __post_init__(self):
@@ -73,8 +75,7 @@ class EffectContext:
             )
         ):
             raise ValueError("cell_shape must contain positive integer rows and cols")
-        if not isinstance(self.requested_pixels, bool):
-            raise TypeError("requested_pixels must be a boolean")
+        get_render_backend(self.render_mode)
         if not isinstance(self.advance_state, bool):
             raise TypeError("advance_state must be a boolean")
 

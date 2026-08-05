@@ -1,18 +1,23 @@
 # YouTube in the Terminal
 
-Watch YouTube videos as terminal art on Linux, macOS, and Windows. The
-`yt-ascii` command provides:
+`yt-ascii` is a portable terminal visual renderer for YouTube video. ASCII is
+one rendering option, not the product boundary: frames can also be composed as
+ANSI color cells or higher-resolution Unicode half-block pixels.
 
-- ASCII rendering in 24-bit color or grayscale, plus color half-block pixels;
-- six live video styles, 33 structural terminal effects, and two animated reveals;
-- optional audio and an 8-bit audio mode; and
-- pause, seek, and percentage-jump controls during playback.
+It runs on Linux, macOS, and Windows and includes optional audio, pause/seek
+controls, static image styles, a small set of structural and motion effects,
+and two entrance reveals.
+
+> **v0.5.0 release hold:** this renderer/effect pivot is a working-tree review
+> candidate. Do not tag, publish, or promote v0.5.0 until the manual visual
+> review is complete. The automated pivot suites are green; stable remains the
+> tag recorded in
+> [`STABLE_VERSION`](STABLE_VERSION).
 
 ## Quick start
 
-The installer requires Python 3.10 or newer and an internet connection. It
-installs tagged project source and dependencies into a private, user-owned
-environment; it does not need administrator privileges.
+Python 3.10 or newer is required. The installer creates a private user-owned
+environment and does not require administrator privileges.
 
 Linux and macOS:
 
@@ -26,317 +31,284 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 -
 ```
 
-If the Windows Python launcher is unavailable, replace `py -3 -` with
-`python -`.
-
-Open a new terminal after installation so the updated `PATH` is available,
-then play a video. The installer also prints the launcher's absolute path for
-immediate use:
+Then open a new terminal and run:
 
 ```sh
 yt-ascii https://youtu.be/jNQXAC9IVRw
 ```
 
-Run `yt-ascii` without a URL to open an interactive prompt where you can paste
-links and play multiple videos. The default installer uses the stable source
-tag recorded in [`STABLE_VERSION`](STABLE_VERSION), not a mutable branch or a
-GitHub Release asset.
-
-The v0.5.0 structural-effect candidate is currently available from the
-development channel while the default installer remains on stable v0.4.0:
+Running `yt-ascii` without a URL opens a paste prompt. Development-channel
+installs use `--edge`; they are for reviewing the pivot and are not a v0.5.0
+release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 - --edge
 ```
 
-```powershell
-irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 - --edge
+## Rendering model
+
+The playback path has three deliberately separate stages:
+
+```text
+decoded RGB frame -> visual style -> motion/structural effect -> render backend
 ```
 
-## Usage
+- A **render backend** decides how terminal cells are emitted.
+- A **visual style** handles static color, contrast, dithering, and image
+  treatment.
+- An **effect** changes spatial structure, motion, or frame history. The only
+  exceptions are two explicitly text-specific terminal reconstructions.
 
-### Controls
+Graphical work happens on NumPy RGB/luminance arrays before terminal
+composition. It therefore remains visible when no character glyphs are used.
+The boundary also leaves room for future Kitty, Sixel, or iTerm protocol
+backends without making any non-portable protocol a requirement.
+
+### Render backends
+
+Choose one with the canonical `--render` option:
+
+| Backend | Output contract | Unicode | Color |
+|---|---|:---:|:---:|
+| `chars` | Luminance mapped to characters; ASCII-only by default | No | Optional |
+| `cells` | ANSI background colors followed by spaces; no visible glyphs | No | Required |
+| `half-block` | Foreground/background colors joined by `▀`, two source rows per cell | Yes | Required |
+
+`cells` is a real graphical backend, not an alias for character rendering.
+Its colored frames contain background-color ANSI sequences and literal spaces.
+
+`--pixels` remains a compatibility alias for `--render half-block`. It cannot
+be combined with a conflicting `--render` value.
+
+`--no-color` always has visible output. `chars` emits grayscale ASCII;
+requested `cells` and `half-block` explicitly resolve to effective `chars`.
+The status line and diagnostics record both the requested and effective
+backend.
+
+The byte-level contracts are intentionally recognizable:
+
+```text
+chars:      ESC[38;2;R;G;Bm<ASCII glyph>
+cells:      ESC[48;2;R;G;Bm<space>
+half-block: ESC[38;2;topRGBm ESC[48;2;bottomRGBm▀
+```
+
+Examples:
+
+```sh
+yt-ascii URL --render chars --no-color
+yt-ascii URL --render cells --style edge-glow --effect none
+yt-ascii URL --render half-block --style posterize --effect wave
+yt-ascii URL --pixels --effect prism                 # compatibility alias
+```
+
+### Visual styles
+
+Select a static image treatment with `--style NAME`; press `s` to cycle.
+
+| Style | Image treatment |
+|---|---|
+| `classic` | Unmodified decoded RGB (default) |
+| `bayer` | Four-level brightness dither with source hue retained |
+| `posterize` | Five-level RGB quantization |
+| `contour` | Clean cyan edge map |
+| `edge-glow` | Neon contours over a dimmed source frame |
+| `ordered-dither` | Four-level ordered quantization per color channel |
+| `error-diffusion` | Deterministic serpentine error diffusion |
+| `duotone` | Smooth navy-to-gold luminance grade |
+| `two-tone` | Hard two-color luminance threshold |
+| `riso` | Offset red/blue ink-plate treatment |
+
+Styles are deterministic and renderer-independent. They do not own timestamps
+or frame history.
+
+### Motion and structural effects
+
+Select an effect with `--effect NAME`; press `e` to cycle through effects
+compatible with the effective renderer.
+
+| Effect | Category | Distinct result |
+|---|---|---|
+| `none` | passthrough | No structural effect; zero-copy effect path |
+| `pixelate` | spatial | Averaged color tiles |
+| `glitch` | motion/structural | Animated row displacement, channel separation, and scanlines |
+| `crt` | display simulation | Scanlines, vignette, glow, and shimmer |
+| `chromatic-shift` | structural | Independently displaced color channels |
+| `wave` | motion | Time-driven geometric row displacement |
+| `trails` | temporal | Bounded frame-history afterimage |
+| `prism` | structural | Multi-offset RGB channel splitting |
+| `digital-rain` | text-specific | Moving luminance-gated heads and vertical trails |
+| `terminal-hud` | text-specific | Borders, reticles, ticks, labels, and readouts |
+
+The eight entries from `none` through `prism` produce RGB frames and work with
+every renderer. `chars` quantizes them to its luminance palette; `cells` and
+`half-block` preserve graphical color output. None is implemented by swapping
+decorative Unicode symbols.
+
+`digital-rain` and `terminal-hud` are retained because they reconstruct
+materially different animated/interface cell layouts. They are not alternate
+glyph palettes.
+
+| Effect family | `chars` | `cells` | `half-block` |
+|---|:---:|:---:|:---:|
+| `none` plus graphical effects | Yes, quantized | Yes | Yes |
+| `digital-rain`, `terminal-hud` | Yes | Rejected | Rejected |
+
+Text-specific incompatibilities are explicit errors. Compatible-only cycling
+prevents blank or visually unchanged selections. If `--no-color` changes a
+requested graphical backend to effective `chars`, compatibility is evaluated
+against that visible fallback.
+
+Canonical examples:
+
+```sh
+yt-ascii URL --render cells --effect pixelate
+yt-ascii URL --render cells --style ordered-dither --effect crt
+yt-ascii URL --render cells --style posterize --effect pixelate
+yt-ascii URL --render half-block --style duotone --effect chromatic-shift
+yt-ascii URL --render chars --effect digital-rain
+yt-ascii URL --render chars --effect terminal-hud --effect-text LIVE
+```
+
+Static treatments use `--style`; spatial, motion, temporal, and text-specific
+changes use `--effect`.
+
+Four historical effect names remain input aliases and do not appear during
+cycling:
+
+| Compatibility name | Canonical effect |
+|---|---|
+| `tile-mosaic` | `pixelate` |
+| `wave-lines` | `wave` |
+| `afterimage` | `trails` |
+| `hologram` | `crt` |
+
+The parser provides narrow migration shims for options that changed category:
+
+| Legacy selection | Canonical interpretation |
+|---|---|
+| `--style glitch` | `--style classic --effect glitch` |
+| `--effect posterize` | `--style posterize --effect none` |
+| `--effect edge-glow` | `--style edge-glow --effect none` |
+| `--effect ordered-dither` | `--style ordered-dither --effect none` |
+| `--effect error-diffusion` | `--style error-diffusion --effect none` |
+| `--effect duotone` | `--style two-tone --effect none` |
+| `--effect poster-press` | `--style posterize --effect none` |
+
+These parser-only shims never enter canonical registries or cycling. They apply
+only when unambiguous; combining one with a conflicting explicit style/effect
+is rejected rather than silently discarding a choice. In canonical commands,
+use the right-hand spellings. `--style duotone` remains the smooth grade and
+animated glitch is `--effect glitch`.
+
+The redundant text-heavy effects `contour-glyph`, `number-field`,
+`glyph-grid`, `word-field`, `inscription`, `type-echo`, and `type-collage` are
+retired without aliases.
+
+Effect options are `--effect-speed`, `--effect-seed`, and—for
+`terminal-hud`—`--effect-text`. `--effect-glyphs ascii|unicode` affects only
+the text-specific effects; ASCII is the portable default.
+
+See [`EFFECTS.md`](EFFECTS.md) for the exact registry contract and
+[`ROADMAP.md`](ROADMAP.md) for release-review status.
+
+### Controls and reveals
 
 | Key | Action |
 |---|---|
 | `space` | pause / resume |
-| `s` | cycle video style |
-| `e` | cycle structural effect |
+| `s` | cycle visual style |
+| `e` | cycle compatible effect |
 | `←` / `→` | seek -5s / +5s |
 | `↓` / `↑` | seek -30s / +30s |
 | `0`–`9` | jump to 0%–90% |
 | `q` / `Ctrl-C` | quit |
 
-### Video styles
-
-Choose a starting style with `--style NAME`, then press `s` during playback to
-cycle without restarting the video:
-
-| Style | Effect |
-|---|---|
-| `classic` | Original frame with no style transform (default) |
-| `bayer` | Four-level ordered dithering with source hue retained |
-| `duotone` | Navy-to-gold luminance mapping |
-| `riso` | Offset red and blue ink plates with purple overlaps |
-| `contour` | Bright cyan edge lines on black |
-| `glitch` | Animated RGB separation, scanlines, and horizontal displacement |
-
-Styles work with character and `--pixels` rendering, color and `--no-color`,
-and both reveal effects. A style selected with `s` remains active for later
-videos in the same interactive session. Glitch animation freezes while paused
-and is deterministic after seeking.
-
-```sh
-yt-ascii https://youtu.be/jNQXAC9IVRw --style bayer
-yt-ascii https://youtu.be/jNQXAC9IVRw --style riso --palette symbols
-yt-ascii https://youtu.be/jNQXAC9IVRw --style contour --pixels --rain
-yt-ascii https://youtu.be/jNQXAC9IVRw --style glitch --palette matrix
-```
-
-These styles are independent implementations of established image-processing
-techniques. `ladybug.app` provided visual inspiration; no Ladybug code,
-shaders, assets, or presets are included.
-
-### Structural effects
-
-Styles recolor or transform the RGB picture. Structural effects rebuild its
-terminal cells using glyphs, lines, dots, regions, or frame history. Select one
-with `--effect NAME`; `none` preserves the normal style-and-renderer path.
-Press `e` during playback to cycle through this fixed order:
-
-| Effect | Terminal treatment |
-|---|---|
-| `none` | No structural effect (default) |
-| `geometry` | Maps tone bands to geometric cells |
-| `contour-glyph` | Draws detected contours with directional glyphs |
-| `hatch` | Builds light and shade from directional hatch marks |
-| `dotfield` | Represents tone with a deterministic field of dots |
-| `tile-mosaic` | Reconstructs the frame from averaged rectangular tiles |
-| `wave-lines` | Draws an animated wave-line field bent by image tone |
-| `voronoi` | Samples the picture into seeded Voronoi regions |
-| `afterimage` | Retains a fading history of motion between frames |
-| `number-field` | Labels every cell with its luminance decile from `0` to `9` |
-| `glyph-grid` | Rebuilds the image as a seed-shifted light/heavy cell lattice |
-| `vector-field` | Points directional marks toward increasing image brightness |
-| `word-field` | Repeats a phrase with luminance-controlled text density |
-| `inscription` | Writes a decorated phrase along detected image contours |
-| `type-echo` | Layers deterministic time-offset echoes of a phrase |
-| `error-diffusion` | Quantizes tone into a deterministic binary glyph field |
-| `halftone` | Rebuilds tone with a clustered-dot screen |
-| `poster-press` | Simulates reduced ink levels and offset color plates |
-| `cross-stitch` | Converts tone into alternating diagonal stitches |
-| `weave` | Interlaces light and dark warp-and-weft marks |
-| `kilim` | Applies a mirrored chevron-and-diamond textile pattern |
-| `quadtree` | Subdivides image detail into adaptive mean-color blocks |
-| `patchwork` | Reconstructs the frame from seeded irregular patches |
-| `digital-rain` | Drops deterministic glyph heads and fading column trails |
-| `ribbon-scan` | Sweeps warped highlight ribbons across a dimmed frame |
-| `pixel-sort` | Sorts luminance inside animated horizontal blocks |
-| `stardust` | Drifts a luminance-controlled field of twinkling particles |
-| `type-collage` | Animates staggered and reversed bands of configured text |
-| `engraving` | Combines contour strokes with directional hatching |
-| `brickwork` | Rebuilds tone as staggered bricks and mortar |
-| `prism` | Splits and recombines displaced color channels |
-| `hologram` | Maps tone to scanlined cyan/magenta light and sparkles |
-| `glass` | Refracts the frame through frosted offset blocks |
-| `terminal-hud` | Overlays terminal-native borders, reticles, ticks, and time |
-
-The shared controls are:
-
-| Option | Meaning |
-|---|---|
-| `--effect-glyphs ascii|unicode` | Use portable ASCII glyphs (default) or richer Unicode |
-| `--effect-speed N` | Positive finite animation-speed multiplier (default `1.0`) |
-| `--effect-seed N` | Integer seed for reproducible procedural layouts (default `0`) |
-| `--effect-text TEXT` | Phrase used by text effects (default `YTASCII`) |
-
-Static effects ignore the speed multiplier, and effects without a procedural
-layout ignore the seed. Effects other than `word-field`, `inscription`,
-`type-echo`, and `type-collage` ignore `--effect-text`.
-
-Effect selection composes with `--style`: the style transforms RGB first, then
-the structural effect interprets that styled frame. Seeds and video timestamps
-make procedural and animated output repeatable after seeking. An effect chosen
-with `e` remains active for later videos in the same interactive session, as
-does the configured effect text.
-
-`geometry`, `contour-glyph`, `hatch`, `dotfield`, `number-field`, `glyph-grid`,
-`vector-field`, `word-field`, `inscription`, `type-echo`, `error-diffusion`,
-`halftone`, `cross-stitch`, `weave`, `kilim`, `digital-rain`, `stardust`,
-`type-collage`, `engraving`, `brickwork`, and `terminal-hud` produce
-character-cell structures. If `--pixels` is active, those 21 effects
-temporarily fall back to character rendering and the status line shows
-`pixels→chars`. `--effect-glyphs` selects their ASCII or Unicode schema.
-
-`tile-mosaic`, `wave-lines`, `voronoi`, `afterimage`, `poster-press`,
-`quadtree`, `patchwork`, `ribbon-scan`, `pixel-sort`, `prism`, `hologram`, and
-`glass` transform RGB. They retain half-block pixels and the normal
-`--palette` / `--chars` behavior; cycling to `none` also restores the ordinary
-renderer path.
-
-`word-field` repeats the configured phrase with a seeded row stagger and uses
-image luminance as its text density: black stays blank and white shows the
-complete field. ASCII rows repeat `TEXT + ". "`; Unicode rows use
-`TEXT + "· "`. `inscription` writes `[TEXT] ` or `‹TEXT› ` across detected
-contours in row-major order. `type-echo` repeats `TEXT + ": "` or `TEXT + "∶ "`
-and analytically derives up to three faded row-band echoes from
-`floor(video_time × speed × 6)`. It is stateless, so seeking to the same time
-reconstructs the same output and pausing freezes it.
-
-The print and textile family covers accumulated binary diffusion, clustered
-halftone dots, reduced-color press plates, stitched diagonals, woven lines, and
-kilim-like mirrored motifs. Adaptive `quadtree` and `patchwork` treatments use
-source-region means while keeping their subdivision and seeded layout
-deterministic.
-
-`digital-rain`, `ribbon-scan`, `pixel-sort`, and `stardust` derive motion from
-video time, so pause and seek retain the shared reconstruction contract.
-`type-collage` applies the configured phrase to staggered label bands.
-`engraving`, `brickwork`, `prism`, `hologram`, `glass`, and `terminal-hud` are
-terminal-native material and interface approximations rather than physical
-rendering or tracked overlays.
-
-`--effect-text` is preserved exactly, without Unicode normalization, and may
-contain 1 to 253 code points, including at least one non-space character.
-ASCII glyph mode accepts portable printable ASCII. Unicode mode accepts
-printable, left-to-right single-cell characters and ordinary spaces but rejects
-control characters, combining or decomposed sequences, and East Asian wide or
-full-width characters with a clear error. Some accepted symbols have
-locale-dependent ambiguous width; use the default ASCII mode if columns drift
-in a CJK-width terminal configuration.
-
-```sh
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect geometry
-yt-ascii https://youtu.be/jNQXAC9IVRw --style duotone --effect hatch
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect voronoi --effect-seed 42
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect wave-lines --effect-speed 1.5
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect number-field
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect glyph-grid --effect-seed 5
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect vector-field --effect-glyphs unicode
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect word-field --effect-text TERMINAL --effect-seed 5
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect inscription --effect-text "HELLO WORLD" --effect-glyphs unicode
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect type-echo --effect-text AFTERIMAGE --effect-speed 1.5
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect halftone --effect-glyphs unicode
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect patchwork --effect-seed 42 --pixels
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect digital-rain --effect-speed 1.5
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect type-collage --effect-text "LIVE TYPE"
-yt-ascii https://youtu.be/jNQXAC9IVRw --effect terminal-hud --effect-glyphs unicode
-```
-
-These effects are independent, terminal-native implementations of established
-generative-art techniques. They do not copy another application's code,
-shaders, assets, presets, or control recipes. See [`EFFECTS.md`](EFFECTS.md)
-for compatibility and the living implementation roadmap.
-
-### Reveals
-
-`--scatter` and `--rain` are entrance animations, not persistent structural
-effects. They uncover the composed live picture once at playback start and
-restart after a seek. The flags are mutually exclusive, and their timing and
-rain glyphs are controlled by `--scatter-secs`, `--rain-secs`, and
-`--rain-chars`.
-
-### Palettes and other options
-
-Built-in character palettes are `simple`, `dense`, `blocks`, `binary`,
-`numbers`, `symbols`, and `matrix`. A non-empty `--chars` string overrides the
-selected palette.
+`--scatter` and `--rain` are one-shot entrance reveals, not persistent
+effects. They restart after a seek. In `cells`, both reveals remain
+space/background-color output and introduce no decorative glyphs.
 
 | Area | Options |
 |---|---|
-| Display | `--no-color`, `--pixels`, `--palette`, `--chars`, `--style` |
-| Structural effects | `--effect`, `--effect-glyphs`, `--effect-speed`, `--effect-seed`, `--effect-text` |
+| Renderer | `--render`, `--pixels`, `--no-color`, `--palette`, `--chars` |
+| Image processing | `--style`, `--effect`, `--effect-speed`, `--effect-seed` |
+| Text-specific effects | `--effect-glyphs`, `--effect-text` |
 | Reveals | `--scatter`, `--rain`, `--scatter-secs`, `--rain-secs`, `--rain-chars` |
-| Playback size/rate | `--fps`, `--width`, `--height`, `--max-res` |
-| Audio | `--no-audio`, `--8bit` |
+| Playback | `--fps`, `--width`, `--height`, `--max-res`, `--no-audio`, `--8bit` |
 
-`--pixels` is ignored with `--no-color`. Because pixel mode renders colored
-half-blocks instead of characters, `--palette` and `--chars` do not affect it.
-Custom `--rain-chars` should use single-cell-width glyphs so columns stay
-aligned. Run `yt-ascii --help` for full option descriptions and presets.
+`--palette` and `--chars` affect character rendering and grayscale fallbacks.
+The default character palette and rain reveal are portable ASCII. Unicode
+presets are opt-in.
+
+## Visual review and screenshots
+
+The command examples above replace the former glyph-heavy effect examples.
+Fresh real-terminal screenshots are intentionally pending the manual visual
+direction review; a captured PTY stream is not presented as a terminal
+screenshot. The short review procedure is in
+[`LIVE_PERFORMANCE.md`](LIVE_PERFORMANCE.md).
+
+## Live diagnostics
+
+Opt-in diagnostics can stop after a measured interval and write one aggregate
+JSON report:
+
+```sh
+yt-ascii URL --render cells --style edge-glow --effect none \
+  --diagnostics-json cells.json \
+  --diagnostics-warmup 5 --diagnostics-duration 60
+```
+
+Reports include requested/effective renderer, effect, style, color path,
+ordinary/stress profile, sink/tmux/attached classification, frame timing,
+drops, resource trends, and cleanup evidence. The player refuses to overwrite
+a report and excludes URLs, titles, command lines, raw decoder output,
+keystrokes, effect text, and frame contents.
+
+The exhaustive deterministic matrix is in-memory. Short sink, tmux, and
+attached-class PTY runs provide representative path-classification evidence;
+they are not matched output-path qualification. Real-terminal responsiveness,
+visual judgement, and screenshot capture remain manual user checks. See
+[`PERFORMANCE.md`](PERFORMANCE.md) and
+[`LIVE_PERFORMANCE.md`](LIVE_PERFORMANCE.md).
 
 ## Requirements and troubleshooting
 
-The private environment contains NumPy, yt-dlp, imageio-ffmpeg, and certifi.
-For video decoding, the player checks `YTASCII_FFMPEG`, then `ffmpeg` on
-`PATH`, then its packaged imageio-ffmpeg fallback.
+The managed environment contains NumPy, yt-dlp, imageio-ffmpeg, and certifi.
+Video decoding checks `YTASCII_FFMPEG`, `ffmpeg` on `PATH`, then the bundled
+imageio-ffmpeg fallback. Audio is optional and uses `YTASCII_FFPLAY` or
+`ffplay`; `--8bit` has no effect with `--no-audio`.
 
-On some Linux systems the fallback's static FFmpeg build cannot resolve DNS.
-If video does not start, install your distribution's FFmpeg package, for
-example `sudo apt install ffmpeg` on Debian or Ubuntu, or the equivalent for
-your distribution.
+On some Linux systems the static FFmpeg fallback cannot resolve DNS. Install
+your distribution FFmpeg package if stream resolution succeeds but decoding
+does not start.
 
-Audio is optional and needs `ffplay`, selected through `YTASCII_FFPLAY` or
-found on `PATH`; playback is silent when it is unavailable. `--8bit` has no
-effect with `--no-audio`.
+## Install channels and updates
 
-## Install channels and maintenance
-
-### In-app updates
-
-Installer-managed stable and edge installations can check for and install an
-update without returning to the copy-paste installer command:
+Managed stable and edge installations support:
 
 ```sh
 yt-ascii --check-update
 yt-ascii --update
 ```
 
-`--check-update` waits for the channel check and reports whether the installed
-version is current. `--update` installs an available update immediately and
-preserves the installation's recorded channel:
+Stable follows `STABLE_VERSION`; edge follows `main` when `EDGE_BUILD`
+increases; pinned tags and local source installs do not move implicitly.
+Playback may perform a silent best-effort update check but never installs an
+update automatically. Use `--no-update-check` or
+`YTASCII_NO_UPDATE_CHECK=1` to disable automatic checks.
 
-| Installed channel | In-app update behavior |
+| Goal | Installer argument |
 |---|---|
-| Stable | Follows the tagged version named by `STABLE_VERSION` |
-| Edge | Follows development `main` when its edge build number increases |
-| Pinned tag | Refuses to move the pin and explains how to choose a new version |
-| Local source install | Refuses and points back to its original checkout |
+| Stable install/reinstall | none |
+| Pin a published tag | `--version v0.4.0` |
+| Follow development | `--edge` |
+| Do not change `PATH` | `--no-modify-path` |
 
-Normal URL playback and the no-URL paste prompt also start a best-effort update
-check in the background. If it finds a newer build before terminal playback
-begins, it prints a notice suggesting `yt-ascii --update`; it never installs an
-update automatically or delays playback to wait for the result. Automatic
-checks stay silent when the installation is current or the network, server, or
-response is unavailable. Explicit `--check-update` and `--update` commands
-instead report failures and return a nonzero status.
-
-Use `--no-update-check` to suppress the automatic check for one launch. Set
-`YTASCII_NO_UPDATE_CHECK=1` in your shell profile or user environment to keep
-automatic checks disabled across launches. These opt-outs do not disable the
-two explicit update commands.
-
-Updates use the same GitHub source archives as the installer; the project does
-not publish or download GitHub Release assets. Installations created before
-the updater—including v0.4.0 stable and earlier v0.5.0 edge builds—need the
-external copy-paste installer once to bootstrap onto a build that includes it.
-Today that is the v0.5.0 edge candidate shown in Quick start; stable remains
-v0.4.0 until v0.5 is promoted.
-
-### Installer channels
-
-Append an installer argument to either quick-start command to choose a channel
-or change installation behavior:
-
-| Goal | Argument | Behavior |
-|---|---|---|
-| Install/reinstall stable | none | Uses the tag in `STABLE_VERSION` |
-| Pin a source tag | `--version v0.4.0` | Installs that exact source tag |
-| Follow development | `--edge` | Installs mutable development `main` |
-| Leave `PATH` unchanged | `--no-modify-path` | Skips `PATH` changes; still prints the launcher path |
-
-Rerun the same command to reinstall or change channels when needed. Stable and
-edge installations can normally use `yt-ascii --update` instead.
-Installer-supported tags begin at `v0.3.0`. Run `yt-ascii --version` to see
-both the application version and installed source reference.
-
-Maintainer note: `EDGE_BUILD` is the monotonic update marker for `main`.
-Increment it in the same commit whenever the installable edge application or
-installer changes; never reuse or decrease a published value. Change
-`STABLE_VERSION` only when promoting an existing version tag to stable. The
-two-line `current` pointer and v1 launcher templates are also update-protocol
-contracts: keep their bytes compatible, or make a new updater accept and
-migrate every previously published form before changing them.
+The project installs tagged/source archives, not GitHub Release executables.
+Maintainers must increment `EDGE_BUILD` with an installable edge change and
+must change `STABLE_VERSION` only when promoting an existing reviewed tag.
+This pivot intentionally does neither before review.
 
 Default locations:
 
@@ -345,48 +317,7 @@ Default locations:
 | Linux/macOS | `${XDG_DATA_HOME:-$HOME/.local/share}/yt-ascii` | `$HOME/.local/bin/yt-ascii` |
 | Windows | `%LOCALAPPDATA%\Programs\yt-ascii` | `%LOCALAPPDATA%\Programs\yt-ascii\bin\yt-ascii.cmd` |
 
-Uninstall on Linux or macOS:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | python3 - --uninstall
-```
-
-Uninstall from Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py | py -3 - --uninstall
-```
-
-Uninstall removes only installer-managed versions, state, launcher, and its
-managed `PATH` entry. It leaves unrelated files and user configuration alone.
-
-<details>
-<summary>Inspect the installer before running it</summary>
-
-Piping downloaded Python into an interpreter executes remote code. To inspect
-the installer first, download and run a saved copy.
-
-Linux and macOS:
-
-```sh
-curl -fsSLo install.py https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py
-less install.py
-python3 install.py
-```
-
-Windows PowerShell:
-
-```powershell
-irm https://raw.githubusercontent.com/EnchiladaBoy/Youtube-in-the-terminal/main/install.py -OutFile install.py
-Get-Content .\install.py
-py -3 .\install.py
-```
-
-Replacing `main` in the download URL with a tag or full commit ID pins the
-installer code only. To pin the application source too, use a version tag in
-the URL and pass the same tag with `--version`.
-
-</details>
+Uninstall with the same installer command plus `--uninstall`.
 
 ## Run from source
 
@@ -396,38 +327,33 @@ cd Youtube-in-the-terminal
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements.txt
-python yt-ascii https://youtu.be/jNQXAC9IVRw
+python yt-ascii URL --render cells --style edge-glow --effect none
 ```
 
-On Windows, create the environment with `py -3 -m venv .venv`, activate it with
-`.\.venv\Scripts\Activate.ps1`, and use `python` for the remaining commands.
-Source installs require Python 3.10 or newer.
+On Windows, create the environment with `py -3 -m venv .venv` and activate
+`.\.venv\Scripts\Activate.ps1`.
 
 ## Build and test
 
-PyInstaller packaging is available for local use, but this project does not
-publish or install executables. PyInstaller cannot cross-compile, so build on
-the target operating system:
+PyInstaller is available for local builds; it cannot cross-compile and the
+project does not publish executable artifacts:
 
 ```sh
 python -m pip install -r requirements-build.txt
-python packaging/build.py          # dist/yt-ascii or dist/yt-ascii.exe
+python packaging/build.py
 ```
 
-Run the regression suite, offline self-test, and deterministic benchmark with:
+Run the complete local checks with:
 
 ```sh
 python -m unittest discover -s tests -v
 python yt-ascii --self-test
-python benchmarks/benchmark_renderer.py
+python benchmarks/benchmark_renderer.py --profile ordinary --check-budgets
+python benchmarks/benchmark_renderer.py --profile stress --check-budgets
 ```
 
-GitHub Actions tests source and installer behavior on Linux with Python 3.10
-and 3.12, macOS arm64 with Python 3.12, and Windows with Python 3.12. It does
-not build, upload, or publish executable artifacts.
-
-See [performance notes and benchmarks](PERFORMANCE.md) for measured bottlenecks
-and implementation details.
+The benchmark matrix and gates are documented in
+[`PERFORMANCE.md`](PERFORMANCE.md).
 
 ## Author
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""yt-ascii: stream YouTube videos as ASCII art in your terminal.
+"""yt-ascii: stream video through a portable terminal visual renderer.
 
 Usage:
     yt-ascii [url] [options]      # omit the url for an interactive paste prompt
@@ -7,7 +7,7 @@ Usage:
 Keys (while playing):
     space        pause / resume
     s            cycle visual style
-    e            cycle structural effect
+    e            cycle compatible visual effect
     ← / →        seek -5s / +5s
     ↓ / ↑        seek -30s / +30s
     0..9         jump to 0%..90% of the video
@@ -68,71 +68,59 @@ PALETTES = {
     "matrix": " 01:=+*<>|/",
 }
 
-# Kept dependency-free so ``yt-ascii --version`` works before NumPy is
-# installed. ``run`` and ``self_test`` statically import the implementation
-# only after dependency checks have succeeded.
-STYLE_NAMES = ("classic", "bayer", "duotone", "riso", "contour", "glitch")
+# Kept dependency-free so ``yt-ascii --version`` and ``--help`` work before
+# NumPy is installed. ``run`` and ``self_test`` import the implementations only
+# after dependency checks have succeeded.
+STYLE_NAMES = (
+    "classic",
+    "bayer",
+    "posterize",
+    "contour",
+    "edge-glow",
+    "ordered-dither",
+    "error-diffusion",
+    "duotone",
+    "two-tone",
+    "riso",
+)
+STYLE_ALIASES = {}
+STYLE_CHOICES = STYLE_NAMES + tuple(STYLE_ALIASES)
+# Parser-only migrations preserve edge-build command lines without putting old
+# layer assignments back into the canonical style/effect registries.
+LEGACY_STYLE_EFFECTS = {"glitch": "glitch"}
+RENDER_MODES = ("chars", "cells", "half-block")
 EFFECT_NAMES = (
     "none",
-    "geometry",
-    "contour-glyph",
-    "hatch",
-    "dotfield",
-    "tile-mosaic",
-    "wave-lines",
-    "voronoi",
-    "afterimage",
-    "number-field",
-    "glyph-grid",
-    "vector-field",
-    "word-field",
-    "inscription",
-    "type-echo",
-    "error-diffusion",
-    "halftone",
-    "poster-press",
-    "cross-stitch",
-    "weave",
-    "kilim",
-    "quadtree",
-    "patchwork",
-    "digital-rain",
-    "ribbon-scan",
-    "pixel-sort",
-    "stardust",
-    "type-collage",
-    "engraving",
-    "brickwork",
+    "pixelate",
+    "glitch",
+    "crt",
+    "chromatic-shift",
+    "wave",
+    "trails",
     "prism",
-    "hologram",
-    "glass",
+    "digital-rain",
     "terminal-hud",
 )
-GLYPH_EFFECT_NAMES = frozenset(
-    (
-        "geometry",
-        "contour-glyph",
-        "hatch",
-        "dotfield",
-        "number-field",
-        "glyph-grid",
-        "vector-field",
-        "word-field",
-        "inscription",
-        "type-echo",
-        "error-diffusion",
-        "halftone",
-        "cross-stitch",
-        "weave",
-        "kilim",
-        "digital-rain",
-        "stardust",
-        "type-collage",
-        "engraving",
-        "brickwork",
-        "terminal-hud",
-    )
-)
+EFFECT_ALIASES = {
+    "tile-mosaic": "pixelate",
+    "wave-lines": "wave",
+    "afterimage": "trails",
+    "hologram": "crt",
+}
+EFFECT_CHOICES = EFFECT_NAMES + tuple(EFFECT_ALIASES)
+LEGACY_EFFECT_STYLES = {
+    "posterize": "posterize",
+    "edge-glow": "edge-glow",
+    "ordered-dither": "ordered-dither",
+    "error-diffusion": "error-diffusion",
+    "duotone": "two-tone",
+    "poster-press": "posterize",
+}
+TEXT_EFFECT_NAMES = frozenset(("digital-rain", "terminal-hud"))
+# Compatibility import for integrations built against the pre-pivot registry.
+# It now means text-specific effects, not every effect that happens to use a
+# glyph during terminal composition.
+GLYPH_EFFECT_NAMES = TEXT_EFFECT_NAMES
 DEFAULT_EFFECT_TEXT = "YTASCII"
 _RTL_EFFECT_TEXT_BIDI_CLASSES = frozenset(
     ("R", "AL", "AN", "RLE", "RLO", "RLI")
@@ -153,8 +141,8 @@ MAX_FPS = 60
 MAX_STREAM_RETRIES = 3
 
 # --scatter: default seconds for the random pop-in reveal to fill the screen.
-# Cells appear one-by-one in a shuffled order — characters spraying in from
-# random spots until the picture is complete — so this wants to be short and
+# Cells appear one-by-one in a shuffled order from random spots until the
+# picture is complete, so this wants to be short and
 # snappy ("rapidly", per the effect). The video plays live behind it the whole
 # time. Override with --scatter-secs.
 SCATTER_SECS = 4.0
@@ -173,10 +161,11 @@ RAIN_SECS = 7.5
 # scripts (Arabic, Hebrew, Thai, Devanagari…) — they'd ripple the columns. Korean
 # and Japanese therefore use their HALF-width forms (jamo / katakana). Greek and
 # Cyrillic are East-Asian-"ambiguous" width: one cell in a normal terminal, two
-# only in a CJK locale set to ambiguous=wide. `matrix` is the default; `polyglot`
-# mixes every aligned script (letters), and `all` is the whole alphabet — every
-# preset unioned, symbols included. --rain-chars also takes a literal custom
-# string, so the presets are just convenient names.
+# only in a CJK locale set to ambiguous=wide. `polyglot` mixes every aligned
+# script (letters), and `all` is the whole alphabet — every preset unioned,
+# symbols included. The default ``ascii`` preset keeps the canonical chars
+# backend Unicode-free. --rain-chars also takes a literal custom string, so the
+# presets are just convenient names.
 def _chars(*ranges):
     """Expand (lo, hi) inclusive Unicode codepoint ranges into a glyph string."""
     return "".join(chr(cp) for lo, hi in ranges for cp in range(lo, hi + 1))
@@ -192,6 +181,7 @@ _HANGUL   = _chars((0xFFA1, 0xFFBE), (0xFFC2, 0xFFC7),       # half-width jamo
                    (0xFFCA, 0xFFCF), (0xFFD2, 0xFFD7), (0xFFDA, 0xFFDC))
 
 RAIN_CHARSETS = {
+    "ascii":    _DIGITS + ":.=+*<>|/",
     "matrix":   _DIGITS + _KATAKANA + ":.=+*<>|/",
     "katakana": _KATAKANA,
     "english":  _LATIN + _DIGITS,
@@ -205,7 +195,7 @@ RAIN_CHARSETS = {
 }
 # `all` = the entire rain alphabet: every glyph from every preset above, deduped.
 RAIN_CHARSETS["all"] = "".join(sorted(set("".join(RAIN_CHARSETS.values()))))
-DEFAULT_RAIN_CHARS = "matrix"
+DEFAULT_RAIN_CHARS = "ascii"
 
 # Let ffmpeg/ffplay ride out transient googlevideo failures — expired URL
 # segments, 403/5xx throttling, TCP/TLS resets — instead of exiting, which
@@ -248,7 +238,7 @@ def fps_type(value):
         return MAX_FPS
     try:
         n = int(value)
-    except ValueError:
+    except (TypeError, ValueError):
         raise argparse.ArgumentTypeError(
             f"--fps must be an integer 1..{MAX_FPS} or 'max' (got {value!r})"
         )
@@ -260,6 +250,56 @@ def fps_type(value):
             f"use '--fps max' to request the cap"
         )
     return n
+
+
+def positive_int_type(value):
+    """Validate dimensions and source-resolution caps before any network work."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"must be a positive integer (got {value!r})"
+        )
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def style_name_type(value):
+    """Accept canonical styles plus unambiguous parser-only migrations."""
+    if value not in STYLE_CHOICES and value not in LEGACY_STYLE_EFFECTS:
+        raise argparse.ArgumentTypeError(
+            "unknown style {!r}; canonical styles: {}".format(
+                value, ", ".join(STYLE_NAMES)
+            )
+        )
+    return value
+
+
+def effect_name_type(value):
+    """Accept canonical effects, true aliases, and moved-treatment shims."""
+    if value not in EFFECT_CHOICES and value not in LEGACY_EFFECT_STYLES:
+        raise argparse.ArgumentTypeError(
+            "unknown effect {!r}; canonical effects: {}".format(
+                value, ", ".join(EFFECT_NAMES)
+            )
+        )
+    return value
+
+
+def reveal_duration_type(value):
+    """Validate scatter/rain fill times so a reveal cannot stay blank forever."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"reveal duration must be a positive number (got {value!r})"
+        )
+    if not (0.0 < seconds < float("inf")):
+        raise argparse.ArgumentTypeError(
+            "reveal duration must be a positive finite number"
+        )
+    return seconds
 
 
 def effect_speed_type(value):
@@ -277,8 +317,38 @@ def effect_speed_type(value):
     return speed
 
 
+def diagnostics_warmup_type(value):
+    """Validate the excluded warm-up interval for live diagnostics."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--diagnostics-warmup must be a nonnegative number (got {value!r})"
+        )
+    if not (0.0 <= seconds < float("inf")):
+        raise argparse.ArgumentTypeError(
+            "--diagnostics-warmup must be a nonnegative finite number"
+        )
+    return seconds
+
+
+def diagnostics_duration_type(value):
+    """Validate the measured playback interval for live diagnostics."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--diagnostics-duration must be a positive number (got {value!r})"
+        )
+    if not (0.0 < seconds < float("inf")):
+        raise argparse.ArgumentTypeError(
+            "--diagnostics-duration must be a positive finite number"
+        )
+    return seconds
+
+
 def validate_effect_text(value, glyph_mode="ascii"):
-    """Return a safe, unchanged terminal-cell inscription.
+    """Return a safe, unchanged terminal-HUD label.
 
     This validation deliberately stays in the dependency-free launcher so
     ``--help`` and argument errors work before NumPy is installed.  The effect
@@ -317,6 +387,36 @@ def validate_effect_text(value, glyph_mode="ascii"):
                 "--effect-text contains a non-ASCII code point at "
                 f"position {position} (U+{ord(char):04X}); use "
                 "--effect-glyphs unicode for safe Unicode text"
+            )
+    return value
+
+
+def validate_rain_chars(value):
+    """Validate a preset name or bounded custom single-cell reveal alphabet."""
+    if not isinstance(value, str):
+        raise TypeError("--rain-chars must be text")
+    if value in RAIN_CHARSETS:
+        return value
+    if not 1 <= len(value) <= 256:
+        raise ValueError(
+            "--rain-chars must be a preset or contain 1..256 code points"
+        )
+    for position, char in enumerate(value, start=1):
+        category = unicodedata.category(char)
+        unsafe = (
+            (char != " " and char.isspace())
+            or not char.isprintable()
+            or category in ("Cc", "Cf", "Cs")
+            or category.startswith("M")
+            or bool(unicodedata.combining(char))
+            or unicodedata.bidirectional(char) in _RTL_EFFECT_TEXT_BIDI_CLASSES
+            or unicodedata.east_asian_width(char) in ("W", "F")
+        )
+        if unsafe:
+            raise ValueError(
+                "--rain-chars contains an unsupported code point at "
+                f"position {position} (U+{ord(char):04X}); only printable "
+                "single-cell left-to-right glyphs are allowed"
             )
     return value
 
@@ -500,6 +600,8 @@ def probe(url, max_h):
         "width":    int(info.get("width") or 16),
         "height":   int(info.get("height") or 9),
         "duration": float(info.get("duration") or 0),
+        "is_live":  bool(info.get("is_live")),
+        "fps":      info.get("fps"),
         "video":    video_url,
         "audio":    audio_url,
     }
@@ -602,8 +704,17 @@ def _read_keys_posix(fd):
 
 
 # ── Process management for video + audio ──────────────────────────────────────
-def spawn_video(info, fps, ow, oh, pos):
-    cmd = [find_ffmpeg(), "-loglevel", "quiet"]
+def spawn_video(info, fps, ow, oh, pos, diagnostics=None):
+    cmd = [find_ffmpeg()]
+    capture = None
+    if diagnostics is None:
+        cmd += ["-loglevel", "quiet"]
+    else:
+        # Benchmark output is informational, so quiet mode would suppress it.
+        # Capture all diagnostic stderr in an unlinked temporary file; only
+        # parsed numeric ``bench:`` totals survive in the final report.
+        cmd += ["-loglevel", "info", "-nostats", "-benchmark"]
+        capture = diagnostics.new_ffmpeg_capture()
     cmd += RECONNECT_FLAGS
     if pos > 0:
         cmd += ["-ss", f"{pos:.3f}"]
@@ -613,7 +724,29 @@ def spawn_video(info, fps, ow, oh, pos):
         "-vf", f"fps={fps},scale={ow}:{oh}:flags=fast_bilinear",
         "-",
     ]
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, **_popen_kwargs())
+    kwargs = _popen_kwargs()
+    if capture is not None:
+        kwargs["stderr"] = capture.stream
+    try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, **kwargs)
+    except BaseException:
+        if capture is not None:
+            diagnostics.consume_ffmpeg_capture(capture)
+        raise
+    if capture is not None:
+        process._ytascii_diagnostics_capture = capture
+    return process
+
+
+def consume_video_diagnostics(process, diagnostics):
+    """Parse and discard one diagnostic decoder's temporary stderr stream."""
+    if process is None or diagnostics is None:
+        return
+    capture = getattr(process, "_ytascii_diagnostics_capture", None)
+    if capture is None:
+        return
+    process._ytascii_diagnostics_capture = None
+    diagnostics.consume_ffmpeg_capture(capture)
 
 
 def spawn_audio(info, pos, eight_bit=False):
@@ -735,18 +868,33 @@ def discard_frames(stream, count, scratch):
     return complete
 
 
-def write_terminal_frame(body, status):
+def write_terminal_frame(body, status, diagnostics=None):
     """Write one already-composed UTF-8 frame, with a text-stream fallback."""
+    if diagnostics is not None and (not body or b"\x00" in body):
+        diagnostics.increment("output_corruption")
     payload = b"".join(
         (b"\x1b[H", body, b"\n", status.encode("utf-8"), b"\x1b[K")
     )
     binary = getattr(sys.stdout, "buffer", None)
     if binary is None:
-        sys.stdout.write(payload.decode("utf-8"))
-        sys.stdout.flush()
+        if diagnostics is None:
+            sys.stdout.write(payload.decode("utf-8"))
+            sys.stdout.flush()
+            return
+        else:
+            with diagnostics.timer("terminal_write"):
+                sys.stdout.write(payload.decode("utf-8"))
+                sys.stdout.flush()
+        return len(payload)
+    if diagnostics is None:
+        binary.write(payload)
+        binary.flush()
         return
-    binary.write(payload)
-    binary.flush()
+    else:
+        with diagnostics.timer("terminal_write"):
+            binary.write(payload)
+            binary.flush()
+    return len(payload)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -770,16 +918,43 @@ def version_text():
     return f"yt-ascii {APP_VERSION} ({install_ref})"
 
 
+def _effective_render_mode(requested, color):
+    """Resolve the backend actually used for the selected color path.
+
+    ``cells`` has no visible payload without background color and half-block
+    needs both foreground/background colors to represent two pixels. Their
+    documented ``--no-color`` behavior is therefore the portable ``chars``
+    backend, never an empty frame.
+    """
+    if requested not in RENDER_MODES:
+        choices = ", ".join(RENDER_MODES)
+        raise ValueError(f"unknown rendering backend {requested!r}: {choices}")
+    if not color and requested in ("cells", "half-block"):
+        return "chars"
+    return requested
+
+
+def _requested_render_mode(args):
+    """Read canonical settings with a compatibility path for API callers."""
+    requested = getattr(args, "render", None)
+    if requested is None:
+        requested = "half-block" if getattr(args, "pixels", False) else "chars"
+    return requested
+
+
 def parse_args():
     p = argparse.ArgumentParser(
         prog="yt-ascii",
-        description="Watch YouTube videos as ASCII art in the terminal.",
+        description=(
+            "Render YouTube video in the terminal; ASCII is one portable "
+            "backend."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Keys while playing:\n"
             "  space        pause / resume\n"
             "  s            cycle visual style\n"
-            "  e            cycle structural effect\n"
+            "  e            cycle compatible visual effect\n"
             "  ←/→          seek ±5s\n"
             "  ↓/↑          seek ±30s\n"
             "  0..9         jump to 0%..90%\n"
@@ -806,34 +981,48 @@ def parse_args():
     p.add_argument("url", nargs="?",
                    help="YouTube URL or video ID. Omit it to get a simple "
                         "interactive prompt where you can paste a link.")
-    p.add_argument("--no-color", action="store_true",
-                   help="render in grayscale (default is 24-bit color)")
+    p.add_argument(
+        "--no-color", action="store_true",
+        help=(
+            "disable ANSI color; cells and half-block explicitly fall back "
+            "to ASCII luminance characters"
+        ),
+    )
     p.add_argument("--no-audio", action="store_true",
                    help="disable audio playback")
     p.add_argument("--8bit", dest="eight_bit", action="store_true",
                    help="bit-crush the audio (≈8-bit, 11kHz) for a retro "
                         "chiptune sound; no effect with --no-audio")
-    p.add_argument("--pixels", action="store_true",
-                   help="render with half-block pixels (▀) instead of ASCII "
-                        "characters — packs two colored pixels per cell, "
-                        "giving 2x vertical resolution and a sharper image. "
-                        "Glyph effects temporarily switch to character cells; "
-                        "ignored when --no-color is set.")
+    p.add_argument(
+        "--render", choices=RENDER_MODES, default=None, metavar="BACKEND",
+        help=(
+            "terminal backend: chars (portable ASCII), cells (ANSI "
+            "background-colored spaces), or half-block (Unicode ▀; default: "
+            "chars)"
+        ),
+    )
+    p.add_argument(
+        "--pixels", action="store_true",
+        help="compatibility alias for --render half-block",
+    )
     reveal = p.add_mutually_exclusive_group()
     reveal.add_argument("--scatter", action="store_true",
-                        help="reveal the picture with a random pop-in: ASCII "
-                             "characters appear one-by-one from random positions, "
+                        help="reveal the picture with a random pop-in: terminal "
+                             "cells appear one-by-one from random positions, "
                              "rapidly filling the screen (re-scatters after each "
                              "seek)")
     reveal.add_argument("--rain", action="store_true",
-                        help="reveal the picture with a Matrix-style rain: "
-                             "white glyphs cascade down each column and the "
+                        help="reveal the picture with a column rain: glyphs in "
+                             "chars or background cells in graphical modes "
+                             "cascade while the "
                              "live picture settles in behind them (re-rains "
                              "after each seek)")
-    p.add_argument("--scatter-secs", type=float, default=SCATTER_SECS, metavar="S",
+    p.add_argument("--scatter-secs", type=reveal_duration_type,
+                   default=SCATTER_SECS, metavar="S",
                    help=f"seconds for the --scatter reveal to fill the "
                         f"screen (default: {SCATTER_SECS:g})")
-    p.add_argument("--rain-secs", type=float, default=RAIN_SECS, metavar="S",
+    p.add_argument("--rain-secs", type=reveal_duration_type,
+                   default=RAIN_SECS, metavar="S",
                    help=f"seconds for the --rain reveal to fill the screen "
                         f"(default: {RAIN_SECS:g})")
     p.add_argument("--rain-chars", default=DEFAULT_RAIN_CHARS, metavar="SET",
@@ -846,41 +1035,129 @@ def parse_args():
                         f"{MAX_FPS} are rejected because most YouTube content "
                         f"tops out at 60fps and terminals can't reliably draw "
                         f"faster anyway.")
-    p.add_argument("--width", type=int,
-                   help="output width in characters")
-    p.add_argument("--height", type=int,
-                   help="output height in characters")
-    p.add_argument("--max-res", type=int, default=480, metavar="N",
+    p.add_argument("--width", type=positive_int_type,
+                   help="output width in terminal cells")
+    p.add_argument("--height", type=positive_int_type,
+                   help="output height in terminal cells")
+    p.add_argument("--max-res", type=positive_int_type, default=480, metavar="N",
                    help="max source video resolution (default: 480)")
     p.add_argument("--palette", choices=PALETTES, default="dense",
-                   help="ASCII palette (default: dense, ~70 chars)")
-    p.add_argument("--chars", help="custom palette, dark→light")
-    p.add_argument("--style", choices=STYLE_NAMES, default="classic",
-                   help="visual style (default: classic)")
-    p.add_argument("--effect", choices=EFFECT_NAMES, default="none",
-                   help="structural effect (default: none)")
+                   help="chars-backend palette (default: dense, ~70 chars)")
+    p.add_argument("--chars", help="custom chars palette, dark→light")
+    p.add_argument(
+        "--style", type=style_name_type, default="classic", metavar="NAME",
+        help=(
+            "static visual treatment (default: classic; canonical: "
+            + ", ".join(STYLE_NAMES) + ")"
+        ),
+    )
+    p.add_argument(
+        "--effect", type=effect_name_type, default="none", metavar="NAME",
+        help=(
+            "motion, structural, or text-specific effect (default: none; "
+            "canonical: " + ", ".join(EFFECT_NAMES) + ")"
+        ),
+    )
     p.add_argument("--effect-glyphs", choices=("ascii", "unicode"),
                    default="ascii", metavar="MODE",
-                   help="glyph set for structural effects: ascii or unicode "
-                        "(default: ascii)")
+                   help="glyph set for text-specific effects: ascii or unicode "
+                        "(default: ascii; chars backend only)")
     p.add_argument("--effect-text", default=DEFAULT_EFFECT_TEXT, metavar="TEXT",
-                   help="text used by word, inscription, echo, and collage "
-                        "effects "
+                   help="text used by the terminal-hud effect "
                         f"(default: {DEFAULT_EFFECT_TEXT})")
     p.add_argument("--effect-speed", type=effect_speed_type, default=1.0,
                    metavar="N",
-                   help="animation-speed multiplier for structural effects "
+                   help="animation-speed multiplier for animated effects "
                         "(default: 1.0)")
     p.add_argument("--effect-seed", type=int, default=0, metavar="N",
                    help="deterministic procedural-layout seed (default: 0)")
+    p.add_argument(
+        "--diagnostics-json", metavar="FILE",
+        help="write an opt-in live playback diagnostics report to a new FILE",
+    )
+    p.add_argument(
+        "--diagnostics-warmup", type=diagnostics_warmup_type, default=None,
+        metavar="SECONDS",
+        help="exclude this many seconds after the first frame from diagnostic "
+             "performance statistics (default: 0)",
+    )
+    p.add_argument(
+        "--diagnostics-duration", type=diagnostics_duration_type, default=None,
+        metavar="SECONDS",
+        help="stop after this many measured seconds following diagnostic "
+             "warm-up (default: run until playback exits)",
+    )
     p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
+    if args.render is None:
+        args.render = "half-block" if args.pixels else "chars"
+    elif args.pixels and args.render != "half-block":
+        p.error("--pixels is an alias for --render half-block and conflicts "
+                f"with --render {args.render}")
+    # Keep this attribute for callers that persisted the legacy option while
+    # making the canonical backend selection unambiguous everywhere else.
+    args.pixels = args.render == "half-block"
+    moved_effect = LEGACY_STYLE_EFFECTS.get(args.style)
+    moved_style = LEGACY_EFFECT_STYLES.get(args.effect)
+    if moved_effect is not None:
+        if args.effect != "none":
+            p.error(
+                f"legacy --style {args.style} now selects --effect "
+                f"{moved_effect} and cannot be combined with --effect "
+                f"{args.effect}"
+            )
+        args.style = "classic"
+        args.effect = moved_effect
+    elif moved_style is not None:
+        if args.style != "classic":
+            p.error(
+                f"legacy --effect {args.effect} now selects --style "
+                f"{moved_style} and cannot be combined with --style "
+                f"{args.style}"
+            )
+        args.style = moved_style
+        args.effect = "none"
+    else:
+        args.style = STYLE_ALIASES.get(args.style, args.style)
+        args.effect = EFFECT_ALIASES.get(args.effect, args.effect)
+    try:
+        args.rain_chars = validate_rain_chars(args.rain_chars)
+    except (TypeError, ValueError) as error:
+        p.error(str(error))
+    effective_render = _effective_render_mode(args.render, not args.no_color)
+    if args.effect in TEXT_EFFECT_NAMES and effective_render != "chars":
+        p.error(
+            f"effect {args.effect!r} requires --render chars; graphical "
+            f"effects are available with --render {args.render}"
+        )
     try:
         args.effect_text = validate_effect_text(
             args.effect_text, args.effect_glyphs
         )
     except (TypeError, ValueError) as error:
         p.error(str(error))
+    diagnostics_enabled = args.diagnostics_json is not None
+    if not diagnostics_enabled and (
+        args.diagnostics_warmup is not None
+        or args.diagnostics_duration is not None
+    ):
+        p.error(
+            "diagnostics tuning options require --diagnostics-json"
+        )
+    if diagnostics_enabled:
+        if not args.diagnostics_json:
+            p.error("--diagnostics-json FILE must be non-empty")
+        if os.path.lexists(args.diagnostics_json):
+            p.error(
+                f"--diagnostics-json refuses to overwrite existing path: "
+                f"{args.diagnostics_json}"
+            )
+        if not args.url:
+            p.error("--diagnostics-json requires an explicit playback URL")
+        if args.self_test or args.update or args.check_update:
+            p.error("diagnostics are available only for normal URL playback")
+        if args.diagnostics_warmup is None:
+            args.diagnostics_warmup = 0.0
     return args
 
 
@@ -893,13 +1170,13 @@ def prompt_for_url():
         "\x1b[2J\x1b[H"
         f"{cyan}{bold}"
         "   +-----------------------------------------------+\n"
-        "   |   yt-ascii  -  YouTube as ASCII in your shell  |\n"
+        "   | yt-ascii - terminal video, ASCII or graphical |\n"
         "   +-----------------------------------------------+"
         f"{reset}\n\n"
         f"{gray}   Paste a YouTube link and press Enter to play it.\n"
         "   While playing:  space=pause  <-/-> +-5s  up/down +-30s  "
         "0-9=jump  s=style  e=effect  q=quit\n"
-        "   Run with --help for color / audio / effect options."
+        "   Run with --help for renderer / color / audio / effect options."
         f"{reset}\n\n"
     )
     sys.stdout.flush()
@@ -915,17 +1192,117 @@ def prompt_for_url():
             return line
 
 
+def _diagnostics_config(args):
+    """Return an allowlisted, non-identifying snapshot of player settings."""
+    import hashlib
+
+    reveal = "rain" if args.rain else "scatter" if args.scatter else "none"
+    requested_render = _requested_render_mode(args)
+    effective_render = _effective_render_mode(
+        requested_render, not args.no_color
+    )
+    try:
+        stdout_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    except (OSError, ValueError):
+        stdout_tty = False
+    default_output = (
+        "sink" if not stdout_tty
+        else "tmux" if os.environ.get("TMUX")
+        else "attached"
+    )
+    effect_text = getattr(args, "effect_text", DEFAULT_EFFECT_TEXT)
+    if not isinstance(effect_text, str):
+        effect_text = DEFAULT_EFFECT_TEXT
+    config = {
+        "target_fps": args.fps,
+        "width": args.width,
+        "height": args.height,
+        "max_res": args.max_res,
+        "color": not args.no_color,
+        "render_backend": requested_render,
+        "effective_render_backend": effective_render,
+        "audio": not args.no_audio,
+        "eight_bit": args.eight_bit,
+        "style": args.style,
+        "effect": getattr(args, "effect", "none"),
+        "glyph_mode": getattr(args, "effect_glyphs", "ascii"),
+        "effect_speed": getattr(args, "effect_speed", 1.0),
+        "effect_seed": getattr(args, "effect_seed", 0),
+        "effect_text_sha256": hashlib.sha256(
+            effect_text.encode("utf-8")
+        ).hexdigest(),
+        "output_environment": default_output,
+        "palette": (
+            "custom"
+            if getattr(args, "chars", None) is not None
+            else getattr(args, "palette", "dense")
+        ),
+        "reveal": reveal,
+        "scatter": args.scatter,
+        "rain": args.rain,
+    }
+    return config
+
+
 def run(args, automatic_update_check=None):
-    half_block = args.pixels and not args.no_color
+    """Run playback, lazily enabling diagnostics only when explicitly asked."""
+    report_path = getattr(args, "diagnostics_json", None)
+    if report_path is None:
+        # Keep the ordinary path free from diagnostics imports, clocks, temp
+        # files, FFmpeg flags, and per-frame observer calls.
+        _run_playback(args, automatic_update_check)
+        return
+
+    from yt_ascii_diagnostics import PlaybackDiagnostics
+
+    stress_dimensions = (
+        args.fps >= 60
+        and (args.width or 0) >= 240
+        and (args.height or 0) >= 68
+    )
+    profile = "stress" if stress_dimensions else "ordinary"
+    diagnostics = PlaybackDiagnostics(
+        report_path,
+        getattr(args, "diagnostics_warmup", 0.0),
+        getattr(args, "diagnostics_duration", None),
+        config=_diagnostics_config(args),
+        source={"kind": "remote"},
+        profile=profile,
+    )
+    try:
+        exit_reason = _run_playback(
+            args, automatic_update_check, diagnostics=diagnostics
+        )
+    except BaseException as error:
+        diagnostics.finalize(
+            exit_reason="error", error_type=type(error).__name__
+        )
+        raise
+    diagnostics.finalize(exit_reason=exit_reason or "normal")
+
+
+def _run_playback(args, automatic_update_check=None, diagnostics=None):
     color = not args.no_color
+    requested_render = _requested_render_mode(args)
+    try:
+        render_mode = _effective_render_mode(requested_render, color)
+    except ValueError as error:
+        fail(str(error))
+    half_block = render_mode == "half-block"
+    if getattr(args, "effect", "none") in TEXT_EFFECT_NAMES \
+            and render_mode != "chars":
+        fail(
+            f"effect {args.effect!r} requires the chars renderer; choose a "
+            "graphical effect for cells or half-block"
+        )
     # One reveal animation may be active per run (the flags are mutually
     # exclusive); reveal_secs is its fill time, pulled from the matching knob.
     if args.rain:
         reveal_style = "rain"
-        reveal_secs = max(0.1, args.rain_secs)
+        reveal_secs = args.rain_secs
     elif args.scatter:
         reveal_style = "scatter"
-        reveal_secs = max(0.1, args.scatter_secs)
+        reveal_secs = args.scatter_secs
     else:
         reveal_style = None
         reveal_secs = 0.0
@@ -957,9 +1334,23 @@ def run(args, automatic_update_check=None):
 
     sys.stderr.write("Resolving stream…\n")
     try:
-        info = probe(args.url, args.max_res)
+        if diagnostics is None:
+            info = probe(args.url, args.max_res)
+        else:
+            with diagnostics.timer("probe", startup=True):
+                info = probe(args.url, args.max_res)
     except ProbeError as e:
+        if diagnostics is not None:
+            diagnostics.event("probe_failure")
         fail(str(e))
+    if diagnostics is not None:
+        diagnostics.set_source_metadata(
+            width=info["width"],
+            height=info["height"],
+            duration_seconds=info["duration"],
+            live=info.get("is_live"),
+            fps=info.get("fps"),
+        )
     report_automatic_update(automatic_update_check)
 
     def compute_dims():
@@ -980,23 +1371,35 @@ def run(args, automatic_update_check=None):
 
     cols, rows, ow, oh = compute_dims()
     pix_h = oh * 2 if half_block else oh   # source-pixel height ffmpeg scales to
+    if diagnostics is not None:
+        diagnostics.set_output_geometry(
+            width=ow, height=oh, target_fps=args.fps
+        )
 
-    pixel_fallback = half_block and args.effect in GLYPH_EFFECT_NAMES
-    mode_label = (
-        "pixels→chars" if pixel_fallback
-        else "pixels" if half_block
-        else "color-chars" if not args.no_color
-        else "gray-chars"
-    )
+    mode_label = render_mode
+    if requested_render != render_mode:
+        mode_label = f"{requested_render}→{render_mode} (--no-color)"
+    elif not color:
+        mode_label += " grayscale"
     audio_enabled = not args.no_audio and bool(find_ffplay())
     audio_label = (
         "8-bit audio" if (audio_enabled and args.eight_bit)
         else ("audio" if audio_enabled else "no audio")
     )
+    if diagnostics is not None:
+        diagnostics.event(
+            "audio_mode",
+            success=audio_enabled,
+            reason=(
+                "eight_bit"
+                if audio_enabled and args.eight_bit
+                else "normal" if audio_enabled else "disabled"
+            ),
+        )
     sys.stderr.write(
         f"▶ {info['title']}\n"
         f"  source {info['width']}x{info['height']}  "
-        f"→  terminal {ow}x{oh} chars @ {args.fps}fps  "
+        f"→  terminal {ow}x{oh} cells @ {args.fps}fps  "
         f"({mode_label}, {audio_label})\n"
     )
 
@@ -1027,12 +1430,48 @@ def run(args, automatic_update_check=None):
         return seek_pos + (time.monotonic() - seek_at)
 
     def start_at(pos):
-        state["video"] = spawn_video(info, args.fps, ow, pix_h, pos)
+        if diagnostics is None:
+            state["video"] = spawn_video(info, args.fps, ow, pix_h, pos)
+        else:
+            with diagnostics.timer("decoder_start"):
+                state["video"] = spawn_video(
+                    info, args.fps, ow, pix_h, pos, diagnostics
+                )
+            diagnostics.register_child(state["video"], "video")
         if audio_enabled:
-            state["audio"] = spawn_audio(info, pos, args.eight_bit)
+            if diagnostics is None:
+                state["audio"] = spawn_audio(info, pos, args.eight_bit)
+            else:
+                with diagnostics.timer("audio_start"):
+                    state["audio"] = spawn_audio(
+                        info, pos, args.eight_bit
+                    )
+                diagnostics.register_child(state["audio"], "audio")
 
     def stop_all():
-        stop_procs(state["video"], state["audio"])
+        video = state["video"]
+        audio = state["audio"]
+        if diagnostics is not None:
+            diagnostics.sample_resources(force=True)
+            for role, child in (("video", video), ("audio", audio)):
+                if child is None:
+                    continue
+                try:
+                    child_exit_code = child.poll()
+                except (AttributeError, OSError):
+                    child_exit_code = None
+                child_fields = {
+                    "reason": role,
+                    "success": child_exit_code is None,
+                }
+                if child_exit_code is not None:
+                    child_fields["exit_code"] = child_exit_code
+                diagnostics.event("child_before_stop", **child_fields)
+        stop_procs(video, audio)
+        consume_video_diagnostics(video, diagnostics)
+        if diagnostics is not None:
+            diagnostics.unregister_child(video)
+            diagnostics.unregister_child(audio)
         state["video"] = state["audio"] = None
 
     def seek_to(new_pos):
@@ -1052,6 +1491,11 @@ def run(args, automatic_update_check=None):
         style_processor.reset()
         effect_processor.reset("seek")
         begin_reveal()  # replay the reveal from the new position
+        if diagnostics is not None:
+            diagnostics.increment("controls")
+            diagnostics.event(
+                "control", reason="seek", position_seconds=new_pos
+            )
 
     def toggle_pause():
         nonlocal paused, pause_started, seek_at, reveal_start, seek_pos, frame_no
@@ -1067,6 +1511,9 @@ def run(args, automatic_update_check=None):
                 seek_at = pause_started     # current_pos() == seek_pos paused
                 stop_all()
             paused = True
+            if diagnostics is not None:
+                diagnostics.increment("controls")
+                diagnostics.event("control", reason="pause", paused=True)
         else:
             delta = time.monotonic() - pause_started
             if reveal_start is not None:
@@ -1080,6 +1527,9 @@ def run(args, automatic_update_check=None):
                 seek_at = time.monotonic()
                 frame_no = 0
             paused = False
+            if diagnostics is not None:
+                diagnostics.increment("controls")
+                diagnostics.event("control", reason="resume", paused=False)
 
     def do_resize():
         """Recompute output size and restart the video decoder in place.
@@ -1100,15 +1550,32 @@ def run(args, automatic_update_check=None):
         cols, rows = new_cols, new_rows
         ow, oh = new_ow, new_oh
         pix_h = oh * 2 if half_block else oh
+        if diagnostics is not None:
+            diagnostics.set_output_geometry(
+                width=ow, height=oh, target_fps=args.fps
+            )
         frame_size = ow * pix_h * channels
         frame_buffer = bytearray(frame_size)
         discard_buffer = bytearray(frame_size)
-        stop_proc(state["video"])
+        old_video = state["video"]
+        if diagnostics is not None:
+            diagnostics.sample_resources(force=True)
+        stop_proc(old_video)
+        consume_video_diagnostics(old_video, diagnostics)
+        if diagnostics is not None:
+            diagnostics.unregister_child(old_video)
         state["video"] = None
         # Windows pause stops the decoders instead of suspending them. Do not
         # spawn a decoder during a paused resize; resume will start exactly one.
         if not paused or _CAN_SUSPEND:
-            state["video"] = spawn_video(info, args.fps, ow, pix_h, pos)
+            if diagnostics is None:
+                state["video"] = spawn_video(info, args.fps, ow, pix_h, pos)
+            else:
+                with diagnostics.timer("decoder_start"):
+                    state["video"] = spawn_video(
+                        info, args.fps, ow, pix_h, pos, diagnostics
+                    )
+                diagnostics.register_child(state["video"], "video")
         seek_pos = pos
         seek_at = resize_at
         frame_no = 0
@@ -1120,6 +1587,11 @@ def run(args, automatic_update_check=None):
             pause_started = resize_at
             if _CAN_SUSPEND:
                 signal_proc(state["video"], signal.SIGSTOP)
+        if diagnostics is not None:
+            diagnostics.increment("resizes")
+            diagnostics.event(
+                "resize", width=ow, height=oh
+            )
         sys.stdout.write("\x1b[2J\x1b[H")  # clear; old frame had wrong dims
         sys.stdout.flush()
         # A reveal in progress just continues at the new size: its progress is
@@ -1127,6 +1599,7 @@ def run(args, automatic_update_check=None):
         # the rain reshuffles its columns to the new width on the next frame.
 
     retry = {"n": 0, "pos": -1.0}
+    termination_reason = "end_of_stream"
     def recover_stream():
         """The video pipe closed before the end of the video. A close near the
         known end is a normal finish; otherwise the stream dropped (the
@@ -1134,9 +1607,11 @@ def run(args, automatic_update_check=None):
         reconnect) — refresh the URL and resume from the last shown frame.
         Returns True if playback resumed, False if we should stop."""
         nonlocal seek_pos, seek_at, frame_no, paused, last_frame
+        nonlocal termination_reason
         pos = seek_pos + frame_no * frame_dur
         dur = info["duration"]
         if dur and pos >= dur - 1.0:
+            termination_reason = "end_of_stream"
             return False  # reached the end — a normal finish
 
         # Count consecutive failures at (roughly) the same spot so a truly
@@ -1146,12 +1621,27 @@ def run(args, automatic_update_check=None):
         else:
             retry["n"], retry["pos"] = 1, pos
         if retry["n"] > MAX_STREAM_RETRIES:
+            termination_reason = "reconnect_exhausted"
+            if diagnostics is not None:
+                diagnostics.increment("reconnect_failures")
+                diagnostics.event(
+                    "reconnect", reason="exhausted", count=retry["n"]
+                )
             return False
 
+        if diagnostics is not None:
+            diagnostics.increment("reconnects")
+            diagnostics.event(
+                "reconnect", reason="start", count=retry["n"]
+            )
         sys.stdout.write(f"\x1b[{oh + 1};1H\x1b[0m  ⟳ reconnecting…\x1b[K")
         sys.stdout.flush()
         try:
-            info.update(probe(args.url, args.max_res))
+            if diagnostics is None:
+                info.update(probe(args.url, args.max_res))
+            else:
+                with diagnostics.timer("reconnect_probe"):
+                    info.update(probe(args.url, args.max_res))
         except Exception:
             pass  # keep the old URL; recovery must never crash the player
         stop_all()
@@ -1159,6 +1649,10 @@ def run(args, automatic_update_check=None):
         seek_pos, seek_at, frame_no, paused = pos, time.monotonic(), 0, False
         last_frame = None
         style_processor.reset()
+        if diagnostics is not None:
+            diagnostics.event(
+                "reconnect", reason="resumed", count=retry["n"]
+            )
         return True
 
     resize_flag = [False]
@@ -1171,15 +1665,6 @@ def run(args, automatic_update_check=None):
     fd = sys.stdin.fileno()
     is_tty = os.isatty(fd)
     old_term = None
-    if is_tty and not IS_WINDOWS:
-        try:
-            old_term = termios.tcgetattr(fd)
-            tty.setcbreak(fd)
-        except Exception:
-            is_tty = False
-
-    sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")  # hide cursor, clear, home
-    sys.stdout.flush()
 
     frame_dur = 1.0 / args.fps
     channels = 3
@@ -1187,46 +1672,70 @@ def run(args, automatic_update_check=None):
     frame_buffer = bytearray(frame_size)
     discard_buffer = bytearray(frame_size)
 
-    rain_chars = RAIN_CHARSETS.get(args.rain_chars, args.rain_chars)
-    if not rain_chars:
-        fail("--rain-chars must be a preset "
-             f"({', '.join(RAIN_CHARSETS)}) or a non-empty string of glyphs")
-    if "\x00" in rain_chars:
-        fail("--rain-chars cannot contain NUL")
+    try:
+        rain_choice = validate_rain_chars(args.rain_chars)
+    except (TypeError, ValueError) as error:
+        fail(str(error))
+    rain_chars = RAIN_CHARSETS.get(rain_choice, rain_choice)
     renderer = AnsiRenderer(
         chars,
         color=color,
-        half_block=half_block,
+        render_mode=render_mode,
         rain_chars=rain_chars,
     )
 
     def render_frame(
         frame, video_time, reveal_fraction, *, advance_state, sequence
     ):
-        """Compose style, structural effect, reveal, then terminal bytes."""
-        styled = style_processor.apply(frame, video_time)
+        """Compose style, visual effect, reveal, then terminal bytes."""
+        if diagnostics is None:
+            styled = style_processor.apply(frame)
+        else:
+            with diagnostics.timer("style"):
+                styled = style_processor.apply(frame)
         context = EffectContext(
             video_time=video_time,
             frame_sequence=sequence,
             cell_shape=(oh, ow),
-            requested_pixels=half_block,
+            render_mode=render_mode,
             advance_state=advance_state,
         )
-        effected = effect_processor.apply(styled, context)
-        if reveal_fraction < 1.0:
-            reveal_method = (
-                renderer.render_rain
-                if reveal_style == "rain"
-                else renderer.render_scatter
-            )
+        if diagnostics is None:
+            effected = effect_processor.apply(styled, context)
+        else:
+            with diagnostics.timer("effect"):
+                effected = effect_processor.apply(styled, context)
+
+        if diagnostics is None:
+            if reveal_fraction < 1.0:
+                reveal_method = (
+                    renderer.render_rain
+                    if reveal_style == "rain"
+                    else renderer.render_scatter
+                )
+                if effected.cells is None:
+                    return reveal_method(effected.rgb, reveal_fraction)
+                return reveal_method(
+                    effected.rgb, reveal_fraction, effected.cells
+                )
             if effected.cells is None:
-                return reveal_method(effected.rgb, reveal_fraction)
-            return reveal_method(
-                effected.rgb, reveal_fraction, effected.cells
-            )
-        if effected.cells is None:
-            return renderer.render(effected.rgb)
-        return renderer.render(effected.rgb, effected.cells)
+                return renderer.render(effected.rgb)
+            return renderer.render(effected.rgb, effected.cells)
+        with diagnostics.timer("ansi"):
+            if reveal_fraction < 1.0:
+                reveal_method = (
+                    renderer.render_rain
+                    if reveal_style == "rain"
+                    else renderer.render_scatter
+                )
+                if effected.cells is None:
+                    return reveal_method(effected.rgb, reveal_fraction)
+                return reveal_method(
+                    effected.rgb, reveal_fraction, effected.cells
+                )
+            if effected.cells is None:
+                return renderer.render(effected.rgb)
+            return renderer.render(effected.rgb, effected.cells)
 
     def redraw_paused_frame():
         """Render the retained raw frame with the current paused state."""
@@ -1239,21 +1748,43 @@ def run(args, automatic_update_check=None):
             advance_state=False,
             sequence=presented_sequence,
         )
-        status = build_status(
-            args.fps, current_pos(), info, cols, paused=True,
-            style=args.style, effect=args.effect,
-            pixel_fallback=half_block and args.effect in GLYPH_EFFECT_NAMES,
-        )
-        write_terminal_frame(body, status)
+        if diagnostics is None:
+            status = build_status(
+                args.fps, current_pos(), info, cols, paused=True,
+                style=args.style, effect=args.effect,
+                render_backend=mode_label,
+            )
+            write_terminal_frame(body, status)
+        else:
+            with diagnostics.timer("status"):
+                status = build_status(
+                    args.fps, current_pos(), info, cols, paused=True,
+                    style=args.style, effect=args.effect,
+                    render_backend=mode_label,
+                )
+            diagnostics.increment(
+                "output_bytes",
+                write_terminal_frame(body, status, diagnostics),
+            )
 
     def cycle_style():
         """Select the next style; the caller coordinates any paused redraw."""
         args.style = style_processor.cycle()
         effect_processor.reset("style")
+        if diagnostics is not None:
+            diagnostics.increment("controls")
+            diagnostics.event(
+                "control", reason="style", style=args.style
+            )
 
     def cycle_effect():
-        """Select the next structural effect without restarting playback."""
-        args.effect = effect_processor.cycle()
+        """Select the next backend-compatible effect without restarting."""
+        args.effect = effect_processor.cycle(render_mode=render_mode)
+        if diagnostics is not None:
+            diagnostics.increment("controls")
+            diagnostics.event(
+                "control", reason="effect", effect=args.effect
+            )
 
     def begin_reveal():
         """Start (or restart, after a seek) the current reveal animation: clear
@@ -1266,12 +1797,23 @@ def run(args, automatic_update_check=None):
             sys.stdout.write("\x1b[2J\x1b[H")
             sys.stdout.flush()
 
-    start_at(0.0)
-    seek_at = time.monotonic()  # pace from first-frame time, not probe time
-    begin_reveal()
-
     try:
+        if is_tty and not IS_WINDOWS:
+            try:
+                old_term = termios.tcgetattr(fd)
+                tty.setcbreak(fd)
+            except Exception:
+                is_tty = False
+        sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")
+        sys.stdout.flush()
+        start_at(0.0)
+        # Pace from decoder startup rather than stream-probe time.
+        seek_at = time.monotonic()
+        begin_reveal()
         while True:
+            loop_started = (
+                time.monotonic() if diagnostics is not None else None
+            )
             # ── Handle keyboard ──────────────────────────────────────────
             quit_now = False
             style_changed = False
@@ -1281,6 +1823,10 @@ def run(args, automatic_update_check=None):
                 for key in read_keys(fd):
                     if key == "q":
                         quit_now = True
+                        termination_reason = "user_quit"
+                        if diagnostics is not None:
+                            diagnostics.increment("controls")
+                            diagnostics.event("control", reason="quit")
                         break
                     if key == "space":
                         toggle_pause()
@@ -1321,35 +1867,83 @@ def run(args, automatic_update_check=None):
             # ── Paused: just idle and keep the status line updating ─────
             if paused:
                 pos = current_pos()
-                status = build_status(
-                    args.fps, pos, info, cols, paused=True,
-                    style=args.style, effect=args.effect,
-                    pixel_fallback=(
-                        half_block and args.effect in GLYPH_EFFECT_NAMES
-                    ),
-                )
-                sys.stdout.write(f"\x1b[{oh + 1};1H" + status + "\x1b[K")
-                sys.stdout.flush()
+                if diagnostics is None:
+                    status = build_status(
+                        args.fps, pos, info, cols, paused=True,
+                        style=args.style, effect=args.effect,
+                        render_backend=mode_label,
+                    )
+                    sys.stdout.write(
+                        f"\x1b[{oh + 1};1H" + status + "\x1b[K"
+                    )
+                    sys.stdout.flush()
+                else:
+                    with diagnostics.timer("status"):
+                        status = build_status(
+                            args.fps, pos, info, cols, paused=True,
+                            style=args.style, effect=args.effect,
+                            render_backend=mode_label,
+                        )
+                    paused_payload = (
+                        f"\x1b[{oh + 1};1H" + status + "\x1b[K"
+                    )
+                    with diagnostics.timer("terminal_write"):
+                        sys.stdout.write(paused_payload)
+                        sys.stdout.flush()
+                    diagnostics.increment(
+                        "output_bytes", len(paused_payload.encode("utf-8"))
+                    )
                 time.sleep(0.05)
+                if diagnostics is not None and diagnostics.tick():
+                    termination_reason = "duration"
+                    break
                 continue
 
             # ── Drop frames if behind, to stay in sync with audio ───────
             now = time.monotonic()
             seg_elapsed = now - seek_at
             target = int(seg_elapsed * args.fps)
+            dropped = 0
             if frame_no < target - 1:
                 skip = target - frame_no - 1
-                dropped = discard_frames(
-                    state["video"].stdout, skip, discard_buffer
-                )
+                if diagnostics is None:
+                    dropped = discard_frames(
+                        state["video"].stdout, skip, discard_buffer
+                    )
+                else:
+                    with diagnostics.timer("frame_drain"):
+                        dropped = discard_frames(
+                            state["video"].stdout, skip, discard_buffer
+                        )
                 frame_no += dropped
                 if dropped != skip:
+                    if diagnostics is not None:
+                        diagnostics.increment("frames_dropped", dropped)
+                        diagnostics.increment("decoder_eofs")
+                        diagnostics.event(
+                            "frame_drain_eof",
+                            count=dropped,
+                        )
                     if recover_stream():
                         continue
                     break
 
-            received = read_exact_into(state["video"].stdout, frame_buffer)
+            if diagnostics is None:
+                received = read_exact_into(
+                    state["video"].stdout, frame_buffer
+                )
+            else:
+                with diagnostics.timer("decoder_read"):
+                    received = read_exact_into(
+                        state["video"].stdout, frame_buffer
+                    )
             if received != frame_size:
+                if diagnostics is not None:
+                    diagnostics.increment("decoder_eofs")
+                    diagnostics.event(
+                        "decoder_eof",
+                        count=received,
+                    )
                 if recover_stream():
                     continue
                 break
@@ -1381,28 +1975,124 @@ def run(args, automatic_update_check=None):
             presented_sequence += 1
 
             pos = seek_pos + seg_elapsed
-            status = build_status(
-                args.fps, pos, info, cols, paused=False,
-                style=args.style, effect=args.effect,
-                pixel_fallback=(
-                    half_block and args.effect in GLYPH_EFFECT_NAMES
-                ),
-            )
+            if diagnostics is None:
+                status = build_status(
+                    args.fps, pos, info, cols, paused=False,
+                    style=args.style, effect=args.effect,
+                    render_backend=mode_label,
+                )
+                write_terminal_frame(body, status)
+            else:
+                with diagnostics.timer("status"):
+                    status = build_status(
+                        args.fps, pos, info, cols, paused=False,
+                        style=args.style, effect=args.effect,
+                        render_backend=mode_label,
+                    )
+                output_bytes = write_terminal_frame(
+                    body, status, diagnostics
+                )
 
-            write_terminal_frame(body, status)
+            presented_at = (
+                time.monotonic() if diagnostics is not None else None
+            )
+            if diagnostics is not None:
+                first_presented_frame = presented_sequence == 1
+                diagnostics.mark_first_frame()
+                diagnostics.record_frame(
+                    output_bytes=output_bytes,
+                    dropped=dropped,
+                    lateness_seconds=(
+                        None
+                        if first_presented_frame
+                        else max(
+                            0.0,
+                            presented_at - (seek_at + frame_no * frame_dur),
+                        )
+                    ),
+                    loop_seconds=(
+                        None
+                        if first_presented_frame
+                        else presented_at - loop_started
+                    ),
+                )
 
             frame_no += 1
             delay = (seek_at + frame_no * frame_dur) - time.monotonic()
             if delay > 0:
-                time.sleep(delay)
+                if diagnostics is None:
+                    time.sleep(delay)
+                else:
+                    sleep_deadline = time.monotonic() + delay
+                    time.sleep(delay)
+                    diagnostics.record_timing(
+                        "sleep_overshoot",
+                        max(0.0, time.monotonic() - sleep_deadline),
+                    )
+            if diagnostics is not None and diagnostics.tick():
+                termination_reason = "duration"
+                break
     except KeyboardInterrupt:
-        pass
+        termination_reason = "keyboard_interrupt"
     finally:
-        stop_all()
-        if old_term is not None and termios is not None:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
-        sys.stdout.write("\x1b[0m\x1b[?25h\n")
-        sys.stdout.flush()
+        if diagnostics is None:
+            stop_all()
+            if old_term is not None and termios is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+            sys.stdout.write("\x1b[0m\x1b[?25h\n")
+            sys.stdout.flush()
+        else:
+            cleanup_started = time.monotonic()
+            children = (state["video"], state["audio"])
+            terminal_restored = True
+            for role, child in zip(("video", "audio"), children):
+                if child is None:
+                    continue
+                try:
+                    child_exit_code = child.poll()
+                except (AttributeError, OSError):
+                    child_exit_code = None
+                child_fields = {
+                    "reason": role,
+                    "success": child_exit_code is None,
+                }
+                if child_exit_code is not None:
+                    child_fields["exit_code"] = child_exit_code
+                diagnostics.event("child_before_cleanup", **child_fields)
+            try:
+                stop_all()
+            finally:
+                try:
+                    if old_term is not None and termios is not None:
+                        try:
+                            termios.tcsetattr(
+                                fd, termios.TCSADRAIN, old_term
+                            )
+                        except BaseException:
+                            terminal_restored = False
+                            raise
+                finally:
+                    try:
+                        sys.stdout.write("\x1b[0m\x1b[?25h\n")
+                        sys.stdout.flush()
+                    except BaseException:
+                        terminal_restored = False
+                        raise
+                    finally:
+                        children_reaped = True
+                        for child in children:
+                            if child is None:
+                                continue
+                            try:
+                                children_reaped &= child.poll() is not None
+                            except (AttributeError, OSError):
+                                children_reaped = False
+                        diagnostics.record_cleanup(
+                            time.monotonic() - cleanup_started,
+                            children_reaped=children_reaped,
+                            terminal_restored=terminal_restored,
+                        )
+    return termination_reason
 
 
 def _terminal_cell_width(text):
@@ -1432,7 +2122,7 @@ def _truncate_terminal_cells(text, limit):
 
 def build_status(
     fps, pos, info, cols, paused, style="classic", effect="none",
-    pixel_fallback=False,
+    render_backend="chars", pixel_fallback=False,
 ):
     if info["duration"]:
         clock = f"{fmt_time(pos)} / {fmt_time(info['duration'])}"
@@ -1441,13 +2131,18 @@ def build_status(
     tag = "‖ PAUSED" if paused else "▶"
     width = max(0, int(cols))
     effect_label = f"effect:{effect}"
+    # ``pixel_fallback`` is retained only for programmatic callers from the old
+    # interface; normal playback always supplies the explicit backend label.
     if pixel_fallback:
-        effect_label += " pixels→chars"
+        render_backend = "half-block→chars"
+    render_label = f"render:{render_backend}"
     head_options = (
-        f"  {tag}  {clock}  {fps}fps  style:{style}  {effect_label}",
-        f"  {tag}  {clock}  style:{style}  {effect_label}",
-        f"  {clock}  style:{style}  {effect_label}",
-        f"  style:{style}  {effect_label}",
+        f"  {tag}  {clock}  {fps}fps  {render_label}  style:{style}  "
+        f"{effect_label}",
+        f"  {tag}  {clock}  {render_label}  style:{style}  {effect_label}",
+        f"  {render_label}  style:{style}  {effect_label}",
+        f"  {clock}  {render_label}  {effect_label}",
+        f"  {render_label}  {effect_label}",
         f"  {effect_label}",
     )
     control_options = (
@@ -1498,89 +2193,54 @@ def build_status(
 
 
 def self_test():
-    """Exercise bundled NumPy, every style/effect and rendering offline."""
+    """Exercise every retained style, effect, and backend offline."""
     import numpy as np
     from yt_ascii_effects import (
         DEFAULT_EFFECT_TEXT as IMPLEMENTED_DEFAULT_EFFECT_TEXT,
+        EFFECT_ALIASES as IMPLEMENTED_ALIASES,
         EFFECT_NAMES as IMPLEMENTED_EFFECTS,
         EFFECT_SPECS,
+        TEXT_EFFECT_NAMES as IMPLEMENTED_TEXT_EFFECTS,
         EffectProcessor,
     )
     from yt_ascii_frames import EffectContext
-    from yt_ascii_renderer import AnsiRenderer
-    from yt_ascii_styles import STYLE_NAMES as IMPLEMENTED_STYLES, StyleProcessor
+    from yt_ascii_renderer import AnsiRenderer, BG, HALF_BLOCK
+    from yt_ascii_styles import (
+        STYLE_ALIASES as IMPLEMENTED_STYLE_ALIASES,
+        STYLE_NAMES as IMPLEMENTED_STYLES,
+        StyleProcessor,
+    )
 
     if tuple(IMPLEMENTED_STYLES) != STYLE_NAMES:
         fail("style registry self-test failed")
+    if dict(IMPLEMENTED_STYLE_ALIASES) != STYLE_ALIASES:
+        fail("style alias registry self-test failed")
     if IMPLEMENTED_DEFAULT_EFFECT_TEXT != DEFAULT_EFFECT_TEXT:
         fail("effect text default self-test failed")
     if tuple(IMPLEMENTED_EFFECTS) != EFFECT_NAMES:
         fail("effect registry self-test failed")
-    implemented_glyph_effects = frozenset(
-        spec.name for spec in EFFECT_SPECS if spec.glyph_owned
-    )
-    if implemented_glyph_effects != GLYPH_EFFECT_NAMES:
-        fail("effect pixel-policy self-test failed")
+    if dict(IMPLEMENTED_ALIASES) != EFFECT_ALIASES:
+        fail("effect alias registry self-test failed")
+    if frozenset(IMPLEMENTED_TEXT_EFFECTS) != TEXT_EFFECT_NAMES:
+        fail("text effect registry self-test failed")
+    if tuple(spec.name for spec in EFFECT_SPECS) != EFFECT_NAMES:
+        fail("effect metadata self-test failed")
 
-    frame = np.array([[[1, 2, 3]]], dtype=np.uint8)
+    pixel = np.array([[[1, 2, 3]]], dtype=np.uint8)
     expected = b"\x1b[38;2;1;2;3mx\x1b[0m\x1b[K"
-    if AnsiRenderer("x").render(frame) != expected:
-        fail("renderer self-test failed")
-
-    sample = np.arange(8 * 8 * 3, dtype=np.uint8).reshape(8, 8, 3)
-    processor = StyleProcessor()
-    renderer = AnsiRenderer(" .#")
-    for name in STYLE_NAMES:
-        processor.select(name)
-        styled = processor.apply(sample, 0.25)
-        if styled.shape != sample.shape or styled.dtype != np.uint8:
-            fail(f"{name} style self-test failed")
-        if not renderer.render(styled):
-            fail(f"{name} style renderer self-test failed")
-
-    effect_processor = EffectProcessor()
-    context = EffectContext(
-        video_time=0.25,
-        frame_sequence=0,
-        cell_shape=sample.shape[:2],
-        requested_pixels=False,
-        advance_state=True,
+    if AnsiRenderer("x", render_mode="chars").render(pixel) != expected:
+        fail("chars renderer self-test failed")
+    cells_output = AnsiRenderer(render_mode="cells").render(pixel)
+    if BG not in cells_output or not cells_output.endswith(b" \x1b[0m\x1b[K"):
+        fail("cells renderer self-test failed")
+    half_output = AnsiRenderer(render_mode="half-block").render(
+        np.repeat(pixel, 2, axis=0)
     )
-    for name in EFFECT_NAMES:
-        effect_processor.select(name)
-        effected = effect_processor.apply(sample, context)
-        if effected.rgb.dtype != np.uint8 or effected.rgb.ndim != 3:
-            fail(f"{name} effect self-test failed")
-        output = renderer.render(effected.rgb, effected.cells)
-        if not output:
-            fail(f"{name} effect renderer self-test failed")
-        if name in GLYPH_EFFECT_NAMES:
-            unicode_effected = EffectProcessor(
-                name, glyph_mode="unicode"
-            ).apply(sample, context)
-            if unicode_effected.cells is None or not renderer.render(
-                unicode_effected.rgb, unicode_effected.cells
-            ):
-                fail(f"{name} Unicode effect self-test failed")
-        if name == "afterimage":
-            moved = np.roll(sample, 1, axis=1)
-            later = EffectContext(
-                video_time=0.5,
-                frame_sequence=1,
-                cell_shape=sample.shape[:2],
-                requested_pixels=False,
-                advance_state=True,
-            )
-            temporal = effect_processor.apply(moved, later)
-            if not renderer.render(temporal.rgb, temporal.cells):
-                fail("afterimage temporal self-test failed")
+    if HALF_BLOCK not in half_output:
+        fail("half-block renderer self-test failed")
 
-    # Exercise every roadmap effect with a deliberately varied fixture.  The
-    # ordinary registry loop above proves shape and renderer compatibility;
-    # this additionally catches an implementation that accidentally produces
-    # an entirely blank structural result.
-    rows, cols = np.indices((24, 32), dtype=np.uint16)
-    structure_sample = np.stack(
+    rows, cols = np.indices((18, 24), dtype=np.uint16)
+    sample = np.stack(
         (
             (cols * 37 + rows * 17) % 256,
             (cols * 11 + rows * 53) % 256,
@@ -1588,151 +2248,69 @@ def self_test():
         ),
         axis=2,
     ).astype(np.uint8)
-    structure_context = EffectContext(
-        video_time=0.125,
-        frame_sequence=0,
-        cell_shape=structure_sample.shape[:2],
-        requested_pixels=False,
-        advance_state=False,
-    )
-    roadmap_effects = (
-        "error-diffusion",
-        "halftone",
-        "poster-press",
-        "cross-stitch",
-        "weave",
-        "kilim",
-        "quadtree",
-        "patchwork",
-        "digital-rain",
-        "ribbon-scan",
-        "pixel-sort",
-        "stardust",
-        "type-collage",
-        "engraving",
-        "brickwork",
-        "prism",
-        "hologram",
-        "glass",
-        "terminal-hud",
-    )
-    for name in roadmap_effects:
-        structured = EffectProcessor(
-            name, seed=7, effect_text="CODEX"
-        ).apply(structure_sample, structure_context)
-        if structured.cells is None:
-            nonblank = bool(np.any(structured.rgb))
-        else:
-            nonblank = bool(np.any(structured.cells.glyph_indices))
-        if not nonblank or not renderer.render(structured.rgb, structured.cells):
-            fail(f"{name} nonblank fixture self-test failed")
+    style_processor = StyleProcessor()
+    for name in STYLE_NAMES:
+        style_processor.select(name)
+        styled = style_processor.apply(sample)
+        if styled.shape != sample.shape or styled.dtype != np.uint8:
+            fail(f"{name} style self-test failed")
 
-    # Analytic animation must be reconstructible from video time, but each
-    # animated treatment should still advance between distinct ticks.
-    animation_contexts = (
-        structure_context,
-        EffectContext(
-            video_time=0.875,
-            frame_sequence=1,
-            cell_shape=structure_sample.shape[:2],
-            requested_pixels=False,
-            advance_state=False,
-        ),
-    )
-    animated_roadmap_effects = (
-        "digital-rain",
-        "ribbon-scan",
-        "pixel-sort",
-        "stardust",
-        "type-collage",
-        "hologram",
-        "terminal-hud",
-    )
-    for name in animated_roadmap_effects:
-        animation = EffectProcessor(
-            name, seed=7, effect_text="CODEX"
-        )
-        first = animation.apply(structure_sample, animation_contexts[0])
-        later = animation.apply(structure_sample, animation_contexts[1])
-        changed = not np.array_equal(first.rgb, later.rgb)
-        if first.cells is not None and later.cells is not None:
-            changed = changed or not np.array_equal(
-                first.cells.glyph_indices, later.cells.glyph_indices
-            )
-            changed = changed or not np.array_equal(
-                first.cells.fg_rgb, later.cells.fg_rgb
-            )
-        if not changed:
-            fail(f"{name} temporal fixture self-test failed")
-
-    white_text_sample = np.full((8, 8, 3), 255, dtype=np.uint8)
-    inscription_sample = np.zeros((8, 8, 3), dtype=np.uint8)
-    inscription_sample[:, 4:] = 255
-    text_samples = {
-        "word-field": white_text_sample,
-        "inscription": inscription_sample,
-        "type-echo": white_text_sample,
-        "type-collage": white_text_sample,
+    renderers = {
+        "chars": AnsiRenderer(" .#", render_mode="chars"),
+        "cells": AnsiRenderer(render_mode="cells"),
+        "half-block": AnsiRenderer(render_mode="half-block"),
     }
-    for name, text_sample in text_samples.items():
-        custom = EffectProcessor(name, effect_text="CODEX").apply(
-            text_sample, context
-        )
-        if custom.cells is None or not set("CODEX").issubset(
-            set(custom.cells.glyphs)
-        ):
-            fail(f"{name} custom text self-test failed")
-        custom_indices = {
-            custom.cells.glyphs.index(glyph) for glyph in "CODEX"
-        }
-        rendered_indices = set(np.unique(custom.cells.glyph_indices).tolist())
-        if (
-            not custom_indices.issubset(rendered_indices)
-            or not renderer.render(custom.rgb, custom.cells)
-        ):
-            fail(f"{name} custom text self-test failed")
+    for spec in EFFECT_SPECS:
+        for render_mode in spec.compatible_renderers:
+            source = (
+                np.repeat(sample, 2, axis=0)
+                if render_mode == "half-block"
+                else sample
+            )
+            processor = EffectProcessor(
+                spec.name, seed=7, effect_text="CODEX"
+            )
+            context = EffectContext(
+                video_time=0.25,
+                frame_sequence=0,
+                cell_shape=sample.shape[:2],
+                render_mode=render_mode,
+                advance_state=True,
+            )
+            effected = processor.apply(source, context)
+            if effected.rgb.dtype != np.uint8 or effected.rgb.shape != source.shape:
+                fail(f"{spec.name}/{render_mode} effect self-test failed")
+            if (effected.cells is not None) != (spec.name in TEXT_EFFECT_NAMES):
+                fail(f"{spec.name}/{render_mode} cell-plane self-test failed")
+            output = renderers[render_mode].render(
+                effected.rgb, effected.cells
+            )
+            if not output or b"\x00" in output:
+                fail(f"{spec.name}/{render_mode} renderer self-test failed")
+            if render_mode == "cells" and (
+                BG not in output or HALF_BLOCK in output
+            ):
+                fail(f"{spec.name} cells visual-contract self-test failed")
 
-    echo_later = EffectContext(
-        video_time=0.5,
-        frame_sequence=1,
-        cell_shape=sample.shape[:2],
-        requested_pixels=False,
-        advance_state=False,
-    )
-    first_echo = EffectProcessor(
-        "type-echo", effect_text="CODEX"
-    ).apply(white_text_sample, context)
-    later_echo = EffectProcessor(
-        "type-echo", effect_text="CODEX"
-    ).apply(white_text_sample, echo_later)
-    if np.array_equal(
-        first_echo.cells.glyph_indices, later_echo.cells.glyph_indices
-    ):
-        fail("type-echo temporal self-test failed")
-
-    pixel_sample = np.repeat(sample, 2, axis=0)
-    pixel_context = EffectContext(
-        video_time=0.25,
-        frame_sequence=0,
-        cell_shape=sample.shape[:2],
-        requested_pixels=True,
-        advance_state=True,
-    )
-    pixel_renderer = AnsiRenderer(" .#", half_block=True)
-    for name in EFFECT_NAMES:
-        if name not in GLYPH_EFFECT_NAMES:
-            continue
-        effect_processor.select(name)
-        effected = effect_processor.apply(pixel_sample, pixel_context)
-        if (
-            effected.cells is None
-            or effected.cells.glyph_indices.shape != pixel_context.cell_shape
-            or effected.cells.fg_rgb is None
-            or effected.cells.fg_rgb.shape != pixel_context.cell_shape + (3,)
+    for name in TEXT_EFFECT_NAMES:
+        context = EffectContext(0.25, 0, sample.shape[:2], "chars")
+        effected = EffectProcessor(
+            name, glyph_mode="unicode", effect_text="CODEX"
+        ).apply(sample, context)
+        if effected.cells is None or not renderers["chars"].render(
+            effected.rgb, effected.cells
         ):
-            fail(f"{name} pixel fallback contract self-test failed")
-        if not pixel_renderer.render(effected.rgb, effected.cells):
-            fail(f"{name} pixel fallback self-test failed")
+            fail(f"{name} Unicode text self-test failed")
+
+    gray_renderer = AnsiRenderer(
+        " .#", color=False, render_mode="chars"
+    )
+    gray_style = StyleProcessor("edge-glow").apply(sample)
+    gray_output = gray_renderer.render(gray_style)
+    try:
+        gray_output.decode("ascii")
+    except UnicodeDecodeError:
+        fail("Unicode-free grayscale self-test failed")
     sys.stdout.write("yt-ascii self-test: ok\n")
 
 

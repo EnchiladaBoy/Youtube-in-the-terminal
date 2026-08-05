@@ -388,7 +388,8 @@ def stage_source(
         app_dir / "requirements.txt",
     ]
     # Historical tags remain installable with the source layout they shipped:
-    # v0.4 adds styles, and v0.5 adds structured frames and terminal effects.
+    # v0.4 adds styles; v0.5 adds structured frames, backend capabilities,
+    # graphical effects, diagnostics, and managed updates.
     # Local source, edge, and unknown refs are always held to the latest layout.
     tag_version = (
         tuple(int(part) for part in ref[1:].split("."))
@@ -411,8 +412,10 @@ def stage_source(
     )
     if requires_effect_modules:
         required.extend([
+            app_dir / "yt_ascii_backends.py",
             app_dir / "yt_ascii_effects.py",
             app_dir / "yt_ascii_frames.py",
+            app_dir / "yt_ascii_diagnostics.py",
         ])
     requires_update_assets = (
         source_dir is not None

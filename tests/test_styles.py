@@ -2,45 +2,71 @@ import unittest
 
 import numpy as np
 
-from yt_ascii_renderer import AnsiRenderer
-from yt_ascii_styles import STYLE_NAMES, StyleProcessor
+from yt_ascii_effects import EFFECT_NAMES
+from yt_ascii_renderer import AnsiRenderer, BG
+from yt_ascii_styles import (
+    STYLE_ALIASES,
+    STYLE_NAMES,
+    STYLE_SPECS,
+    StyleProcessor,
+    StyleSpec,
+)
 
 
 class StyleProcessorTests(unittest.TestCase):
     def setUp(self):
-        self.frame = np.array(
-            [
-                [[0, 0, 0], [32, 64, 96], [255, 0, 0], [255, 255, 255]],
-                [[0, 255, 0], [0, 0, 255], [190, 120, 20], [11, 22, 33]],
-                [[40, 80, 120], [80, 120, 160], [120, 160, 200], [160, 200, 240]],
-                [[1, 2, 3], [99, 100, 101], [200, 201, 202], [253, 254, 255]],
-            ],
-            dtype=np.uint8,
-        )
+        rows, cols = 12, 20
+        y, x = np.indices((rows, cols), dtype=np.uint16)
+        self.frame = np.stack(
+            (
+                (x * 13 + y * 3) & 255,
+                (y * 21 + x * 5) & 255,
+                ((x + y) * 9) & 255,
+            ),
+            axis=2,
+        ).astype(np.uint8)
 
-    def test_registry_order_select_cycle_and_wrap(self):
+    def test_registry_is_static_treatments_only(self):
         self.assertEqual(
             STYLE_NAMES,
-            ("classic", "bayer", "duotone", "riso", "contour", "glitch"),
+            (
+                "classic",
+                "bayer",
+                "posterize",
+                "contour",
+                "edge-glow",
+                "ordered-dither",
+                "error-diffusion",
+                "duotone",
+                "two-tone",
+                "riso",
+            ),
         )
-        processor = StyleProcessor()
-        seen = [processor.name]
+        self.assertEqual(dict(STYLE_ALIASES), {})
+        self.assertEqual(tuple(spec.name for spec in STYLE_SPECS), STYLE_NAMES)
+        self.assertTrue(all(isinstance(spec, StyleSpec) for spec in STYLE_SPECS))
+        self.assertNotIn("glitch", STYLE_NAMES)
+        self.assertNotIn("wave", STYLE_NAMES)
+        self.assertNotIn("trails", STYLE_NAMES)
+        self.assertTrue(set(STYLE_NAMES).isdisjoint(EFFECT_NAMES))
+
+    def test_select_cycle_and_wrap(self):
+        processor = StyleProcessor("bayer")
+        self.assertEqual(processor.name, "bayer")
+        seen = [processor.select("classic")]
         for _ in range(len(STYLE_NAMES)):
             seen.append(processor.cycle())
         self.assertEqual(tuple(seen[:-1]), STYLE_NAMES)
         self.assertEqual(seen[-1], "classic")
-        self.assertEqual(processor.select("contour"), "contour")
-        self.assertEqual(processor.name, "contour")
-        processor.reset()
-        self.assertEqual(processor.name, "contour")
+        self.assertEqual(StyleProcessor("contour").name, "contour")
 
     def test_invalid_names_and_frames_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "unknown style"):
-            StyleProcessor("missing")
+        for name in ("missing", "glitch", "wave"):
+            with self.subTest(name=name), self.assertRaisesRegex(
+                ValueError, "unknown style"
+            ):
+                StyleProcessor(name)
         processor = StyleProcessor()
-        with self.assertRaisesRegex(ValueError, "unknown style"):
-            processor.select("missing")
-        self.assertEqual(processor.name, "classic")
         with self.assertRaises(TypeError):
             processor.apply([[[0, 0, 0]]])
         with self.assertRaises(ValueError):
@@ -51,9 +77,6 @@ class StyleProcessorTests(unittest.TestCase):
         ):
             with self.subTest(shape=invalid.shape), self.assertRaises(ValueError):
                 processor.apply(invalid)
-        for invalid_time in (None, "later", float("inf"), float("nan")):
-            with self.subTest(time=invalid_time), self.assertRaises(ValueError):
-                processor.apply(self.frame, invalid_time)
 
     def test_classic_is_zero_copy(self):
         processor = StyleProcessor("classic")
@@ -61,16 +84,24 @@ class StyleProcessorTests(unittest.TestCase):
         noncontiguous = self.frame[:, ::2]
         self.assertIs(processor.apply(noncontiguous), noncontiguous)
 
-    def test_every_transform_preserves_contract_without_mutating_input(self):
+    def test_every_treatment_is_deterministic_distinct_and_nonmutating(self):
+        payloads = {}
         for name in STYLE_NAMES:
             with self.subTest(style=name):
                 original = self.frame.copy()
-                output = StyleProcessor(name).apply(self.frame, 3.25)
+                processor = StyleProcessor(name)
+                first = processor.apply(self.frame)
+                repeat = StyleProcessor(name).apply(self.frame)
                 np.testing.assert_array_equal(self.frame, original)
-                self.assertEqual(output.shape, self.frame.shape)
-                self.assertEqual(output.dtype, np.uint8)
+                np.testing.assert_array_equal(first, repeat)
+                self.assertEqual(first.shape, self.frame.shape)
+                self.assertEqual(first.dtype, np.uint8)
                 if name != "classic":
-                    self.assertIsNot(output, self.frame)
+                    self.assertIsNot(first, self.frame)
+                    self.assertFalse(np.array_equal(first, self.frame))
+                payload = first.tobytes()
+                self.assertNotIn(payload, payloads)
+                payloads[payload] = name
 
     def test_empty_and_single_pixel_frames(self):
         frames = (
@@ -80,103 +111,84 @@ class StyleProcessorTests(unittest.TestCase):
         for name in STYLE_NAMES:
             for frame in frames:
                 with self.subTest(style=name, shape=frame.shape):
-                    output = StyleProcessor(name).apply(frame, 1.0)
+                    output = StyleProcessor(name).apply(frame)
                     self.assertEqual(output.shape, frame.shape)
                     self.assertEqual(output.dtype, np.uint8)
 
-    def test_bayer_has_four_brightness_levels_and_keeps_endpoints(self):
-        ramp = np.arange(256, dtype=np.uint8).reshape(16, 16)
-        frame = np.repeat(ramp[:, :, None], 3, axis=2)
-        output = StyleProcessor("bayer").apply(frame)
-        self.assertTrue(set(np.unique(output)).issubset({0, 85, 170, 255}))
-        self.assertEqual(tuple(output[0, 0]), (0, 0, 0))
-        self.assertEqual(tuple(output[-1, -1]), (255, 255, 255))
+    def test_posterize_has_five_exact_channel_levels(self):
+        values = np.arange(256, dtype=np.uint8)
+        frame = np.repeat(values[None, :, None], 3, axis=2)
+        output = StyleProcessor("posterize").apply(frame)
+        self.assertEqual(
+            set(np.unique(output).tolist()), {0, 64, 128, 191, 255}
+        )
 
-    def test_bayer_scales_color_channels_together(self):
-        frame = np.full((4, 4, 3), (30, 60, 90), dtype=np.uint8)
-        output = StyleProcessor("bayer").apply(frame)
-        colored = output[np.all(output > 0, axis=2)]
-        self.assertGreater(len(colored), 0)
-        for pixel in colored:
-            self.assertAlmostEqual(pixel[1] / pixel[0], 2.0, delta=0.08)
-            self.assertAlmostEqual(pixel[2] / pixel[0], 3.0, delta=0.12)
+    def test_edge_glow_detects_contours(self):
+        frame = np.zeros((9, 9, 3), dtype=np.uint8)
+        frame[:, 5:] = 255
+        output = StyleProcessor("edge-glow").apply(frame)
+        self.assertTrue(np.any(output[:, 4:6, 1] > 0))
+        self.assertGreater(int(output[:, 4:6].sum()), int(output[:, :2].sum()))
 
-    def test_bayer_retains_saturated_hues_without_gamut_clipping(self):
-        rng = np.random.default_rng(11)
-        frame = rng.integers(1, 256, size=(12, 12, 3), dtype=np.uint8)
-        output = StyleProcessor("bayer").apply(frame)
-        brightness = output.max(axis=2)
-        self.assertTrue(set(np.unique(brightness)) <= {0, 85, 170, 255})
+    def test_ordered_dither_uses_four_rgb_levels(self):
+        frame = np.full((8, 8, 3), 128, dtype=np.uint8)
+        output = StyleProcessor("ordered-dither").apply(frame)
+        self.assertTrue(np.all(output[:, :, 0] == output[:, :, 1]))
+        self.assertLessEqual(set(np.unique(output).tolist()), {0, 85, 170, 255})
 
-        visible = brightness > 0
-        source_ratios = frame[visible] / frame[visible].max(axis=1, keepdims=True)
-        output_ratios = output[visible] / output[visible].max(axis=1, keepdims=True)
-        np.testing.assert_allclose(output_ratios, source_ratios, atol=0.007)
+    def test_error_diffusion_conserves_tone_and_endpoints(self):
+        black = np.zeros((5, 7, 3), dtype=np.uint8)
+        white = np.full_like(black, 255)
+        self.assertFalse(StyleProcessor("error-diffusion").apply(black).any())
+        self.assertTrue(
+            np.all(StyleProcessor("error-diffusion").apply(white) == 255)
+        )
+        gray = np.full((5, 7, 3), 127, dtype=np.uint8)
+        output = StyleProcessor("error-diffusion").apply(gray)
+        expected_marks = gray.shape[0] * gray.shape[1] * 127 // 255
+        for channel in range(3):
+            self.assertEqual(
+                int(np.count_nonzero(output[:, :, channel])), expected_marks
+            )
 
-    def test_duotone_endpoints_and_smooth_midpoint(self):
-        frame = np.array([[[0, 0, 0], [128, 128, 128], [255, 255, 255]]], dtype=np.uint8)
+    def test_duotone_is_a_smooth_color_grade(self):
+        values = np.array((0, 128, 255), dtype=np.uint8)
+        frame = np.repeat(values[None, :, None], 3, axis=2)
         output = StyleProcessor("duotone").apply(frame)
         np.testing.assert_array_equal(output[0, 0], (15, 18, 42))
         np.testing.assert_array_equal(output[0, 2], (255, 196, 92))
         self.assertTrue(np.all(output[0, 1] > output[0, 0]))
         self.assertTrue(np.all(output[0, 1] < output[0, 2]))
 
-    def test_riso_uses_only_the_two_inks_and_overlap(self):
+    def test_two_tone_is_an_exact_threshold_palette(self):
+        values = np.array((0, 127, 128, 255), dtype=np.uint8)
+        frame = np.repeat(values[None, :, None], 3, axis=2)
+        output = StyleProcessor("two-tone").apply(frame)
+        np.testing.assert_array_equal(output[0, 0], (10, 18, 44))
+        np.testing.assert_array_equal(output[0, 1], (10, 18, 44))
+        np.testing.assert_array_equal(output[0, 2], (255, 184, 76))
+        np.testing.assert_array_equal(output[0, 3], (255, 184, 76))
+
+    def test_riso_uses_only_two_inks_and_their_overlap(self):
         colors = {
             (0, 0, 0),
             (238, 61, 52),
             (45, 103, 210),
             (188, 63, 145),
         }
-        frame = np.full((4, 4, 3), 255, dtype=np.uint8)
-        output = StyleProcessor("riso").apply(frame)
-        self.assertEqual({tuple(pixel) for pixel in output.reshape(-1, 3)}, {(188, 63, 145)})
-        mixed = StyleProcessor("riso").apply(self.frame)
-        self.assertTrue({tuple(pixel) for pixel in mixed.reshape(-1, 3)} <= colors)
-
-    def test_contour_suppresses_flat_areas_and_finds_an_edge(self):
-        processor = StyleProcessor("contour")
-        flat = np.full((7, 7, 3), 80, dtype=np.uint8)
-        self.assertFalse(processor.apply(flat).any())
-        edge = np.zeros((7, 7, 3), dtype=np.uint8)
-        edge[:, 4:] = 255
-        output = processor.apply(edge)
-        self.assertTrue(output[:, 3:5].any())
-        self.assertFalse(output[:, :2].any())
-        active = output[np.any(output > 0, axis=2)]
-        self.assertTrue(np.all(active[:, 0] <= 120))
-        self.assertTrue(np.all(active[:, 1] <= 245))
-        self.assertTrue(np.all(active[:, 2] <= 225))
-
-    def test_glitch_is_deterministic_at_eight_hertz(self):
-        frame = np.arange(12 * 20 * 3, dtype=np.uint8).reshape(12, 20, 3)
-        processor = StyleProcessor("glitch")
-        first = processor.apply(frame, 1.0)
-        repeat = processor.apply(frame, 1.0)
-        same_tick = processor.apply(frame, 1.124)
-        next_tick = processor.apply(frame, 1.125)
-        np.testing.assert_array_equal(first, repeat)
-        np.testing.assert_array_equal(first, same_tick)
-        self.assertFalse(np.array_equal(first, next_tick))
-        processor.reset()
-        np.testing.assert_array_equal(first, processor.apply(frame, 1.0))
-        self.assertFalse(np.array_equal(first, frame))
-
-    def test_glitch_dims_every_fourth_scanline(self):
-        frame = np.full((8, 4, 3), 200, dtype=np.uint8)
-        output = StyleProcessor("glitch").apply(frame, 0.0)
-        np.testing.assert_array_equal(output[3], np.full((4, 3), 150, dtype=np.uint8))
-        np.testing.assert_array_equal(output[7], np.full((4, 3), 150, dtype=np.uint8))
+        output = StyleProcessor("riso").apply(self.frame)
+        self.assertTrue({tuple(pixel) for pixel in output.reshape(-1, 3)} <= colors)
 
     def test_every_style_composes_with_all_render_and_reveal_modes(self):
-        frame = np.arange(4 * 6 * 3, dtype=np.uint8).reshape(4, 6, 3)
         renderer_options = (
-            {"color": True},
-            {"color": False},
-            {"color": True, "half_block": True},
+            {"color": True, "render_mode": "chars"},
+            {"color": False, "render_mode": "chars"},
+            {"color": True, "render_mode": "cells"},
+            {"color": False, "render_mode": "cells"},
+            {"color": True, "render_mode": "half-block"},
         )
         for style in STYLE_NAMES:
-            styled = StyleProcessor(style).apply(frame, 2.5)
+            styled = StyleProcessor(style).apply(self.frame)
             for options in renderer_options:
                 with self.subTest(style=style, options=options):
                     renderer = AnsiRenderer(
@@ -190,6 +202,17 @@ class StyleProcessorTests(unittest.TestCase):
                     )
                     self.assertTrue(all(isinstance(output, bytes) for output in outputs))
                     self.assertTrue(all(output for output in outputs))
+
+    def test_every_nonidentity_style_materially_changes_cells_output(self):
+        baseline = AnsiRenderer(render_mode="cells").render(self.frame)
+        for style in STYLE_NAMES[1:]:
+            with self.subTest(style=style):
+                output = AnsiRenderer(render_mode="cells").render(
+                    StyleProcessor(style).apply(self.frame)
+                )
+                self.assertNotEqual(output, baseline)
+                self.assertIn(BG, output)
+                output.decode("ascii")
 
 
 if __name__ == "__main__":

@@ -1,16 +1,31 @@
-"""Fast ANSI frame composition for :mod:`yt-ascii`.
+"""Fast, portable terminal frame composition for :mod:`yt-ascii`.
 
-The terminal protocol is byte-oriented, so frames are assembled in reusable
-``uint8`` record grids instead of fixed-width Unicode arrays.  Each cell gets a
-padded byte record; zero padding is removed once, in NumPy, after all cells and
-row trailers have been filled.  Palette and rain glyphs may contain any Unicode
-code point except NUL, which is reserved as the padding sentinel.
+The public rendering backends describe *how* an already-treated frame is
+emitted.  ``chars`` maps luminance to a character palette, ``cells`` paints
+ANSI background-coloured spaces, and ``half-block`` packs two source pixels
+into the Unicode upper-half-block glyph.  Keeping this choice separate from
+image effects makes it possible to add bitmap protocol renderers later without
+encoding protocol decisions into the effects themselves.
+
+The ANSI terminal protocol is byte-oriented, so frames are assembled in
+reusable ``uint8`` record grids instead of fixed-width Unicode arrays.  Each
+cell gets a padded byte record; zero padding is removed once, in NumPy, after
+all cells and row trailers have been filled.  Explicit character palettes and
+rain glyphs may contain any Unicode code point except NUL, which is reserved as
+the padding sentinel.  The default character and cell paths are ASCII-only.
 """
 
 from __future__ import annotations
 
+import unicodedata
+
 import numpy as np
 
+from yt_ascii_backends import (
+    RENDER_BACKENDS,
+    RenderBackendSpec,
+    get_render_backend,
+)
 from yt_ascii_frames import CellPlane
 
 
@@ -19,6 +34,8 @@ BG = b"\x1b[48;2;"
 RESET = b"\x1b[0m"
 CLEAR_EOL = b"\x1b[K"
 HALF_BLOCK = "▀".encode("utf-8")
+ASCII_PALETTE = " .:-=+*#%@"
+_RTL_BIDI_CLASSES = frozenset(("R", "AL", "AN", "RLE", "RLO", "RLI"))
 
 
 def _decimal_lut():
@@ -52,23 +69,75 @@ def _glyph_lut(text, label):
     return lut
 
 
-class AnsiRenderer:
-    """Compose character, half-block, scatter and rain frames as UTF-8 bytes.
+def _validate_rain_glyphs(text):
+    """Reject glyphs that cannot preserve one-column reveal geometry."""
+    if not isinstance(text, str):
+        raise TypeError("rain glyph set must be a string")
+    for position, glyph in enumerate(text, start=1):
+        category = unicodedata.category(glyph)
+        if (
+            (glyph != " " and glyph.isspace())
+            or not glyph.isprintable()
+            or category in ("Cc", "Cf", "Cs")
+            or category.startswith("M")
+            or unicodedata.combining(glyph)
+            or unicodedata.bidirectional(glyph) in _RTL_BIDI_CLASSES
+            or unicodedata.east_asian_width(glyph) in ("W", "F")
+        ):
+            raise ValueError(
+                "rain glyph set contains an unsupported code point at "
+                f"position {position} (U+{ord(glyph):04X}); only printable "
+                "single-cell left-to-right glyphs are allowed"
+            )
 
-    ``color=False`` accepts a two-dimensional FFmpeg ``gray`` frame or RGB24 as
-    a compatibility fallback. Color character mode expects ``(rows, cols, 3)``
-    RGB24, and half-block mode expects ``(rows * 2, cols, 3)`` RGB24.
+
+class AnsiRenderer:
+    """Compose portable ANSI terminal frames as UTF-8 bytes.
+
+    ``render_mode`` is the canonical selector.  The legacy ``half_block=True``
+    flag remains accepted for callers from before renderer modes were named.
+
+    ``color=False`` accepts a two-dimensional FFmpeg ``gray`` frame or RGB24.
+    In ``cells`` and ``half-block`` modes it selects the documented ASCII
+    character fallback, because uncoloured spaces or block glyphs would either
+    be blank or lose their two-colour meaning.  ``requested_render_mode`` keeps
+    the caller's selection for reporting; the operational ``render_mode`` and
+    ``backend`` always describe the composer actually used.
     """
 
-    def __init__(self, chars, *, color=True, half_block=False,
-                 rain_chars="01", rng=None):
-        if half_block and not color:
-            raise ValueError("half-block rendering requires color")
+    def __init__(self, chars=ASCII_PALETTE, *, color=True, half_block=False,
+                 render_mode=None, rain_chars="01", rng=None):
+        if render_mode is None:
+            render_mode = "half-block" if half_block else "chars"
+        backend = get_render_backend(render_mode)
+        if half_block and render_mode != "half-block":
+            raise ValueError(
+                "half_block=True conflicts with render_mode="
+                f"{render_mode!r}"
+            )
         self.color = color
-        self.half_block = half_block
+        self.requested_render_mode = backend.name
+        self.requested_backend = backend
+        self.effective_render_mode = (
+            "chars"
+            if backend.requires_color and not color
+            else backend.name
+        )
+        self.effective_backend = RENDER_BACKENDS[self.effective_render_mode]
+        # These established attributes are operational.  Code choosing source
+        # geometry or effect compatibility cannot accidentally act on a backend
+        # that has already fallen back to chars.
+        self.render_mode = self.effective_render_mode
+        self.backend = self.effective_backend
+        self.half_block = self.effective_render_mode == "half-block"
         self.palette_lut = _glyph_lut(chars, "palette")
         self.n_pal = self.palette_lut.shape[0] - 1
+        self.fallback_palette_lut = _glyph_lut(
+            ASCII_PALETTE, "ASCII fallback palette"
+        )
+        _validate_rain_glyphs(rain_chars)
         self.rain_lut = _glyph_lut(rain_chars, "rain glyph set")
+        self.fallback_rain_lut = _glyph_lut("01", "ASCII fallback rain set")
         self.rng = rng if rng is not None else np.random.default_rng()
 
         self._shape = None
@@ -153,13 +222,16 @@ class AnsiRenderer:
     def _cell_shape(self, frame):
         if frame.dtype != np.uint8:
             raise ValueError("frame must have dtype uint8")
-        if self.half_block:
+        if self.effective_render_mode == "half-block":
             if frame.ndim != 3 or frame.shape[2] != 3 or frame.shape[0] % 2:
                 raise ValueError("half-block frame must have shape (2*rows, cols, 3)")
             return frame.shape[0] // 2, frame.shape[1]
         if self.color:
             if frame.ndim != 3 or frame.shape[2] != 3:
-                raise ValueError("color frame must have shape (rows, cols, 3)")
+                raise ValueError(
+                    f"{self.render_mode} color frame must have shape "
+                    "(rows, cols, 3)"
+                )
             return frame.shape[0], frame.shape[1]
         if frame.ndim == 2:
             return frame.shape
@@ -171,6 +243,11 @@ class AnsiRenderer:
         """Validate and prepare a structured glyph plane for composition."""
         if cell_plane is None:
             return None
+        if not self.effective_backend.supports_cell_plane:
+            raise ValueError(
+                "structured text cell planes require render_mode='chars'; "
+                f"render_mode={self.effective_render_mode!r} is graphical"
+            )
         if not isinstance(cell_plane, CellPlane):
             raise TypeError("cell_plane must be a CellPlane or None")
 
@@ -234,26 +311,37 @@ class AnsiRenderer:
 
         shape = (rows, cols)
         row_suffix = RESET + CLEAR_EOL if colored or mode in (
-            "half-block", "fallback-chars"
+            "half-block", "cells"
         ) else CLEAR_EOL
-        rain_width = self.rain_lut.shape[1]
+        rain_lut = (
+            self.fallback_rain_lut
+            if self.requested_backend.requires_color and not self.color
+            else self.rain_lut
+        )
+        rain_width = rain_lut.shape[1]
         if mode == "half-block":
             normal_width = 41
+        elif mode == "cells":
+            normal_width = 20
         elif colored:
             normal_width = 19 + glyph_width
-            if mode == "fallback-chars":
-                normal_width += len(RESET)
         else:
             normal_width = glyph_width
-        rain_prefix = (
-            len(RESET)
-            if mode in ("half-block", "plane-chars", "fallback-chars")
-            else 0
-        )
-        rain_record_width = (
-            rain_prefix + 19 + rain_width + len(RESET)
-            if rain_workspace else 0
-        )
+        if rain_workspace and mode == "cells":
+            rain_record_width = len(RESET) + 20
+        elif rain_workspace and mode == "half-block":
+            rain_record_width = (
+                len(RESET) + 19 + 19 + len(HALF_BLOCK) + len(RESET)
+            )
+        elif rain_workspace and colored:
+            rain_record_width = (
+                (len(RESET) if mode == "plane-chars" else 0)
+                + 19 + rain_width + len(RESET)
+            )
+        elif rain_workspace:
+            rain_record_width = rain_width
+        else:
+            rain_record_width = 0
         record_width = max(normal_width, rain_record_width, len(row_suffix) + 1)
 
         template = np.zeros((rows, cols + 1, record_width), dtype=np.uint8)
@@ -268,14 +356,17 @@ class AnsiRenderer:
             cells[:, :, 33] = ord(";")
             cells[:, :, 37] = ord("m")
             cells[:, :, 38:41] = tuple(HALF_BLOCK)
+        elif mode == "cells":
+            cells[:, :, :7] = tuple(BG)
+            cells[:, :, 10] = ord(";")
+            cells[:, :, 14] = ord(";")
+            cells[:, :, 18] = ord("m")
+            cells[:, :, 19] = ord(" ")
         elif colored:
-            prefix = len(RESET) if mode == "fallback-chars" else 0
-            if prefix:
-                cells[:, :, :prefix] = tuple(RESET)
-            cells[:, :, prefix:prefix + 7] = tuple(FG)
-            cells[:, :, prefix + 10] = ord(";")
-            cells[:, :, prefix + 14] = ord(";")
-            cells[:, :, prefix + 18] = ord("m")
+            cells[:, :, :7] = tuple(FG)
+            cells[:, :, 10] = ord(";")
+            cells[:, :, 14] = ord(";")
+            cells[:, :, 18] = ord("m")
 
         trailers = template[:, cols]
         trailers[:, :len(row_suffix)] = tuple(row_suffix)
@@ -292,16 +383,22 @@ class AnsiRenderer:
     def _fill_cells(self, frame, rain_workspace, plane=None):
         if plane is None:
             rows, cols = self._cell_shape(frame)
-            glyph_lut = self.palette_lut
-            mode = (
-                "half-block" if self.half_block
-                else "color-chars" if self.color
-                else "gray-chars"
-            )
-            colored = self.color
+            if self.requested_backend.requires_color and not self.color:
+                glyph_lut = self.fallback_palette_lut
+            else:
+                glyph_lut = self.palette_lut
+            if self.effective_render_mode == "half-block":
+                mode = "half-block"
+            elif self.effective_render_mode == "cells":
+                mode = "cells"
+            elif self.color:
+                mode = "color-chars"
+            else:
+                mode = "gray-chars"
+            colored = mode in ("half-block", "cells", "color-chars")
         else:
             rows, cols, indices, glyph_lut, colors = plane
-            mode = "fallback-chars" if self.half_block else "plane-chars"
+            mode = "plane-chars"
             colored = self.color
         if not frame.flags.c_contiguous:
             frame = np.ascontiguousarray(frame)
@@ -320,18 +417,15 @@ class AnsiRenderer:
 
         if plane is not None:
             indices = indices.astype(np.intp, copy=False)
-            glyph_start = (
-                len(RESET) if mode == "fallback-chars" else 0
-            ) + (19 if colored else 0)
+            glyph_start = 19 if colored else 0
             if colored:
-                color_start = len(RESET) if mode == "fallback-chars" else 0
-                cells[:, :, color_start + 7:color_start + 10] = DECIMAL[
+                cells[:, :, 7:10] = DECIMAL[
                     colors[:, :, 0]
                 ]
-                cells[:, :, color_start + 11:color_start + 14] = DECIMAL[
+                cells[:, :, 11:14] = DECIMAL[
                     colors[:, :, 1]
                 ]
-                cells[:, :, color_start + 15:color_start + 18] = DECIMAL[
+                cells[:, :, 15:18] = DECIMAL[
                     colors[:, :, 2]
                 ]
             cells[:, :, glyph_start:glyph_start + glyph_lut.shape[1]] = (
@@ -339,7 +433,7 @@ class AnsiRenderer:
             )
             return
 
-        if self.half_block:
+        if mode == "half-block":
             top = frame[0::2]
             bottom = frame[1::2]
             cells[:, :, 7:10] = DECIMAL[top[:, :, 0]]
@@ -350,17 +444,23 @@ class AnsiRenderer:
             cells[:, :, 34:37] = DECIMAL[bottom[:, :, 2]]
             return
 
+        if mode == "cells":
+            cells[:, :, 7:10] = DECIMAL[frame[:, :, 0]]
+            cells[:, :, 11:14] = DECIMAL[frame[:, :, 1]]
+            cells[:, :, 15:18] = DECIMAL[frame[:, :, 2]]
+            return
+
         if self.color:
             luminance = (
                 0.299 * frame[:, :, 0]
                 + 0.587 * frame[:, :, 1]
                 + 0.114 * frame[:, :, 2]
             ).astype(np.int32)
-            indices = (luminance * self.n_pal) // 255
+            indices = (luminance * (glyph_lut.shape[0] - 1)) // 255
             cells[:, :, 7:10] = DECIMAL[frame[:, :, 0]]
             cells[:, :, 11:14] = DECIMAL[frame[:, :, 1]]
             cells[:, :, 15:18] = DECIMAL[frame[:, :, 2]]
-            cells[:, :, 19:19 + self.palette_lut.shape[1]] = self.palette_lut[indices]
+            cells[:, :, 19:19 + glyph_lut.shape[1]] = glyph_lut[indices]
             return
 
         if frame.ndim == 3:
@@ -369,11 +469,13 @@ class AnsiRenderer:
                 + 0.587 * frame[:, :, 1]
                 + 0.114 * frame[:, :, 2]
             ).astype(np.int32)
-            indices = (luminance * self.n_pal) // 255
+            indices = (luminance * (glyph_lut.shape[0] - 1)) // 255
         else:
-            indices = frame.astype(np.uint32) * self.n_pal // 255
+            indices = (
+                frame.astype(np.uint32) * (glyph_lut.shape[0] - 1) // 255
+            )
         indices = indices.astype(np.intp, copy=False)
-        cells[:, :, :self.palette_lut.shape[1]] = self.palette_lut[indices]
+        cells[:, :, :glyph_lut.shape[1]] = glyph_lut[indices]
 
     def _apply_visibility(self, visible):
         hidden = ~visible
@@ -382,7 +484,7 @@ class AnsiRenderer:
         cells = self._records[:, :self._shape[1]]
         blank = (
             RESET + b" "
-            if self._effective_mode in ("half-block", "fallback-chars")
+            if self._effective_mode in ("half-block", "cells")
             else b" "
         )
         blank_record = np.zeros(self._records.shape[2], dtype=np.uint8)
@@ -394,14 +496,59 @@ class AnsiRenderer:
         values = (
             255 - 200 * np.clip(distance[ys, xs] / trail, 0.0, 1.0)
         ).astype(np.intp)
-        glyphs = self.rng.integers(0, self.rain_lut.shape[0], size=ys.size)
+        rain_lut = (
+            self.fallback_rain_lut
+            if self.requested_backend.requires_color and not self.color
+            else self.rain_lut
+        )
+        glyphs = self.rng.integers(0, rain_lut.shape[0], size=ys.size)
 
         width = self._records.shape[2]
         rain = np.zeros((ys.size, width), dtype=np.uint8)
         position = 0
-        if self._effective_mode in (
-            "half-block", "plane-chars", "fallback-chars"
-        ):
+        if self._effective_mode == "cells":
+            rain[:, :len(RESET)] = tuple(RESET)
+            position += len(RESET)
+            rain[:, position:position + len(BG)] = tuple(BG)
+            rain[:, position + 7:position + 10] = DECIMAL[values]
+            rain[:, position + 10] = ord(";")
+            rain[:, position + 11:position + 14] = DECIMAL[values]
+            rain[:, position + 14] = ord(";")
+            rain[:, position + 15:position + 18] = DECIMAL[values]
+            rain[:, position + 18] = ord("m")
+            rain[:, position + 19] = ord(" ")
+            self._records[ys, xs] = rain
+            return
+        if self._effective_mode == "half-block":
+            rain[:, :len(RESET)] = tuple(RESET)
+            position += len(RESET)
+            rain[:, position:position + len(FG)] = tuple(FG)
+            rain[:, position + 7:position + 10] = DECIMAL[values]
+            rain[:, position + 10] = ord(";")
+            rain[:, position + 11:position + 14] = DECIMAL[values]
+            rain[:, position + 14] = ord(";")
+            rain[:, position + 15:position + 18] = DECIMAL[values]
+            rain[:, position + 18] = ord("m")
+            position += 19
+            lower_values = np.maximum(values - 48, 0)
+            rain[:, position:position + len(BG)] = tuple(BG)
+            rain[:, position + 7:position + 10] = DECIMAL[lower_values]
+            rain[:, position + 10] = ord(";")
+            rain[:, position + 11:position + 14] = DECIMAL[lower_values]
+            rain[:, position + 14] = ord(";")
+            rain[:, position + 15:position + 18] = DECIMAL[lower_values]
+            rain[:, position + 18] = ord("m")
+            position += 19
+            rain[:, position:position + len(HALF_BLOCK)] = tuple(HALF_BLOCK)
+            position += len(HALF_BLOCK)
+            rain[:, position:position + len(RESET)] = tuple(RESET)
+            self._records[ys, xs] = rain
+            return
+        if not self.color:
+            rain[:, :rain_lut.shape[1]] = rain_lut[glyphs]
+            self._records[ys, xs] = rain
+            return
+        if self._effective_mode == "plane-chars":
             rain[:, :len(RESET)] = tuple(RESET)
             position += len(RESET)
         rain[:, position:position + len(FG)] = tuple(FG)
@@ -412,8 +559,8 @@ class AnsiRenderer:
         rain[:, position + 15:position + 18] = DECIMAL[values]
         rain[:, position + 18] = ord("m")
         glyph_start = position + 19
-        glyph_end = glyph_start + self.rain_lut.shape[1]
-        rain[:, glyph_start:glyph_end] = self.rain_lut[glyphs]
+        glyph_end = glyph_start + rain_lut.shape[1]
+        rain[:, glyph_start:glyph_end] = rain_lut[glyphs]
         rain[:, glyph_end:glyph_end + len(RESET)] = tuple(RESET)
         self._records[ys, xs] = rain
 

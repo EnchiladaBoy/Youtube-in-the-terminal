@@ -1,9 +1,23 @@
+import re
 import unittest
 
 import numpy as np
 
 from yt_ascii_frames import CellPlane
-from yt_ascii_renderer import AnsiRenderer, CLEAR_EOL, RESET
+from yt_ascii_renderer import (
+    ASCII_PALETTE,
+    AnsiRenderer,
+    BG,
+    CLEAR_EOL,
+    FG,
+    HALF_BLOCK,
+    RENDER_BACKENDS,
+    RESET,
+    get_render_backend,
+)
+
+
+ANSI_CSI_RE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
 
 
 def legacy_chars(frame, chars, color=True):
@@ -69,6 +83,132 @@ def unsafe_cell_plane(glyph_indices, glyphs, fg_rgb=None):
 
 
 class RendererTests(unittest.TestCase):
+    def test_backend_registry_exposes_portable_capabilities(self):
+        self.assertEqual(tuple(RENDER_BACKENDS), ("chars", "cells", "half-block"))
+        self.assertFalse(get_render_backend("chars").unicode_dependent)
+        self.assertTrue(get_render_backend("chars").supports_cell_plane)
+        self.assertFalse(get_render_backend("cells").unicode_dependent)
+        self.assertFalse(get_render_backend("cells").supports_cell_plane)
+        self.assertTrue(get_render_backend("cells").requires_color)
+        self.assertTrue(get_render_backend("half-block").unicode_dependent)
+        self.assertEqual(get_render_backend("half-block").source_rows_per_cell, 2)
+
+        with self.assertRaisesRegex(ValueError, "unknown render mode"):
+            get_render_backend("kitty")
+        with self.assertRaisesRegex(TypeError, "must be a string"):
+            get_render_backend(None)
+
+    def test_default_chars_backend_is_ascii_only(self):
+        frame = np.arange(3 * len(ASCII_PALETTE), dtype=np.uint8).reshape(
+            1, len(ASCII_PALETTE), 3
+        )
+        renderer = AnsiRenderer(color=False)
+        output = renderer.render(frame)
+        self.assertEqual(renderer.render_mode, "chars")
+        self.assertEqual(renderer.effective_render_mode, "chars")
+        output.decode("ascii")
+        self.assertNotIn("▀".encode("utf-8"), output)
+
+    def test_cells_emit_background_colors_and_spaces_only(self):
+        frame = np.array(
+            [[[1, 2, 3], [254, 255, 0]], [[9, 10, 11], [99, 100, 101]]],
+            dtype=np.uint8,
+        )
+        output = AnsiRenderer(render_mode="cells").render(frame)
+        self.assertEqual(
+            output,
+            (
+                b"\x1b[48;2;1;2;3m "
+                b"\x1b[48;2;254;255;0m " + RESET + CLEAR_EOL + b"\n"
+                b"\x1b[48;2;9;10;11m "
+                b"\x1b[48;2;99;100;101m " + RESET + CLEAR_EOL
+            ),
+        )
+        self.assertNotIn(b"\x1b[38;2;", output)
+        self.assertNotIn("▀".encode("utf-8"), output)
+        output.decode("ascii")
+
+    def test_cells_no_color_has_explicit_ascii_character_fallback(self):
+        frame = np.array([[0, 127, 128, 255]], dtype=np.uint8)
+        renderer = AnsiRenderer(
+            "λ🚀", color=False, render_mode="cells", rain_chars="λ"
+        )
+        output = renderer.render(frame)
+        self.assertEqual(renderer.requested_render_mode, "cells")
+        self.assertEqual(renderer.requested_backend, get_render_backend("cells"))
+        self.assertEqual(renderer.render_mode, "chars")
+        self.assertEqual(renderer.backend, get_render_backend("chars"))
+        self.assertEqual(renderer.effective_render_mode, "chars")
+        self.assertEqual(renderer.effective_backend, get_render_backend("chars"))
+        self.assertEqual(output, b" ==@" + CLEAR_EOL)
+        output.decode("ascii")
+
+        plane = CellPlane(
+            np.array([[0, 1, 0, 1]], dtype=np.uint8), "AB"
+        )
+        self.assertEqual(renderer.render(frame, plane), b"ABAB" + CLEAR_EOL)
+
+        middle = renderer.render_rain(frame, 0.5)
+        middle.decode("ascii")
+        self.assertNotIn("λ".encode("utf-8"), middle)
+
+    def test_half_block_no_color_has_explicit_ascii_character_fallback(self):
+        frame = np.array([[0, 127, 128, 255]], dtype=np.uint8)
+        renderer = AnsiRenderer(
+            "λ🚀", color=False, render_mode="half-block", rain_chars="λ"
+        )
+        output = renderer.render(frame)
+        self.assertEqual(renderer.requested_render_mode, "half-block")
+        self.assertEqual(
+            renderer.requested_backend, get_render_backend("half-block")
+        )
+        self.assertEqual(renderer.render_mode, "chars")
+        self.assertEqual(renderer.backend, get_render_backend("chars"))
+        self.assertEqual(renderer.effective_render_mode, "chars")
+        self.assertEqual(renderer.effective_backend, get_render_backend("chars"))
+        self.assertEqual(output, b" ==@" + CLEAR_EOL)
+        output.decode("ascii")
+        self.assertNotIn(HALF_BLOCK, output)
+
+        middle = renderer.render_rain(frame, 0.5)
+        middle.decode("ascii")
+        self.assertNotIn("λ".encode("utf-8"), middle)
+        self.assertNotIn(HALF_BLOCK, middle)
+
+        plane = CellPlane(
+            np.array([[0, 1, 0, 1]], dtype=np.uint8), "AB"
+        )
+        self.assertEqual(renderer.render(frame, plane), b"ABAB" + CLEAR_EOL)
+
+    def test_cells_reveals_never_emit_decorative_glyphs(self):
+        frame = np.arange(8 * 3 * 3, dtype=np.uint8).reshape(8, 3, 3)
+        renderer = AnsiRenderer(
+            render_mode="cells", rain_chars="λЖ", rng=np.random.default_rng(8)
+        )
+        for output in (
+            renderer.render(frame),
+            renderer.render_scatter(frame, 0.5),
+            renderer.render_rain(frame, 0.5),
+        ):
+            with self.subTest(output=output[:40]):
+                output.decode("ascii")
+                self.assertNotIn(b"\x1b[38;2;", output)
+                self.assertNotIn("λ".encode("utf-8"), output)
+                self.assertNotIn("🚀".encode("utf-8"), output)
+                visible = ANSI_CSI_RE.sub(b"", output)
+                self.assertLessEqual(set(visible), {ord(" "), ord("\n")})
+                self.assertEqual(visible.count(b" "), 8 * 3)
+
+    def test_render_mode_and_legacy_half_block_selection(self):
+        canonical = AnsiRenderer(render_mode="half-block")
+        legacy = AnsiRenderer(half_block=True)
+        self.assertEqual(canonical.render_mode, "half-block")
+        self.assertEqual(canonical.backend, get_render_backend("half-block"))
+        self.assertTrue(legacy.half_block)
+
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            AnsiRenderer(half_block=True, render_mode="cells")
+
     def test_color_output_matches_legacy_renderer(self):
         rng = np.random.default_rng(20260803)
         boundary = np.array(
@@ -198,7 +338,7 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn(b"\x00", second_rain)
         self.assertEqual(renderer._workspace_key[4], len("λ".encode("utf-8")))
 
-    def test_cell_plane_forces_half_block_fallback_and_resets_background(self):
+    def test_graphical_backends_reject_structured_text_planes(self):
         frame = np.zeros((4, 2, 3), dtype=np.uint8)
         colors = np.array(
             [
@@ -210,17 +350,11 @@ class RendererTests(unittest.TestCase):
         plane = CellPlane(
             np.array([[0, 1], [1, 0]], dtype=np.uint8), "AB", colors
         )
-        output = AnsiRenderer("x", half_block=True).render(frame, plane)
-        self.assertNotIn(b"\x1b[48;2;", output)
-        self.assertNotIn("▀".encode("utf-8"), output)
-        self.assertEqual(output.count(RESET + b"\x1b[38;2;"), 4)
-        self.assertIn(RESET + b"\x1b[38;2;1;2;3mA", output)
-
-        with self.assertRaises(ValueError):
-            AnsiRenderer("x", half_block=True).render(
-                frame,
-                CellPlane(np.zeros((2, 2), dtype=np.uint8), "x"),
-            )
+        for render_mode in ("cells", "half-block"):
+            with self.subTest(render_mode=render_mode), self.assertRaisesRegex(
+                ValueError, "structured text cell planes require"
+            ):
+                AnsiRenderer(render_mode=render_mode).render(frame, plane)
 
     def test_renderer_revalidates_mutated_cell_plane_contract(self):
         frame = np.zeros((2, 3, 3), dtype=np.uint8)
@@ -307,7 +441,7 @@ class RendererTests(unittest.TestCase):
     def test_rain_endpoints_unicode_and_no_padding_bytes(self):
         frame = np.arange(5 * 7 * 3, dtype=np.uint8).reshape(5, 7, 3)
         renderer = AnsiRenderer(
-            " .#", rain_chars="λ🚀", rng=np.random.default_rng(8)
+            " .#", rain_chars="λЖ", rng=np.random.default_rng(8)
         )
         plain = renderer.render(frame)
         blank_row = b" " * 7 + RESET + CLEAR_EOL
@@ -317,32 +451,63 @@ class RendererTests(unittest.TestCase):
         self.assertNotIn(b"\x00", middle)
         self.assertEqual(renderer.render_rain(frame, 1), plain)
 
-    def test_half_block_rain_resets_background_before_trail(self):
+    def test_half_block_rain_preserves_half_block_backend_contract(self):
         frame = np.zeros((12, 4, 3), dtype=np.uint8)
         renderer = AnsiRenderer(
-            "x", half_block=True, rain_chars="λ", rng=np.random.default_rng(3)
+            "x", half_block=True, rain_chars="R", rng=np.random.default_rng(3)
         )
         middle = renderer.render_rain(frame, 0.5)
         self.assertIn(RESET + b"\x1b[38;2;", middle)
+        self.assertIn(BG, middle)
+        self.assertIn(HALF_BLOCK, middle)
+        self.assertNotIn(b"R", middle)
         self.assertNotIn(b"\x00", middle)
 
     def test_grayscale_reveal_endpoints(self):
         frame = np.arange(20, dtype=np.uint8).reshape(4, 5)
         renderer = AnsiRenderer(
-            " .#", color=False, rain_chars="λ", rng=np.random.default_rng(9)
+            " .#", color=False, rain_chars="R", rng=np.random.default_rng(9)
         )
         plain = renderer.render(frame)
         self.assertEqual(renderer.render_scatter(frame, 1), plain)
         renderer.reset_reveal()
+        middle = renderer.render_rain(frame, 0.5)
+        self.assertNotIn(FG, middle)
+        self.assertNotIn(BG, middle)
+        self.assertIn(b"R", middle)
         self.assertEqual(renderer.render_rain(frame, 1), plain)
+
+    def test_no_color_cell_plane_rain_never_reintroduces_truecolor(self):
+        frame = np.zeros((8, 2, 3), dtype=np.uint8)
+        colors = np.full((8, 2, 3), (20, 40, 60), dtype=np.uint8)
+        plane = CellPlane(np.zeros((8, 2), dtype=np.uint8), "P", colors)
+        renderer = AnsiRenderer(
+            "x", color=False, rain_chars="R", rng=np.random.default_rng(13)
+        )
+        renderer._rain = {
+            "cols": 2,
+            "duration": np.ones(2),
+            "offset": np.zeros(2),
+        }
+        output = renderer.render_rain(frame, 0.5, plane)
+        self.assertNotIn(FG, output)
+        self.assertNotIn(BG, output)
+        self.assertIn(b"R", output)
 
     def test_invalid_frames_and_nul_glyphs_are_rejected(self):
         with self.assertRaises(ValueError):
             AnsiRenderer("\x00")
         with self.assertRaises(ValueError):
             AnsiRenderer("x", rain_chars="\x00")
-        with self.assertRaises(ValueError):
-            AnsiRenderer("x", color=False, half_block=True)
+        for unsafe in ("🚀", "A\u0301", "א"):
+            with self.subTest(rain_chars=unsafe), self.assertRaisesRegex(
+                ValueError, "single-cell left-to-right"
+            ):
+                AnsiRenderer("x", rain_chars=unsafe)
+        fallback = AnsiRenderer("x", color=False, half_block=True)
+        self.assertEqual(fallback.requested_render_mode, "half-block")
+        self.assertEqual(fallback.render_mode, "chars")
+        self.assertEqual(fallback.effective_render_mode, "chars")
         with self.assertRaises(ValueError):
             AnsiRenderer("x").render(np.zeros((2, 2), dtype=np.uint8))
         with self.assertRaises(ValueError):

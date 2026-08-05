@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -6,6 +7,7 @@ import runpy
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 import unittest
@@ -168,10 +170,15 @@ class CommandAndOutputTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as raised:
                 CORE["main"]()
         self.assertEqual(raised.exception.code, 0)
+        self.assertIn("--render", output.getvalue())
+        self.assertIn("cells", output.getvalue())
+        self.assertIn("half-block", output.getvalue())
         self.assertIn("--style", output.getvalue())
         self.assertIn("--effect", output.getvalue())
         self.assertIn("--check-update", output.getvalue())
         self.assertIn("--update", output.getvalue())
+        self.assertIn("--diagnostics-json", output.getvalue())
+        self.assertIn("--diagnostics-duration", output.getvalue())
         dependency_check.assert_not_called()
 
     def test_version_defaults_to_source_and_skips_dependency_checks(self):
@@ -208,8 +215,8 @@ class CommandAndOutputTests(unittest.TestCase):
         def run(current):
             seen.append((current.url, current.style, current.effect))
             if current.url == "first":
-                current.style = "bayer"
-                current.effect = "geometry"
+                current.style = "posterize"
+                current.effect = "pixelate"
 
         with mock.patch.dict(globals_, {
             "parse_args": lambda: args,
@@ -224,7 +231,7 @@ class CommandAndOutputTests(unittest.TestCase):
             seen,
             [
                 ("first", "classic", "none"),
-                ("second", "bayer", "geometry"),
+                ("second", "posterize", "pixelate"),
             ],
         )
 
@@ -274,6 +281,48 @@ class CommandAndOutputTests(unittest.TestCase):
             "fps=30,scale=80:24:flags=fast_bilinear",
         )
 
+    def test_spawn_video_diagnostics_capture_is_opt_in(self):
+        stream = object()
+        capture = SimpleNamespace(stream=stream)
+        diagnostics = SimpleNamespace(
+            new_ffmpeg_capture=mock.Mock(return_value=capture),
+            consume_ffmpeg_capture=mock.Mock(),
+        )
+        process = SimpleNamespace()
+        info = {"video": "https://media.example/stream"}
+        globals_ = CORE["spawn_video"].__globals__
+        with mock.patch.dict(globals_, {
+            "find_ffmpeg": lambda: "ffmpeg",
+            "RECONNECT_FLAGS": ["-reconnect", "1"],
+        }), mock.patch.object(
+            subprocess, "Popen", return_value=process
+        ) as popen:
+            result = CORE["spawn_video"](
+                info, 60, 240, 68, 0, diagnostics
+            )
+        self.assertIs(result, process)
+        self.assertEqual(
+            popen.call_args.args[0],
+            [
+                "ffmpeg", "-loglevel", "info", "-nostats", "-benchmark",
+                "-reconnect", "1", "-i", "https://media.example/stream",
+                "-an",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-vf",
+                "fps=60,scale=240:68:flags=fast_bilinear", "-",
+            ],
+        )
+        self.assertIs(popen.call_args.kwargs["stderr"], stream)
+        self.assertIs(process._ytascii_diagnostics_capture, capture)
+
+    def test_decoder_diagnostics_capture_is_consumed_once_after_reap(self):
+        capture = object()
+        process = SimpleNamespace(_ytascii_diagnostics_capture=capture)
+        diagnostics = SimpleNamespace(consume_ffmpeg_capture=mock.Mock())
+        CORE["consume_video_diagnostics"](process, diagnostics)
+        CORE["consume_video_diagnostics"](process, diagnostics)
+        diagnostics.consume_ffmpeg_capture.assert_called_once_with(capture)
+        self.assertIsNone(process._ytascii_diagnostics_capture)
+
     def test_terminal_frame_has_text_stream_fallback(self):
         output = io.StringIO()
         globals_ = CORE["write_terminal_frame"].__globals__
@@ -300,6 +349,54 @@ class CommandAndOutputTests(unittest.TestCase):
         self.assertEqual(binary.flushes, 1)
         output.write.assert_not_called()
 
+    def test_terminal_diagnostics_preserve_exact_frame_bytes(self):
+        class Timer:
+            def __enter__(self):
+                events.append("start")
+
+            def __exit__(self, *_args):
+                events.append("stop")
+
+        events = []
+        binary = io.BytesIO()
+        output = mock.Mock(buffer=binary)
+        diagnostics = SimpleNamespace(
+            timer=lambda stage: Timer(), increment=mock.Mock()
+        )
+        globals_ = CORE["write_terminal_frame"].__globals__
+        with mock.patch.object(globals_["sys"], "stdout", output):
+            size = CORE["write_terminal_frame"](
+                "λ".encode("utf-8"), "status", diagnostics
+            )
+        expected = b"\x1b[H\xce\xbb\nstatus\x1b[K"
+        self.assertEqual(binary.getvalue(), expected)
+        self.assertEqual(size, len(expected))
+        self.assertEqual(events, ["start", "stop"])
+        diagnostics.increment.assert_not_called()
+
+    def test_terminal_diagnostics_flag_empty_or_nul_frame_bodies(self):
+        class Timer:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                pass
+
+        for body in (b"", b"A\x00B"):
+            with self.subTest(body=body):
+                binary = io.BytesIO()
+                diagnostics = SimpleNamespace(
+                    timer=lambda _stage: Timer(), increment=mock.Mock()
+                )
+                globals_ = CORE["write_terminal_frame"].__globals__
+                with mock.patch.object(
+                    globals_["sys"], "stdout", mock.Mock(buffer=binary)
+                ):
+                    CORE["write_terminal_frame"](body, "status", diagnostics)
+                diagnostics.increment.assert_called_once_with(
+                    "output_corruption"
+                )
+
     def test_style_effect_and_palette_cli_contract(self):
         self.assertEqual(CORE["PALETTES"]["binary"], " 01")
         self.assertEqual(CORE["PALETTES"]["numbers"], " 123456789")
@@ -309,12 +406,17 @@ class CommandAndOutputTests(unittest.TestCase):
         globals_ = CORE["parse_args"].__globals__
         with mock.patch.object(globals_["sys"], "argv", ["yt-ascii"]):
             args = CORE["parse_args"]()
+            self.assertEqual(args.render, "chars")
             self.assertEqual(args.style, "classic")
             self.assertEqual(args.effect, "none")
             self.assertEqual(args.effect_glyphs, "ascii")
             self.assertEqual(args.effect_speed, 1.0)
             self.assertEqual(args.effect_seed, 0)
             self.assertEqual(args.effect_text, "YTASCII")
+            self.assertEqual(args.rain_chars, "ascii")
+            self.assertTrue(
+                all(ord(char) < 128 for char in CORE["RAIN_CHARSETS"]["ascii"])
+            )
             self.assertFalse(args.update)
             self.assertFalse(args.check_update)
             self.assertFalse(args.no_update_check)
@@ -332,7 +434,7 @@ class CommandAndOutputTests(unittest.TestCase):
             globals_["sys"],
             "argv",
             [
-                "yt-ascii", "--effect", "voronoi",
+                "yt-ascii", "--effect", "terminal-hud",
                 "--effect-glyphs", "unicode",
                 "--effect-speed", "1.5", "--effect-seed", "-9",
                 "--effect-text", "YT λ",
@@ -347,8 +449,275 @@ class CommandAndOutputTests(unittest.TestCase):
                 args.effect_seed,
                 args.effect_text,
             ),
-            ("voronoi", "unicode", 1.5, -9, "YT λ"),
+            ("terminal-hud", "unicode", 1.5, -9, "YT λ"),
         )
+
+    def test_render_cli_aliases_fallback_and_effect_compatibility(self):
+        globals_ = CORE["parse_args"].__globals__
+        for render_mode in CORE["RENDER_MODES"]:
+            with self.subTest(render_mode=render_mode), mock.patch.object(
+                globals_["sys"],
+                "argv",
+                ["yt-ascii", "--render", render_mode],
+            ):
+                args = CORE["parse_args"]()
+                self.assertEqual(args.render, render_mode)
+        with mock.patch.object(
+            globals_["sys"], "argv", ["yt-ascii", "--pixels"]
+        ):
+            args = CORE["parse_args"]()
+        self.assertEqual(args.render, "half-block")
+        self.assertTrue(args.pixels)
+
+        for alias, canonical in CORE["STYLE_ALIASES"].items():
+            with self.subTest(style_alias=alias), mock.patch.object(
+                globals_["sys"],
+                "argv",
+                ["yt-ascii", "--style", alias],
+            ):
+                self.assertEqual(CORE["parse_args"]().style, canonical)
+
+        for alias, canonical in CORE["EFFECT_ALIASES"].items():
+            with self.subTest(alias=alias), mock.patch.object(
+                globals_["sys"],
+                "argv",
+                ["yt-ascii", "--effect", alias],
+            ):
+                self.assertEqual(CORE["parse_args"]().effect, canonical)
+
+        migrations = (
+            (["--style", "glitch"], "classic", "glitch"),
+            (["--effect", "posterize"], "posterize", "none"),
+            (["--effect", "edge-glow"], "edge-glow", "none"),
+            (["--effect", "ordered-dither"], "ordered-dither", "none"),
+            (["--effect", "error-diffusion"], "error-diffusion", "none"),
+            (["--effect", "duotone"], "two-tone", "none"),
+            (["--effect", "poster-press"], "posterize", "none"),
+        )
+        for options, style, effect in migrations:
+            with self.subTest(migration=options), mock.patch.object(
+                globals_["sys"], "argv", ["yt-ascii", *options]
+            ):
+                args = CORE["parse_args"]()
+                self.assertEqual((args.style, args.effect), (style, effect))
+
+        invalid = (
+            ["--pixels", "--render", "cells"],
+            ["--render", "cells", "--effect", "digital-rain"],
+            ["--render", "half-block", "--effect", "terminal-hud"],
+            ["--style", "glitch", "--effect", "wave"],
+            ["--style", "riso", "--effect", "posterize"],
+        )
+        for options in invalid:
+            with self.subTest(options=options), mock.patch.object(
+                globals_["sys"], "argv", ["yt-ascii", *options]
+            ), mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    CORE["parse_args"]()
+                self.assertEqual(raised.exception.code, 2)
+
+        # The explicitly documented no-color path has already resolved these
+        # graphical requests to chars, so text-specific output stays visible.
+        with mock.patch.object(
+            globals_["sys"],
+            "argv",
+            [
+                "yt-ascii", "--render", "cells", "--no-color",
+                "--effect", "digital-rain",
+            ],
+        ):
+            args = CORE["parse_args"]()
+        self.assertEqual(args.render, "cells")
+        self.assertEqual(args.effect, "digital-rain")
+        self.assertEqual(
+            CORE["_effective_render_mode"](args.render, not args.no_color),
+            "chars",
+        )
+
+    def test_diagnostics_cli_requires_a_new_report_and_explicit_playback(self):
+        globals_ = CORE["parse_args"].__globals__
+        with tempfile.TemporaryDirectory() as directory:
+            report = str(Path(directory) / "report.json")
+            with mock.patch.object(
+                globals_["sys"],
+                "argv",
+                [
+                    "yt-ascii", "https://example.test/watch",
+                    "--diagnostics-json", report,
+                    "--diagnostics-warmup", "1.5",
+                    "--diagnostics-duration", "2.25",
+                ],
+            ):
+                args = CORE["parse_args"]()
+            self.assertEqual(args.diagnostics_json, report)
+            self.assertEqual(args.diagnostics_warmup, 1.5)
+            self.assertEqual(args.diagnostics_duration, 2.25)
+
+            existing = Path(directory) / "existing.json"
+            existing.touch()
+            invalid = (
+                ["--diagnostics-duration", "1"],
+                ["--diagnostics-json", report],
+                [
+                    "https://example.test/watch", "--self-test",
+                    "--diagnostics-json", report,
+                ],
+                [
+                    "https://example.test/watch", "--update",
+                    "--diagnostics-json", report,
+                ],
+                [
+                    "https://example.test/watch", "--diagnostics-json",
+                    str(existing),
+                ],
+            )
+            for options in invalid:
+                with self.subTest(options=options), mock.patch.object(
+                    globals_["sys"], "argv", ["yt-ascii", *options]
+                ), mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        CORE["parse_args"]()
+                    self.assertEqual(raised.exception.code, 2)
+
+    def test_diagnostics_cli_rejects_nonfinite_and_out_of_range_times(self):
+        globals_ = CORE["parse_args"].__globals__
+        with tempfile.TemporaryDirectory() as directory:
+            report = str(Path(directory) / "report.json")
+            cases = (
+                ("--diagnostics-warmup", "-1"),
+                ("--diagnostics-warmup", "nan"),
+                ("--diagnostics-warmup", "inf"),
+                ("--diagnostics-duration", "0"),
+                ("--diagnostics-duration", "-1"),
+                ("--diagnostics-duration", "nan"),
+                ("--diagnostics-duration", "inf"),
+            )
+            for option, value in cases:
+                argv = [
+                    "yt-ascii", "https://example.test/watch",
+                    "--diagnostics-json", report, option, value,
+                ]
+                with self.subTest(option=option, value=value), \
+                        mock.patch.object(globals_["sys"], "argv", argv), \
+                        mock.patch.object(
+                            globals_["sys"], "stderr", io.StringIO()
+                        ):
+                    with self.assertRaises(SystemExit) as raised:
+                        CORE["parse_args"]()
+                    self.assertEqual(raised.exception.code, 2)
+
+    def test_diagnostics_module_is_not_imported_on_the_disabled_path(self):
+        args = SimpleNamespace(diagnostics_json=None)
+        worker = mock.Mock(return_value="end_of_stream")
+        globals_ = CORE["run"].__globals__
+        with mock.patch.dict(globals_, {"_run_playback": worker}), \
+                mock.patch.dict(
+                    sys.modules, {"yt_ascii_diagnostics": None}
+                ):
+            result = CORE["run"](args, "update-handle")
+        self.assertIsNone(result)
+        worker.assert_called_once_with(args, "update-handle")
+
+    def test_diagnostics_finalize_after_playback_and_on_errors(self):
+        args = SimpleNamespace(
+            diagnostics_json="new-report.json",
+            diagnostics_warmup=1.0,
+            diagnostics_duration=2.0,
+            fps=30,
+            width=80,
+            height=24,
+            max_res=480,
+            no_color=False,
+            pixels=False,
+            no_audio=True,
+            eight_bit=False,
+            style="classic",
+            effect="none",
+            effect_glyphs="ascii",
+            scatter=False,
+            rain=False,
+        )
+        calls = []
+
+        class RecordingDiagnostics:
+            def __init__(self, path, warmup, duration, **metadata):
+                calls.append(
+                    ("init", path, warmup, duration, metadata)
+                )
+
+            def finalize(self, **result):
+                calls.append(("finalize", result))
+
+        module = SimpleNamespace(PlaybackDiagnostics=RecordingDiagnostics)
+        globals_ = CORE["run"].__globals__
+
+        def playback(*_args, **_kwargs):
+            calls.append(("cleanup_complete",))
+            return "duration"
+
+        with mock.patch.dict(sys.modules, {"yt_ascii_diagnostics": module}), \
+                mock.patch.dict(globals_, {"_run_playback": playback}):
+            CORE["run"](args)
+        self.assertEqual(calls[-2:], [
+            ("cleanup_complete",),
+            ("finalize", {"exit_reason": "duration"}),
+        ])
+        metadata = calls[0][-1]
+        self.assertNotIn("url", metadata["source"])
+        self.assertNotIn("effect_text", metadata["config"])
+        self.assertEqual(
+            metadata["config"]["effect_text_sha256"],
+            hashlib.sha256(b"YTASCII").hexdigest(),
+        )
+        self.assertEqual(metadata["config"]["render_backend"], "chars")
+        self.assertEqual(
+            metadata["config"]["effective_render_backend"], "chars"
+        )
+        self.assertNotIn("pixels", metadata["config"])
+        self.assertNotIn("presentation", metadata["config"])
+        self.assertEqual(metadata["profile"], "ordinary")
+
+        # Redirection is a sink even when the parent shell happens to be tmux.
+        config_globals = CORE["_diagnostics_config"].__globals__
+        with mock.patch.dict(os.environ, {"TMUX": "session"}), \
+                mock.patch.object(
+                    config_globals["sys"], "stdout",
+                    SimpleNamespace(isatty=lambda: False),
+                ):
+            self.assertEqual(
+                CORE["_diagnostics_config"](args)["output_environment"],
+                "sink",
+            )
+        with mock.patch.dict(os.environ, {"TMUX": "session"}), \
+                mock.patch.object(
+                    config_globals["sys"], "stdout",
+                    SimpleNamespace(isatty=lambda: True),
+                ):
+            self.assertEqual(
+                CORE["_diagnostics_config"](args)["output_environment"],
+                "tmux",
+            )
+
+        calls.clear()
+        args.fps, args.width, args.height = 60, 240, 68
+        with mock.patch.dict(sys.modules, {"yt_ascii_diagnostics": module}), \
+                mock.patch.dict(globals_, {"_run_playback": playback}):
+            CORE["run"](args)
+        self.assertEqual(calls[0][-1]["profile"], "stress")
+
+        calls.clear()
+        def failing_playback(*_args, **_kwargs):
+            calls.append(("cleanup_complete",))
+            raise RuntimeError("playback failure")
+
+        with mock.patch.dict(sys.modules, {"yt_ascii_diagnostics": module}), \
+                mock.patch.dict(globals_, {"_run_playback": failing_playback}):
+            with self.assertRaisesRegex(RuntimeError, "playback failure"):
+                CORE["run"](args)
+        self.assertEqual(calls[-1], (
+            "finalize",
+            {"exit_reason": "error", "error_type": "RuntimeError"},
+        ))
 
     def test_effect_text_cli_validation_is_mode_aware_and_strict(self):
         globals_ = CORE["parse_args"].__globals__
@@ -601,6 +970,51 @@ class CommandAndOutputTests(unittest.TestCase):
             ):
                 CORE["effect_speed_type"](value)
 
+    def test_geometry_reveal_duration_and_rain_glyphs_are_strict(self):
+        globals_ = CORE["parse_args"].__globals__
+        invalid_options = (
+            ("--width", "0"),
+            ("--width", "-1"),
+            ("--height", "0"),
+            ("--max-res", "-1"),
+            ("--scatter-secs", "0"),
+            ("--scatter-secs", "nan"),
+            ("--rain-secs", "-1"),
+            ("--rain-secs", "inf"),
+            ("--rain-chars", ""),
+            ("--rain-chars", "🚀"),
+            ("--rain-chars", "e\u0301"),
+            ("--rain-chars", "א"),
+        )
+        for option, value in invalid_options:
+            with self.subTest(option=option, value=value), \
+                    mock.patch.object(
+                        globals_["sys"], "argv", ["yt-ascii", option, value]
+                    ), mock.patch.object(
+                        globals_["sys"], "stderr", io.StringIO()
+                    ):
+                with self.assertRaises(SystemExit) as raised:
+                    CORE["parse_args"]()
+                self.assertEqual(raised.exception.code, 2)
+
+        with mock.patch.object(
+            globals_["sys"],
+            "argv",
+            [
+                "yt-ascii", "--width", "1", "--height", "1",
+                "--max-res", "1", "--scatter-secs", "0.1",
+                "--rain-secs", "0.1", "--rain-chars", "λЖ",
+            ],
+        ):
+            args = CORE["parse_args"]()
+        self.assertEqual(
+            (
+                args.width, args.height, args.max_res,
+                args.scatter_secs, args.rain_secs, args.rain_chars,
+            ),
+            (1, 1, 1, 0.1, 0.1, "λЖ"),
+        )
+
     def test_status_shows_style_effect_and_controls(self):
         for width in (120, 80):
             with self.subTest(width=width):
@@ -611,12 +1025,12 @@ class CommandAndOutputTests(unittest.TestCase):
                     width,
                     paused=False,
                     style="riso",
-                    effect="geometry",
+                    effect="pixelate",
                 )
                 visible = status.removeprefix("\x1b[0m")
                 self.assertLessEqual(len(visible), width)
                 self.assertIn("style:riso", visible)
-                self.assertIn("effect:geometry", visible)
+                self.assertIn("effect:pixelate", visible)
                 self.assertIn("s:style", visible)
                 self.assertIn("e:effect", visible)
 
@@ -643,10 +1057,11 @@ class CommandAndOutputTests(unittest.TestCase):
             160,
             paused=False,
             style="classic",
-            effect="geometry",
+            effect="pixelate",
             pixel_fallback=True,
         )
-        self.assertIn("effect:geometry pixels→chars", status)
+        self.assertIn("render:half-block→chars", status)
+        self.assertIn("effect:pixelate", status)
 
     def test_keyboard_backends_accept_only_lowercase_style_and_effect_keys(self):
         globals_ = CORE["_read_keys_windows"].__globals__
@@ -733,6 +1148,9 @@ class NonSuspendResizeTests(unittest.TestCase):
             "effect_speed": 1.0,
             "effect_seed": 0,
             "effect_text": "YTASCII",
+            "diagnostics_json": None,
+            "diagnostics_warmup": None,
+            "diagnostics_duration": None,
         }
         values.update(overrides)
         return SimpleNamespace(**values)
@@ -747,6 +1165,184 @@ class NonSuspendResizeTests(unittest.TestCase):
             "video": "fixture",
             "audio": None,
         }
+
+    def test_diagnostic_duration_stops_after_a_presented_frame_then_finalizes(self):
+        # Keep native-extension modules present in ``sys.modules`` when the
+        # temporary diagnostics-module patch restores its snapshot.
+        import numpy  # noqa: F401
+        import yt_ascii_effects  # noqa: F401
+        import yt_ascii_frames  # noqa: F401
+        import yt_ascii_renderer  # noqa: F401
+        import yt_ascii_styles  # noqa: F401
+
+        calls = []
+        instances = []
+
+        class Timer:
+            def __init__(self, stage):
+                self.stage = stage
+
+            def __enter__(self):
+                calls.append(("timer_start", self.stage))
+
+            def __exit__(self, *_args):
+                calls.append(("timer_end", self.stage))
+
+        class RecordingDiagnostics:
+            def __init__(self, *_args, **_kwargs):
+                self.frames = 0
+                instances.append(self)
+
+            def timer(self, stage, **_kwargs):
+                return Timer(stage)
+
+            def register_child(self, process, role):
+                calls.append(("child_start", role, process.pid))
+
+            def unregister_child(self, process):
+                if process is not None:
+                    calls.append(("child_stop", process.pid))
+
+            def set_source_metadata(self, **metadata):
+                calls.append(("source", metadata))
+
+            def set_output_geometry(self, **metadata):
+                calls.append(("output_geometry", metadata))
+                return "ordinary"
+
+            def event(self, name, **fields):
+                calls.append(("event", name, fields))
+
+            def increment(self, name, amount=1):
+                calls.append(("increment", name, amount))
+
+            def mark_first_frame(self):
+                calls.append(("first_frame",))
+
+            def record_frame(self, **metrics):
+                self.frames += 1
+                calls.append(("frame", metrics))
+
+            def record_timing(self, name, seconds, **_kwargs):
+                calls.append(("timing", name, seconds))
+
+            def tick(self):
+                calls.append(("tick",))
+                return self.frames >= 1
+
+            def sample_resources(self, *, force=False):
+                calls.append(("resources", force))
+
+            def record_cleanup(self, seconds, **result):
+                calls.append(("cleanup", seconds, result))
+
+            def finalize(self, **result):
+                calls.append(("finalize", result))
+
+        process = self.FakeProcess(video=True)
+        args = self.args(
+            diagnostics_json="new-report.json",
+            diagnostics_warmup=0.0,
+            diagnostics_duration=0.01,
+        )
+        globals_ = CORE["run"].__globals__
+        module = SimpleNamespace(PlaybackDiagnostics=RecordingDiagnostics)
+        replacements = {
+            "IS_WINDOWS": True,
+            "probe": lambda *_args: self.info(),
+            "spawn_video": lambda *_args: process,
+            "find_ffplay": lambda: None,
+        }
+        with mock.patch.dict(sys.modules, {"yt_ascii_diagnostics": module}), \
+                mock.patch.dict(globals_, replacements), \
+                mock.patch.object(globals_["os"], "isatty", return_value=False), \
+                mock.patch.object(
+                    globals_["time"], "monotonic", return_value=0.0
+                ), \
+                mock.patch.object(globals_["time"], "sleep"), \
+                mock.patch.object(
+                    globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)
+                ), \
+                mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
+                mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+            CORE["run"](args)
+
+        self.assertEqual(len(instances), 1)
+        self.assertIn(("child_start", "video", process.pid), calls)
+        self.assertIn(("child_stop", process.pid), calls)
+        frames = [item for item in calls if item[0] == "frame"]
+        self.assertEqual(len(frames), 1)
+        self.assertGreater(frames[0][1]["output_bytes"], 0)
+        self.assertEqual(frames[0][1]["dropped"], 0)
+        source = next(item[1] for item in calls if item[0] == "source")
+        self.assertEqual(
+            (source["width"], source["height"], source["duration_seconds"]),
+            (16, 9, 0.0),
+        )
+        self.assertIsNone(source["live"])
+        self.assertIsNone(source["fps"])
+        self.assertEqual(calls[-1], (
+            "finalize", {"exit_reason": "duration"}
+        ))
+        cleanup_index = next(
+            index for index, item in enumerate(calls) if item[0] == "cleanup"
+        )
+        self.assertTrue(calls[cleanup_index][2]["terminal_restored"])
+        self.assertTrue(calls[cleanup_index][2]["children_reaped"])
+        self.assertLess(cleanup_index, len(calls) - 1)
+
+    def test_one_frame_cells_playback_uses_graphical_backend_end_to_end(self):
+        process = self.FakeProcess(video=True)
+        spawned = []
+        key_reads = 0
+
+        def spawn_video(*args, **_kwargs):
+            spawned.append(args)
+            return process
+
+        def read_keys(_fd):
+            nonlocal key_reads
+            key_reads += 1
+            return [] if key_reads == 1 else ["q"]
+
+        args = self.args(
+            no_color=False,
+            render="cells",
+            effect="wave",
+            width=2,
+            height=2,
+        )
+        output = io.StringIO()
+        globals_ = CORE["run"].__globals__
+        replacements = {
+            "_CAN_SUSPEND": False,
+            "IS_WINDOWS": True,
+            "probe": lambda *_args: self.info(),
+            "spawn_video": spawn_video,
+            "find_ffplay": lambda: None,
+            "read_keys": read_keys,
+        }
+        with mock.patch.dict(globals_, replacements), \
+                mock.patch.object(globals_["os"], "isatty", return_value=True), \
+                mock.patch.object(
+                    globals_["time"], "monotonic", return_value=0.0
+                ), \
+                mock.patch.object(globals_["time"], "sleep"), \
+                mock.patch.object(
+                    globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)
+                ), \
+                mock.patch.object(globals_["sys"], "stdout", output), \
+                mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+            CORE["run"](args)
+
+        self.assertTrue(process.exited)
+        self.assertEqual(len(spawned), 1)
+        # Cells decode at one source row per terminal row, unlike half-block.
+        self.assertEqual(spawned[0][2:4], (2, 2))
+        payload = output.getvalue()
+        self.assertIn("\x1b[48;2;", payload)
+        self.assertNotIn("▀", payload)
+        self.assertIn("render:cells", payload)
 
     def test_style_cycle_redraws_paused_frame_without_restarting_reveal(self):
         import yt_ascii_effects
@@ -772,11 +1368,11 @@ class NonSuspendResizeTests(unittest.TestCase):
                     pass
 
                 def cycle(self):
-                    self.name = "bayer"
+                    self.name = "posterize"
                     return self.name
 
-                def apply(self, frame, time_seconds=0.0):
-                    apply_calls.append((self.name, time_seconds))
+                def apply(self, frame):
+                    apply_calls.append(self.name)
                     return frame
 
             class RecordingRenderer(base_renderer):
@@ -854,10 +1450,8 @@ class NonSuspendResizeTests(unittest.TestCase):
                     reveal_resets,
                     effect_resets,
                 ) = exercise(key_batch)
-                self.assertEqual(args.style, "bayer")
-                self.assertEqual(
-                    apply_calls, [("classic", 0.0), ("bayer", 0.0)]
-                )
+                self.assertEqual(args.style, "posterize")
+                self.assertEqual(apply_calls, ["classic", "posterize"])
                 self.assertEqual(len(reveal_fractions), 2)
                 self.assertEqual(reveal_fractions[0], reveal_fractions[1])
                 self.assertEqual(len(reveal_resets), 1)
@@ -881,8 +1475,8 @@ class NonSuspendResizeTests(unittest.TestCase):
             def reset(self, reason):
                 resets.append(reason)
 
-            def cycle(self):
-                self.name = "geometry"
+            def cycle(self, render_mode="chars"):
+                self.name = "pixelate"
                 resets.append("select")
                 return self.name
 
@@ -927,7 +1521,7 @@ class NonSuspendResizeTests(unittest.TestCase):
                 mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
             CORE["run"](args)
 
-        self.assertEqual(args.effect, "geometry")
+        self.assertEqual(args.effect, "pixelate")
         self.assertEqual(configs, [("unicode", 1.5, 9, "YT λ")])
         self.assertEqual(resets, ["source", "select"])
         self.assertEqual(len(contexts), 2)
@@ -1097,8 +1691,8 @@ class NonSuspendResizeTests(unittest.TestCase):
             def reset(self, reason):
                 self.resets.append(reason)
 
-            def cycle(self):
-                self.name = "geometry"
+            def cycle(self, render_mode="chars"):
+                self.name = "pixelate"
                 return self.name
 
             def apply(self, _frame, _context):
@@ -1132,16 +1726,16 @@ class NonSuspendResizeTests(unittest.TestCase):
                 CORE["run"](args)
                 CORE["run"](args)
 
-        self.assertEqual(args.effect, "geometry")
+        self.assertEqual(args.effect, "pixelate")
         self.assertEqual(
-            [item.initial_name for item in instances], ["none", "geometry"]
+            [item.initial_name for item in instances], ["none", "pixelate"]
         )
         self.assertEqual([item.resets for item in instances], [["source"], ["source"]])
 
-    def test_style_receives_decoded_frame_timestamps(self):
+    def test_style_stage_is_timestamp_free(self):
         import yt_ascii_styles
 
-        apply_times = []
+        apply_calls = []
         key_call = 0
 
         class RecordingStyleProcessor:
@@ -1154,8 +1748,8 @@ class NonSuspendResizeTests(unittest.TestCase):
             def cycle(self):
                 raise AssertionError("unexpected style cycle")
 
-            def apply(self, frame, time_seconds=0.0):
-                apply_times.append(time_seconds)
+            def apply(self, frame):
+                apply_calls.append(True)
                 return frame
 
         def read_keys(_fd):
@@ -1164,7 +1758,7 @@ class NonSuspendResizeTests(unittest.TestCase):
             return ["q"] if key_call == 3 else []
 
         process = self.FakeProcess(video=True)
-        args = self.args(style="glitch", fps=10)
+        args = self.args(style="riso", fps=10)
         globals_ = CORE["run"].__globals__
         replacements = {
             "_CAN_SUSPEND": False,
@@ -1184,7 +1778,7 @@ class NonSuspendResizeTests(unittest.TestCase):
                 mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
             CORE["run"](args)
 
-        self.assertEqual(apply_times, [0.0, 0.1])
+        self.assertEqual(apply_calls, [True, True])
 
     def test_pause_resize_resume_spawns_exactly_one_replacement(self):
         spawned = []

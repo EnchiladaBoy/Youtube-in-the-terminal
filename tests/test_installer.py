@@ -43,9 +43,13 @@ def minimal_source(root):
     (root / "install.py").write_text("# installer\n", encoding="utf-8")
     (root / "yt-ascii").write_text("print('ok')\n", encoding="utf-8")
     (root / "yt_ascii_renderer.py").write_text("# renderer\n", encoding="utf-8")
+    (root / "yt_ascii_backends.py").write_text("# backends\n", encoding="utf-8")
     (root / "yt_ascii_styles.py").write_text("# styles\n", encoding="utf-8")
     (root / "yt_ascii_effects.py").write_text("# effects\n", encoding="utf-8")
     (root / "yt_ascii_frames.py").write_text("# frames\n", encoding="utf-8")
+    (root / "yt_ascii_diagnostics.py").write_text(
+        "# diagnostics\n", encoding="utf-8"
+    )
     (root / "yt_ascii_update.py").write_text("# updater\n", encoding="utf-8")
     (root / "requirements.txt").write_text("# none\n", encoding="utf-8")
     (root / install.EDGE_BUILD_FILE).write_text("1\n", encoding="ascii")
@@ -305,8 +309,13 @@ class ArchiveTests(unittest.TestCase):
             self.assertFalse((app / "yt_ascii_effects.py").exists())
             self.assertFalse((app / "yt_ascii_frames.py").exists())
 
-    def test_source_requires_effect_and_frame_modules(self):
-        for missing in ("yt_ascii_effects.py", "yt_ascii_frames.py"):
+    def test_source_requires_backend_effect_frame_and_diagnostics_modules(self):
+        for missing in (
+            "yt_ascii_backends.py",
+            "yt_ascii_effects.py",
+            "yt_ascii_frames.py",
+            "yt_ascii_diagnostics.py",
+        ):
             with self.subTest(missing=missing), tempfile.TemporaryDirectory() as directory:
                 base = Path(directory)
                 source = minimal_source(base / "source")
@@ -314,7 +323,7 @@ class ArchiveTests(unittest.TestCase):
                 with self.assertRaisesRegex(install.InstallerError, missing):
                     install.stage_source(base / "version", source_dir=source)
 
-    def test_v05_and_edge_archives_require_effect_and_frame_modules(self):
+    def test_v05_and_edge_archives_require_pivot_modules(self):
         base_entries = [
             ("repo/yt-ascii", b"entry"),
             ("repo/yt_ascii_renderer.py", b"# renderer\n"),
@@ -322,19 +331,25 @@ class ArchiveTests(unittest.TestCase):
             ("repo/requirements.txt", b"# requirements\n"),
         ]
         cases = [
+            ({"ref": "v0.5.0"}, "yt_ascii_backends.py"),
             ({"ref": "v0.5.0"}, "yt_ascii_effects.py"),
             ({"ref": "v0.5.0"}, "yt_ascii_frames.py"),
+            ({"ref": "v0.5.0"}, "yt_ascii_diagnostics.py"),
+            ({"ref": "edge", "edge": True}, "yt_ascii_backends.py"),
             ({"ref": "edge", "edge": True}, "yt_ascii_effects.py"),
             ({"ref": "edge", "edge": True}, "yt_ascii_frames.py"),
+            ({"ref": "edge", "edge": True}, "yt_ascii_diagnostics.py"),
         ]
         for index, (options, missing) in enumerate(cases):
             entries = list(base_entries)
-            present = (
-                "yt_ascii_frames.py"
-                if missing == "yt_ascii_effects.py"
-                else "yt_ascii_effects.py"
-            )
-            entries.append((f"repo/{present}", b"# present\n"))
+            for present in (
+                "yt_ascii_backends.py",
+                "yt_ascii_effects.py",
+                "yt_ascii_frames.py",
+                "yt_ascii_diagnostics.py",
+            ):
+                if present != missing:
+                    entries.append((f"repo/{present}", b"# present\n"))
             payload = zip_payload(entries)
             with self.subTest(options=options, missing=missing), \
                  tempfile.TemporaryDirectory() as directory, \
@@ -357,9 +372,11 @@ class ArchiveTests(unittest.TestCase):
         base_entries = [
             ("repo/yt-ascii", b"entry"),
             ("repo/yt_ascii_renderer.py", b"# renderer\n"),
+            ("repo/yt_ascii_backends.py", b"# backends\n"),
             ("repo/yt_ascii_styles.py", b"# styles\n"),
             ("repo/yt_ascii_effects.py", b"# effects\n"),
             ("repo/yt_ascii_frames.py", b"# frames\n"),
+            ("repo/yt_ascii_diagnostics.py", b"# diagnostics\n"),
             ("repo/requirements.txt", b"# requirements\n"),
             ("repo/install.py", b"# installer\n"),
             ("repo/yt_ascii_update.py", b"# updater\n"),
@@ -398,9 +415,11 @@ class ArchiveTests(unittest.TestCase):
             ("repo/yt-ascii", b"entry"),
             ("repo/install.py", b"# installer\n"),
             ("repo/yt_ascii_renderer.py", b"# renderer\n"),
+            ("repo/yt_ascii_backends.py", b"# backends\n"),
             ("repo/yt_ascii_styles.py", b"# styles\n"),
             ("repo/yt_ascii_effects.py", b"# effects\n"),
             ("repo/yt_ascii_frames.py", b"# frames\n"),
+            ("repo/yt_ascii_diagnostics.py", b"# diagnostics\n"),
             ("repo/yt_ascii_update.py", b"# updater\n"),
             ("repo/requirements.txt", b"# requirements\n"),
         ]
