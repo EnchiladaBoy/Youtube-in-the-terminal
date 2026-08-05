@@ -95,12 +95,11 @@ same effect definitions work with both portable ASCII and opt-in single-cell
 Unicode glyph schemas. `none` must take the original v0.4 path without copying
 the frame or changing its output bytes.
 
-The completed cell/type stage adds `number-field`, `glyph-grid`,
-`vector-field`, `word-field`, `inscription`, and `type-echo` through that same
-cell-plane contract. They cover luminance deciles, a tone-weighted seeded
-lattice, quantized Sobel directions, configurable word density, contour text,
-and stateless time-derived type echoes; no new renderer or output path is
-involved.
+The completed effects roadmap adds the cell/type, print/textile, adaptive,
+temporal, and interface/material families through that same contract. The 33
+effects cover terminal-native glyph fields, deterministic seeded layouts,
+adaptive color regions, analytic animation, and one bounded history effect;
+no family adds another renderer or output path.
 
 Procedural layouts are derived from an explicit integer seed. Animation uses
 decoded video time rather than wall-clock time, and temporal or size-dependent
@@ -130,8 +129,13 @@ The candidate targets at a 240 x 136 RGB input are:
 | `none` path | Byte-identical output and no more than 3% median regression |
 | Each stateless effect in isolation | Below 2.0 ms median |
 | `afterimage` in isolation | Below 2.5 ms median |
-| Style plus effect processing | Below 4.0 ms median |
 | Full composed processing and ANSI construction | Below 6.0 ms median |
+
+Run the canonical ASCII and Unicode/custom-text budget gate with:
+
+```sh
+python benchmarks/benchmark_renderer.py --width 240 --height 68 --rounds 50 --check-budgets
+```
 
 On 5 August 2026, a 50-round-per-group run on the local four-core Apple AArch64
 Linux host with Python 3.14.6 and NumPy 2.5.1 produced these median times. The
@@ -139,33 +143,81 @@ composed column includes `duotone`, the named effect, and ANSI construction:
 
 | Effect | Isolated | Composed |
 |---|---:|---:|
-| `none` | 0.001 ms | 2.141 ms |
-| `geometry` | 0.326 ms | 1.709 ms |
-| `contour-glyph` | 0.212 ms | 1.580 ms |
-| `hatch` | 0.125 ms | 1.489 ms |
-| `dotfield` | 0.126 ms | 1.511 ms |
-| `tile-mosaic` | 0.309 ms | 2.293 ms |
-| `wave-lines` | 0.373 ms | 2.592 ms |
-| `voronoi` | 0.439 ms | 2.497 ms |
-| `afterimage` | 0.502 ms | 2.626 ms |
-| `number-field` | 0.062 ms | 1.442 ms |
-| `glyph-grid` | 0.126 ms | 1.491 ms |
-| `vector-field` | 0.234 ms | 1.610 ms |
-| `word-field` | 0.157 ms | 1.523 ms |
-| `inscription` | 0.203 ms | 1.572 ms |
-| `type-echo` | 0.254 ms | 1.654 ms |
+| `none` | 0.001 ms | 2.204 ms |
+| `geometry` | 0.357 ms | 1.811 ms |
+| `contour-glyph` | 0.217 ms | 1.678 ms |
+| `hatch` | 0.133 ms | 1.595 ms |
+| `dotfield` | 0.131 ms | 1.601 ms |
+| `tile-mosaic` | 0.334 ms | 2.396 ms |
+| `wave-lines` | 0.390 ms | 2.679 ms |
+| `voronoi` | 0.459 ms | 2.614 ms |
+| `afterimage` | 0.542 ms | 2.776 ms |
+| `number-field` | 0.064 ms | 1.513 ms |
+| `glyph-grid` | 0.130 ms | 1.567 ms |
+| `vector-field` | 0.245 ms | 1.681 ms |
+| `word-field` | 0.164 ms | 1.623 ms |
+| `inscription` | 0.216 ms | 1.670 ms |
+| `type-echo` | 0.268 ms | 1.746 ms |
+| `error-diffusion` | 0.124 ms | 1.562 ms |
+| `halftone` | 0.183 ms | 1.629 ms |
+| `poster-press` | 1.220 ms | 3.587 ms |
+| `cross-stitch` | 0.164 ms | 1.619 ms |
+| `weave` | 0.121 ms | 1.553 ms |
+| `kilim` | 0.153 ms | 1.610 ms |
+| `quadtree` | 1.692 ms | 3.857 ms |
+| `patchwork` | 0.901 ms | 2.994 ms |
+| `digital-rain` | 0.416 ms | 1.917 ms |
+| `ribbon-scan` | 0.412 ms | 2.696 ms |
+| `pixel-sort` | 1.208 ms | 3.189 ms |
+| `stardust` | 0.301 ms | 1.732 ms |
+| `type-collage` | 0.234 ms | 1.595 ms |
+| `engraving` | 0.312 ms | 1.684 ms |
+| `brickwork` | 0.129 ms | 1.490 ms |
+| `prism` | 1.183 ms | 3.227 ms |
+| `hologram` | 0.291 ms | 2.449 ms |
+| `glass` | 0.791 ms | 2.900 ms |
+| `terminal-hud` | 0.104 ms | 1.479 ms |
 
 The matching `duotone` plus half-block renderer control, without constructing
-or applying an effect processor, measured 2.128 ms. The `none` path was 0.63%
-slower in this run, within the 3% overhead budget. Every effect met the
-candidate targets on this host. These results exclude
-FFmpeg, terminal writes, terminal parsing, and pacing, and are not guarantees
-for other machines. Absolute timings remain informational rather than CI gates
-because host variance would make a millisecond threshold flaky; deterministic
-output, shape/dtype contracts, bounded state, and legacy-byte equality are CI
-gates. Future recorded results must likewise name the hardware and
-NumPy/Python versions. The authoritative effect list and promotion rules are
-in [`EFFECTS.md`](EFFECTS.md).
+or applying an effect processor, measured 2.249 ms. The `none` path was 1.97%
+faster in this run, within the 3% overhead budget. Every ASCII effect met the
+candidate targets on this host.
+
+The same run exercised all 21 glyph-owning effects with Unicode schemas and
+custom text (`YT λ`), rather than benchmarking only the ASCII fallback:
+
+| Unicode effect | Isolated | Composed |
+|---|---:|---:|
+| `geometry` | 0.333 ms | 1.857 ms |
+| `contour-glyph` | 0.210 ms | 1.744 ms |
+| `hatch` | 0.117 ms | 1.636 ms |
+| `dotfield` | 0.128 ms | 1.635 ms |
+| `number-field` | 0.063 ms | 1.564 ms |
+| `glyph-grid` | 0.125 ms | 1.691 ms |
+| `vector-field` | 0.236 ms | 1.782 ms |
+| `word-field` | 0.155 ms | 1.721 ms |
+| `inscription` | 0.203 ms | 1.788 ms |
+| `type-echo` | 0.252 ms | 1.846 ms |
+| `error-diffusion` | 0.116 ms | 1.656 ms |
+| `halftone` | 0.176 ms | 1.759 ms |
+| `cross-stitch` | 0.159 ms | 1.698 ms |
+| `weave` | 0.120 ms | 1.636 ms |
+| `kilim` | 0.145 ms | 1.736 ms |
+| `digital-rain` | 0.381 ms | 2.022 ms |
+| `stardust` | 0.296 ms | 1.945 ms |
+| `type-collage` | 0.235 ms | 1.812 ms |
+| `engraving` | 0.318 ms | 1.834 ms |
+| `brickwork` | 0.128 ms | 1.699 ms |
+| `terminal-hud` | 0.100 ms | 1.637 ms |
+
+Every Unicode case also met the same isolated and composed budgets. These
+results exclude FFmpeg, terminal writes, terminal parsing, and pacing, and are
+not guarantees for other machines. Absolute timings remain informational
+instead of CI gates because host variance would make a millisecond threshold
+flaky; deterministic output, shape/dtype contracts, bounded state, and
+legacy-byte equality are CI gates. Future recorded results must likewise name
+the hardware and NumPy/Python versions. The authoritative effect list and
+promotion rules are in [`EFFECTS.md`](EFFECTS.md).
 
 ## Baseline that motivated the changes
 

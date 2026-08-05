@@ -4,7 +4,7 @@ Watch YouTube videos as terminal art on Linux, macOS, and Windows. The
 `yt-ascii` command provides:
 
 - ASCII rendering in 24-bit color or grayscale, plus color half-block pixels;
-- six live video styles, structural terminal effects, and two animated reveals;
+- six live video styles, 33 structural terminal effects, and two animated reveals;
 - optional audio and an 8-bit audio mode; and
 - pause, seek, and percentage-jump controls during playback.
 
@@ -121,6 +121,25 @@ Press `e` during playback to cycle through this fixed order:
 | `word-field` | Repeats a phrase with luminance-controlled text density |
 | `inscription` | Writes a decorated phrase along detected image contours |
 | `type-echo` | Layers deterministic time-offset echoes of a phrase |
+| `error-diffusion` | Quantizes tone into a deterministic binary glyph field |
+| `halftone` | Rebuilds tone with a clustered-dot screen |
+| `poster-press` | Simulates reduced ink levels and offset color plates |
+| `cross-stitch` | Converts tone into alternating diagonal stitches |
+| `weave` | Interlaces light and dark warp-and-weft marks |
+| `kilim` | Applies a mirrored chevron-and-diamond textile pattern |
+| `quadtree` | Subdivides image detail into adaptive mean-color blocks |
+| `patchwork` | Reconstructs the frame from seeded irregular patches |
+| `digital-rain` | Drops deterministic glyph heads and fading column trails |
+| `ribbon-scan` | Sweeps warped highlight ribbons across a dimmed frame |
+| `pixel-sort` | Sorts luminance inside animated horizontal blocks |
+| `stardust` | Drifts a luminance-controlled field of twinkling particles |
+| `type-collage` | Animates staggered and reversed bands of configured text |
+| `engraving` | Combines contour strokes with directional hatching |
+| `brickwork` | Rebuilds tone as staggered bricks and mortar |
+| `prism` | Splits and recombines displaced color channels |
+| `hologram` | Maps tone to scanlined cyan/magenta light and sparkles |
+| `glass` | Refracts the frame through frosted offset blocks |
+| `terminal-hud` | Overlays terminal-native borders, reticles, ticks, and time |
 
 The shared controls are:
 
@@ -132,8 +151,8 @@ The shared controls are:
 | `--effect-text TEXT` | Phrase used by text effects (default `YTASCII`) |
 
 Static effects ignore the speed multiplier, and effects without a procedural
-layout ignore the seed. Effects other than `word-field`, `inscription`, and
-`type-echo` ignore `--effect-text`.
+layout ignore the seed. Effects other than `word-field`, `inscription`,
+`type-echo`, and `type-collage` ignore `--effect-text`.
 
 Effect selection composes with `--style`: the style transforms RGB first, then
 the structural effect interprets that styled frame. Seeds and video timestamps
@@ -142,14 +161,18 @@ with `e` remains active for later videos in the same interactive session, as
 does the configured effect text.
 
 `geometry`, `contour-glyph`, `hatch`, `dotfield`, `number-field`, `glyph-grid`,
-`vector-field`, `word-field`, `inscription`, and `type-echo` produce
-character-cell structures. If `--pixels` is active, those ten effects
+`vector-field`, `word-field`, `inscription`, `type-echo`, `error-diffusion`,
+`halftone`, `cross-stitch`, `weave`, `kilim`, `digital-rain`, `stardust`,
+`type-collage`, `engraving`, `brickwork`, and `terminal-hud` produce
+character-cell structures. If `--pixels` is active, those 21 effects
 temporarily fall back to character rendering and the status line shows
-`pixels→chars`; cycling to `none` or an RGB-only effect
-restores half-block pixels. `--effect-glyphs` selects the schema for those
-glyph effects. `tile-mosaic`, `wave-lines`, `voronoi`, and `afterimage`
-transform RGB and therefore retain pixel mode and the normal `--palette` /
-`--chars` behavior.
+`pixels→chars`. `--effect-glyphs` selects their ASCII or Unicode schema.
+
+`tile-mosaic`, `wave-lines`, `voronoi`, `afterimage`, `poster-press`,
+`quadtree`, `patchwork`, `ribbon-scan`, `pixel-sort`, `prism`, `hologram`, and
+`glass` transform RGB. They retain half-block pixels and the normal
+`--palette` / `--chars` behavior; cycling to `none` also restores the ordinary
+renderer path.
 
 `word-field` repeats the configured phrase with a seeded row stagger and uses
 image luminance as its text density: black stays blank and white shows the
@@ -159,6 +182,19 @@ contours in row-major order. `type-echo` repeats `TEXT + ": "` or `TEXT + "∶ "
 and analytically derives up to three faded row-band echoes from
 `floor(video_time × speed × 6)`. It is stateless, so seeking to the same time
 reconstructs the same output and pausing freezes it.
+
+The print and textile family covers accumulated binary diffusion, clustered
+halftone dots, reduced-color press plates, stitched diagonals, woven lines, and
+kilim-like mirrored motifs. Adaptive `quadtree` and `patchwork` treatments use
+source-region means while keeping their subdivision and seeded layout
+deterministic.
+
+`digital-rain`, `ribbon-scan`, `pixel-sort`, and `stardust` derive motion from
+video time, so pause and seek retain the shared reconstruction contract.
+`type-collage` applies the configured phrase to staggered label bands.
+`engraving`, `brickwork`, `prism`, `hologram`, `glass`, and `terminal-hud` are
+terminal-native material and interface approximations rather than physical
+rendering or tracked overlays.
 
 `--effect-text` is preserved exactly, without Unicode normalization, and may
 contain 1 to 253 code points, including at least one non-space character.
@@ -180,6 +216,11 @@ yt-ascii https://youtu.be/jNQXAC9IVRw --effect vector-field --effect-glyphs unic
 yt-ascii https://youtu.be/jNQXAC9IVRw --effect word-field --effect-text TERMINAL --effect-seed 5
 yt-ascii https://youtu.be/jNQXAC9IVRw --effect inscription --effect-text "HELLO WORLD" --effect-glyphs unicode
 yt-ascii https://youtu.be/jNQXAC9IVRw --effect type-echo --effect-text AFTERIMAGE --effect-speed 1.5
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect halftone --effect-glyphs unicode
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect patchwork --effect-seed 42 --pixels
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect digital-rain --effect-speed 1.5
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect type-collage --effect-text "LIVE TYPE"
+yt-ascii https://youtu.be/jNQXAC9IVRw --effect terminal-hud --effect-glyphs unicode
 ```
 
 These effects are independent, terminal-native implementations of established

@@ -88,6 +88,25 @@ EFFECT_NAMES = (
     "word-field",
     "inscription",
     "type-echo",
+    "error-diffusion",
+    "halftone",
+    "poster-press",
+    "cross-stitch",
+    "weave",
+    "kilim",
+    "quadtree",
+    "patchwork",
+    "digital-rain",
+    "ribbon-scan",
+    "pixel-sort",
+    "stardust",
+    "type-collage",
+    "engraving",
+    "brickwork",
+    "prism",
+    "hologram",
+    "glass",
+    "terminal-hud",
 )
 GLYPH_EFFECT_NAMES = frozenset(
     (
@@ -101,6 +120,17 @@ GLYPH_EFFECT_NAMES = frozenset(
         "word-field",
         "inscription",
         "type-echo",
+        "error-diffusion",
+        "halftone",
+        "cross-stitch",
+        "weave",
+        "kilim",
+        "digital-rain",
+        "stardust",
+        "type-collage",
+        "engraving",
+        "brickwork",
+        "terminal-hud",
     )
 )
 DEFAULT_EFFECT_TEXT = "YTASCII"
@@ -834,7 +864,8 @@ def parse_args():
                    help="glyph set for structural effects: ascii or unicode "
                         "(default: ascii)")
     p.add_argument("--effect-text", default=DEFAULT_EFFECT_TEXT, metavar="TEXT",
-                   help="text used by word, inscription, and echo effects "
+                   help="text used by word, inscription, echo, and collage "
+                        "effects "
                         f"(default: {DEFAULT_EFFECT_TEXT})")
     p.add_argument("--effect-speed", type=effect_speed_type, default=1.0,
                    metavar="N",
@@ -1544,6 +1575,96 @@ def self_test():
             if not renderer.render(temporal.rgb, temporal.cells):
                 fail("afterimage temporal self-test failed")
 
+    # Exercise every roadmap effect with a deliberately varied fixture.  The
+    # ordinary registry loop above proves shape and renderer compatibility;
+    # this additionally catches an implementation that accidentally produces
+    # an entirely blank structural result.
+    rows, cols = np.indices((24, 32), dtype=np.uint16)
+    structure_sample = np.stack(
+        (
+            (cols * 37 + rows * 17) % 256,
+            (cols * 11 + rows * 53) % 256,
+            ((cols ^ rows) * 29) % 256,
+        ),
+        axis=2,
+    ).astype(np.uint8)
+    structure_context = EffectContext(
+        video_time=0.125,
+        frame_sequence=0,
+        cell_shape=structure_sample.shape[:2],
+        requested_pixels=False,
+        advance_state=False,
+    )
+    roadmap_effects = (
+        "error-diffusion",
+        "halftone",
+        "poster-press",
+        "cross-stitch",
+        "weave",
+        "kilim",
+        "quadtree",
+        "patchwork",
+        "digital-rain",
+        "ribbon-scan",
+        "pixel-sort",
+        "stardust",
+        "type-collage",
+        "engraving",
+        "brickwork",
+        "prism",
+        "hologram",
+        "glass",
+        "terminal-hud",
+    )
+    for name in roadmap_effects:
+        structured = EffectProcessor(
+            name, seed=7, effect_text="CODEX"
+        ).apply(structure_sample, structure_context)
+        if structured.cells is None:
+            nonblank = bool(np.any(structured.rgb))
+        else:
+            nonblank = bool(np.any(structured.cells.glyph_indices))
+        if not nonblank or not renderer.render(structured.rgb, structured.cells):
+            fail(f"{name} nonblank fixture self-test failed")
+
+    # Analytic animation must be reconstructible from video time, but each
+    # animated treatment should still advance between distinct ticks.
+    animation_contexts = (
+        structure_context,
+        EffectContext(
+            video_time=0.875,
+            frame_sequence=1,
+            cell_shape=structure_sample.shape[:2],
+            requested_pixels=False,
+            advance_state=False,
+        ),
+    )
+    animated_roadmap_effects = (
+        "digital-rain",
+        "ribbon-scan",
+        "pixel-sort",
+        "stardust",
+        "type-collage",
+        "hologram",
+        "terminal-hud",
+    )
+    for name in animated_roadmap_effects:
+        animation = EffectProcessor(
+            name, seed=7, effect_text="CODEX"
+        )
+        first = animation.apply(structure_sample, animation_contexts[0])
+        later = animation.apply(structure_sample, animation_contexts[1])
+        changed = not np.array_equal(first.rgb, later.rgb)
+        if first.cells is not None and later.cells is not None:
+            changed = changed or not np.array_equal(
+                first.cells.glyph_indices, later.cells.glyph_indices
+            )
+            changed = changed or not np.array_equal(
+                first.cells.fg_rgb, later.cells.fg_rgb
+            )
+        if not changed:
+            fail(f"{name} temporal fixture self-test failed")
+
     white_text_sample = np.full((8, 8, 3), 255, dtype=np.uint8)
     inscription_sample = np.zeros((8, 8, 3), dtype=np.uint8)
     inscription_sample[:, 4:] = 255
@@ -1551,6 +1672,7 @@ def self_test():
         "word-field": white_text_sample,
         "inscription": inscription_sample,
         "type-echo": white_text_sample,
+        "type-collage": white_text_sample,
     }
     for name, text_sample in text_samples.items():
         custom = EffectProcessor(name, effect_text="CODEX").apply(

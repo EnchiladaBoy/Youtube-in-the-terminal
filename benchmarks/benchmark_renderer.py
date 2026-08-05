@@ -31,6 +31,7 @@ from yt_ascii_renderer import AnsiRenderer  # noqa: E402
 from yt_ascii_effects import (  # noqa: E402
     DEFAULT_EFFECT_TEXT,
     EFFECT_NAMES,
+    GLYPH_EFFECT_NAMES,
     EffectProcessor,
 )
 from yt_ascii_frames import EffectContext, EffectFrame  # noqa: E402
@@ -39,6 +40,11 @@ from yt_ascii_styles import STYLE_NAMES, StyleProcessor  # noqa: E402
 
 DENSE = " .'`^\",:;Il!i><~+_-?][}{1)(|/tfjrxnuvczXYUJCLQ0OZmwqpdbkhao*#MW&8%B@$"
 MATRIX = "0123456789ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ:.=+*<>|/"
+UNICODE_EFFECT_TEXT = "YT λ"
+STATELESS_ISOLATED_BUDGET_MS = 2.0
+STATEFUL_ISOLATED_BUDGET_MS = 2.5
+COMPOSED_BUDGET_MS = 6.0
+NONE_OVERHEAD_BUDGET_PERCENT = 3.0
 
 
 def legacy_chars(frame, chars=DENSE, color=True):
@@ -170,6 +176,11 @@ def main():
     parser.add_argument("--height", type=int, default=34)
     parser.add_argument("--rounds", type=int, default=100)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--check-budgets",
+        action="store_true",
+        help="exit nonzero when an effect exceeds the documented local budget",
+    )
     args = parser.parse_args()
     if args.width < 1 or args.height < 1 or args.rounds < 1:
         parser.error("width, height and rounds must be positive")
@@ -256,6 +267,57 @@ def main():
             ),
         ))
 
+    for index, name in enumerate(EFFECT_NAMES):
+        if name not in GLYPH_EFFECT_NAMES:
+            continue
+        isolated = EffectProcessor(
+            name,
+            glyph_mode="unicode",
+            speed=1.0,
+            seed=20260804,
+            effect_text=UNICODE_EFFECT_TEXT,
+        )
+        composed = EffectProcessor(
+            name,
+            glyph_mode="unicode",
+            speed=1.0,
+            seed=20260804,
+            effect_text=UNICODE_EFFECT_TEXT,
+        )
+        cases.append((
+            f"effect/unicode/isolated/{name}",
+            effect_case(isolated, half_frame, (args.height, args.width)),
+        ))
+        cases.append((
+            f"effect/unicode/composed/{name}",
+            effect_case(
+                composed,
+                half_frame,
+                (args.height, args.width),
+                renderer=AnsiRenderer(
+                    DENSE,
+                    half_block=True,
+                    rng=np.random.default_rng(200 + index),
+                ),
+                style=StyleProcessor("duotone"),
+            ),
+        ))
+
+    ascii_coverage = {
+        name.removeprefix("effect/isolated/")
+        for name, _function in cases
+        if name.startswith("effect/isolated/")
+    }
+    unicode_coverage = {
+        name.removeprefix("effect/unicode/isolated/")
+        for name, _function in cases
+        if name.startswith("effect/unicode/isolated/")
+    }
+    if ascii_coverage != set(EFFECT_NAMES):
+        raise RuntimeError("ASCII benchmark effect coverage is incomplete")
+    if unicode_coverage != set(GLYPH_EFFECT_NAMES):
+        raise RuntimeError("Unicode benchmark glyph-effect coverage is incomplete")
+
     results = {
         "width": args.width,
         "height": args.height,
@@ -289,6 +351,62 @@ def main():
         none["median_ms"] / baseline["median_ms"] - 1.0
     ) * 100.0
 
+    budget_failures = []
+    if none["overhead_vs_baseline_percent"] > NONE_OVERHEAD_BUDGET_PERCENT:
+        budget_failures.append(
+            "none overhead "
+            f"{none['overhead_vs_baseline_percent']:.2f}% > "
+            f"{NONE_OVERHEAD_BUDGET_PERCENT:.2f}%"
+        )
+    for name in EFFECT_NAMES:
+        isolated = results["cases"][f"effect/isolated/{name}"]["median_ms"]
+        isolated_budget = (
+            STATEFUL_ISOLATED_BUDGET_MS
+            if name == "afterimage"
+            else STATELESS_ISOLATED_BUDGET_MS
+        )
+        if isolated >= isolated_budget:
+            budget_failures.append(
+                f"ASCII isolated {name} {isolated:.3f} ms >= "
+                f"{isolated_budget:.3f} ms"
+            )
+        composed = results["cases"][f"effect/composed/{name}"]["median_ms"]
+        if composed >= COMPOSED_BUDGET_MS:
+            budget_failures.append(
+                f"ASCII composed {name} {composed:.3f} ms >= "
+                f"{COMPOSED_BUDGET_MS:.3f} ms"
+            )
+    for name in GLYPH_EFFECT_NAMES:
+        isolated = results["cases"][
+            f"effect/unicode/isolated/{name}"
+        ]["median_ms"]
+        if isolated >= STATELESS_ISOLATED_BUDGET_MS:
+            budget_failures.append(
+                f"Unicode isolated {name} {isolated:.3f} ms >= "
+                f"{STATELESS_ISOLATED_BUDGET_MS:.3f} ms"
+            )
+        composed = results["cases"][
+            f"effect/unicode/composed/{name}"
+        ]["median_ms"]
+        if composed >= COMPOSED_BUDGET_MS:
+            budget_failures.append(
+                f"Unicode composed {name} {composed:.3f} ms >= "
+                f"{COMPOSED_BUDGET_MS:.3f} ms"
+            )
+
+    results["effect_budgets"] = {
+        "stateless_isolated_ms": STATELESS_ISOLATED_BUDGET_MS,
+        "afterimage_isolated_ms": STATEFUL_ISOLATED_BUDGET_MS,
+        "composed_ms": COMPOSED_BUDGET_MS,
+        "none_overhead_percent": NONE_OVERHEAD_BUDGET_PERCENT,
+    }
+    results["budget_failures"] = budget_failures
+
+    if args.check_budgets and budget_failures:
+        for failure in budget_failures:
+            print(f"budget failure: {failure}", file=sys.stderr)
+        raise SystemExit(1)
+
     if args.json:
         print(json.dumps(results, indent=2, sort_keys=True))
         return
@@ -312,6 +430,12 @@ def main():
         "effect/composed/none overhead vs baseline: "
         f"{none['overhead_vs_baseline_percent']:+.2f}%"
     )
+    if budget_failures:
+        print("effect budget observations:")
+        for failure in budget_failures:
+            print(f"  {failure}")
+    else:
+        print("all ASCII and Unicode effect budgets passed")
 
 
 if __name__ == "__main__":

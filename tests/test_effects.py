@@ -169,6 +169,25 @@ class EffectProcessorTests(unittest.TestCase):
                 "word-field",
                 "inscription",
                 "type-echo",
+                "error-diffusion",
+                "halftone",
+                "poster-press",
+                "cross-stitch",
+                "weave",
+                "kilim",
+                "quadtree",
+                "patchwork",
+                "digital-rain",
+                "ribbon-scan",
+                "pixel-sort",
+                "stardust",
+                "type-collage",
+                "engraving",
+                "brickwork",
+                "prism",
+                "hologram",
+                "glass",
+                "terminal-hud",
             ),
         )
         self.assertEqual(
@@ -185,6 +204,17 @@ class EffectProcessorTests(unittest.TestCase):
                     "word-field",
                     "inscription",
                     "type-echo",
+                    "error-diffusion",
+                    "halftone",
+                    "cross-stitch",
+                    "weave",
+                    "kilim",
+                    "digital-rain",
+                    "stardust",
+                    "type-collage",
+                    "engraving",
+                    "brickwork",
+                    "terminal-hud",
                 )
             ),
         )
@@ -395,6 +425,38 @@ class EffectProcessorTests(unittest.TestCase):
                 second = processor.apply(frame).cells
                 self.assertEqual(second.glyphs, expected)
 
+    def test_remaining_roadmap_glyph_schemas_are_stable(self):
+        expected = {
+            "error-diffusion": (" #", " █"),
+            "halftone": (" .oO@", " ·○●█"),
+            "cross-stitch": (" /\\x#", " ╱╲╳█"),
+            "weave": (" -|+#", " ─│┼█"),
+            "kilim": (" .<>/\\#", " ·◆◇╱╲█"),
+            "digital-rain": (" 01|", " 01│"),
+            "stardust": (" .+*", " ·✦✧"),
+            "type-collage": (" YTASCI[]", " YTASCI‹›"),
+            "engraving": (" .-|/\\x#", " ·─│╱╲╳█"),
+            "brickwork": (" .#-|+", " ·█─│┼"),
+            "terminal-hud": (
+                " .:-=+*#@|[]0123456789",
+                " ·░▒▓█─│┼‹›0123456789",
+            ),
+        }
+        frame = np.full((12, 20, 3), 173, dtype=np.uint8)
+        for name, (ascii_glyphs, unicode_glyphs) in expected.items():
+            for mode, glyphs in (
+                ("ascii", ascii_glyphs),
+                ("unicode", unicode_glyphs),
+            ):
+                with self.subTest(effect=name, mode=mode):
+                    plane = EffectProcessor(name, glyph_mode=mode).apply(
+                        frame, 0.5
+                    ).cells
+                    self.assertEqual(plane.glyphs, glyphs)
+                    self.assertLess(
+                        int(plane.glyph_indices.max(initial=0)), len(glyphs)
+                    )
+
     def test_frame_and_time_validation(self):
         processor = EffectProcessor()
         with self.assertRaises(TypeError):
@@ -502,6 +564,729 @@ class EffectProcessorTests(unittest.TestCase):
                         self.assertEqual(
                             output.cells.glyph_indices.shape, frame.shape[:2]
                         )
+
+    def test_new_static_effects_ignore_time_speed_and_sequence(self):
+        static_names = (
+            "error-diffusion",
+            "halftone",
+            "poster-press",
+            "cross-stitch",
+            "weave",
+            "kilim",
+            "quadtree",
+            "patchwork",
+            "engraving",
+            "brickwork",
+            "prism",
+            "glass",
+        )
+
+        def payload(output):
+            cells = output.cells
+            return (
+                output.rgb.copy(),
+                None if cells is None else cells.glyph_indices.copy(),
+                None if cells is None else cells.fg_rgb.copy(),
+            )
+
+        for name in static_names:
+            with self.subTest(effect=name):
+                slow = EffectProcessor(name, speed=0.25, seed=-19).apply(
+                    self.frame,
+                    context(-1e200, 2, self.frame.shape[:2], advance=False),
+                )
+                fast = EffectProcessor(name, speed=8.0, seed=-19).apply(
+                    self.frame,
+                    context(1e200, 999, self.frame.shape[:2]),
+                )
+                for left, right in zip(payload(slow), payload(fast)):
+                    if left is None:
+                        self.assertIsNone(right)
+                    else:
+                        np.testing.assert_array_equal(left, right)
+
+    def test_new_procedural_effects_are_seeded_and_accept_huge_integers(self):
+        seeded_names = (
+            "error-diffusion",
+            "halftone",
+            "poster-press",
+            "cross-stitch",
+            "weave",
+            "kilim",
+            "patchwork",
+            "digital-rain",
+            "ribbon-scan",
+            "pixel-sort",
+            "stardust",
+            "type-collage",
+            "engraving",
+            "brickwork",
+            "prism",
+            "hologram",
+            "glass",
+            "terminal-hud",
+        )
+
+        def payload(output):
+            values = [output.rgb]
+            if output.cells is not None:
+                values.extend(
+                    (output.cells.glyph_indices, output.cells.fg_rgb)
+                )
+            return values
+
+        for name in seeded_names:
+            with self.subTest(effect=name):
+                first = EffectProcessor(
+                    name, seed=0, effect_text="CODEX"
+                ).apply(self.frame, 0.375)
+                repeat = EffectProcessor(
+                    name, seed=0, effect_text="CODEX"
+                ).apply(self.frame, 0.375)
+                changed = EffectProcessor(
+                    name, seed=1, effect_text="CODEX"
+                ).apply(self.frame, 0.375)
+                for left, right in zip(payload(first), payload(repeat)):
+                    np.testing.assert_array_equal(left, right)
+                self.assertTrue(
+                    any(
+                        not np.array_equal(left, right)
+                        for left, right in zip(payload(first), payload(changed))
+                    )
+                )
+                for seed in (-(10**100), 10**100):
+                    output = EffectProcessor(
+                        name, seed=seed, effect_text="CODEX"
+                    ).apply(self.frame, 0.375)
+                    self.assertEqual(output.rgb.shape, self.frame.shape)
+
+    def test_new_animated_effects_use_analytic_time_and_speed(self):
+        animated_names = (
+            "digital-rain",
+            "ribbon-scan",
+            "pixel-sort",
+            "stardust",
+            "type-collage",
+            "hologram",
+            "terminal-hud",
+        )
+
+        def arrays(output):
+            yield output.rgb
+            if output.cells is not None:
+                yield output.cells.glyph_indices
+                yield output.cells.fg_rgb
+
+        for name in animated_names:
+            with self.subTest(effect=name):
+                normal = EffectProcessor(name, speed=1.0, seed=23).apply(
+                    self.frame, context(1.25, 4, self.frame.shape[:2])
+                )
+                fast = EffectProcessor(name, speed=2.0, seed=23).apply(
+                    self.frame,
+                    context(0.625, 400, self.frame.shape[:2], advance=False),
+                )
+                for left, right in zip(arrays(normal), arrays(fast)):
+                    np.testing.assert_array_equal(left, right)
+
+                processor = EffectProcessor(name, seed=23)
+                first = processor.apply(
+                    self.frame, context(0.75, 11, self.frame.shape[:2])
+                )
+                processor.reset("seek")
+                replay = processor.apply(
+                    self.frame,
+                    context(0.75, 0, self.frame.shape[:2], advance=False),
+                )
+                for left, right in zip(arrays(first), arrays(replay)):
+                    np.testing.assert_array_equal(left, right)
+
+                for video_time in (-1e300, 1e300):
+                    output = processor.apply(self.frame, video_time)
+                    self.assertEqual(output.rgb.shape, self.frame.shape)
+                    if output.cells is not None:
+                        self.assertEqual(
+                            output.cells.glyph_indices.shape,
+                            self.frame.shape[:2],
+                        )
+
+    def test_new_layout_caches_are_reused_bounded_and_resettable(self):
+        for name in ("error-diffusion", "patchwork", "glass"):
+            with self.subTest(effect=name):
+                processor = EffectProcessor(name, seed=31)
+                first = processor.apply(self.frame, 0.5)
+                self.assertTrue(processor._cache)
+                cached = dict(processor._cache)
+                repeat = processor.apply(self.frame, 99.0)
+                self.assertEqual(tuple(processor._cache), tuple(cached))
+                for key, value in cached.items():
+                    self.assertIs(processor._cache[key], value)
+                np.testing.assert_array_equal(first.rgb, repeat.rgb)
+                if first.cells is not None:
+                    np.testing.assert_array_equal(
+                        first.cells.glyph_indices,
+                        repeat.cells.glyph_indices,
+                    )
+
+                resized = self.frame[:7, :11]
+                processor.apply(resized, 0.5)
+                self.assertNotEqual(tuple(processor._cache), tuple(cached))
+                processor.reset("resize")
+                self.assertFalse(processor._cache)
+                rebuilt = processor.apply(self.frame, 0.5)
+                np.testing.assert_array_equal(first.rgb, rebuilt.rgb)
+                if first.cells is not None:
+                    np.testing.assert_array_equal(
+                        first.cells.glyph_indices,
+                        rebuilt.cells.glyph_indices,
+                    )
+
+    def test_new_animations_change_only_at_documented_tick_boundaries(self):
+        rates = {
+            "digital-rain": 12,
+            "ribbon-scan": 8,
+            "pixel-sort": 6,
+            "stardust": 8,
+            "type-collage": 3,
+            "hologram": 12,
+            "terminal-hud": 10,
+        }
+
+        def changed(left, right):
+            if not np.array_equal(left.rgb, right.rgb):
+                return True
+            if left.cells is None:
+                return False
+            return not np.array_equal(
+                left.cells.glyph_indices, right.cells.glyph_indices
+            ) or not np.array_equal(left.cells.fg_rgb, right.cells.fg_rgb)
+
+        for name, rate in rates.items():
+            with self.subTest(effect=name):
+                processor = EffectProcessor(name, seed=7, effect_text="CODEX")
+                first = processor.apply(self.frame, 0.0)
+                same_tick = processor.apply(
+                    self.frame, (1.0 / rate) - 1e-9
+                )
+                next_tick = processor.apply(self.frame, 1.0 / rate)
+                self.assertFalse(changed(first, same_tick))
+                self.assertTrue(changed(first, next_tick))
+
+    def test_error_diffusion_order_is_seeded_serpentine_permutation(self):
+        rows, cols = 5, 7
+        first = effects._error_diffusion_order(rows, cols, 0)
+        repeat = effects._error_diffusion_order(rows, cols, 0)
+        changed = effects._error_diffusion_order(rows, cols, 1)
+        np.testing.assert_array_equal(first, repeat)
+        np.testing.assert_array_equal(np.sort(first), np.arange(rows * cols))
+        np.testing.assert_array_equal(first[:cols], np.arange(cols))
+        np.testing.assert_array_equal(
+            first[cols:2 * cols], np.arange(2 * cols - 1, cols - 1, -1)
+        )
+        self.assertFalse(np.array_equal(first, changed))
+        self.assertFalse(first.flags.writeable)
+        self.assertEqual(
+            effects._error_diffusion_order(0, cols, 9).shape, (0,)
+        )
+
+    def test_patchwork_bsp_layout_has_bounded_rectangular_regions(self):
+        rows, cols = 48, 72
+        labels = effects._patchwork_layout(rows, cols, -123)
+        repeat = effects._patchwork_layout(rows, cols, -123)
+        changed = effects._patchwork_layout(rows, cols, -122)
+        np.testing.assert_array_equal(labels, repeat)
+        self.assertFalse(np.array_equal(labels, changed))
+        self.assertFalse(labels.flags.writeable)
+        unique = np.unique(labels)
+        self.assertLessEqual(len(unique), 32)
+        np.testing.assert_array_equal(unique, np.arange(len(unique)))
+        for label in unique:
+            positions = np.argwhere(labels == label)
+            top, left = positions.min(axis=0)
+            bottom, right = positions.max(axis=0) + 1
+            self.assertGreaterEqual(bottom - top, 4)
+            self.assertGreaterEqual(right - left, 4)
+            self.assertTrue(np.all(labels[top:bottom, left:right] == label))
+
+    def test_glass_layout_offsets_edges_and_frost_are_bounded(self):
+        rows, cols = 17, 23
+        source_rows, source_cols, frost, edges = effects._glass_layout(
+            rows, cols, 81
+        )
+        row_grid, col_grid = np.indices((rows, cols))
+        self.assertTrue(np.all(np.abs(source_rows - row_grid) <= 2))
+        self.assertTrue(np.all(np.abs(source_cols - col_grid) <= 2))
+        self.assertGreaterEqual(int(source_rows.min()), 0)
+        self.assertLess(int(source_rows.max()), rows)
+        self.assertGreaterEqual(int(source_cols.min()), 0)
+        self.assertLess(int(source_cols.max()), cols)
+        self.assertGreaterEqual(int(frost.min()), -7)
+        self.assertLessEqual(int(frost.max()), 8)
+        np.testing.assert_array_equal(
+            edges, ((row_grid % 4) == 0) | ((col_grid % 6) == 0)
+        )
+        for value in (source_rows, source_cols, frost, edges):
+            self.assertFalse(value.flags.writeable)
+
+    def test_error_diffusion_conserves_tone_and_has_exact_endpoints(self):
+        black = np.zeros((4, 7, 3), dtype=np.uint8)
+        white = np.full_like(black, 255)
+        self.assertFalse(
+            EffectProcessor("error-diffusion", seed=-99)
+            .apply(black)
+            .cells.glyph_indices.any()
+        )
+        self.assertTrue(
+            np.all(
+                EffectProcessor("error-diffusion", seed=99)
+                .apply(white)
+                .cells.glyph_indices
+                == 1
+            )
+        )
+
+        values = np.arange(12 * 20, dtype=np.uint8).reshape(12, 20)
+        frame = np.repeat(values[:, :, None], 3, axis=2)
+        outputs = []
+        for seed in (0, 255):
+            indices = EffectProcessor(
+                "error-diffusion", seed=seed
+            ).apply(frame).cells.glyph_indices
+            expected_marks = (int(values.sum()) + seed % 255) // 255
+            self.assertEqual(int(indices.sum()), expected_marks)
+            outputs.append(indices)
+        self.assertFalse(np.array_equal(*outputs))
+
+    def test_halftone_uses_exact_clustered_rank_coverage(self):
+        for luminance in (0, 1, 16, 64, 128, 192, 255):
+            with self.subTest(luminance=luminance):
+                frame = np.full((4, 4, 3), luminance, dtype=np.uint8)
+                indices = EffectProcessor("halftone", seed=0).apply(
+                    frame
+                ).cells.glyph_indices
+                coverage = (luminance * 16 + 255) // 256
+                weight = 1 + luminance * 4 // 256
+                self.assertEqual(int(np.count_nonzero(indices)), coverage)
+                if coverage:
+                    self.assertEqual(
+                        set(indices[indices != 0].tolist()), {weight}
+                    )
+
+        one_dot = EffectProcessor("halftone", seed=0).apply(
+            np.full((4, 4, 3), 16, dtype=np.uint8)
+        ).cells.glyph_indices
+        expected = np.zeros((4, 4), dtype=np.uint8)
+        expected[1, 1] = 1
+        np.testing.assert_array_equal(one_dot, expected)
+        shifted = EffectProcessor("halftone", seed=1).apply(
+            np.full((4, 4, 3), 16, dtype=np.uint8)
+        ).cells.glyph_indices
+        self.assertFalse(np.array_equal(one_dot, shifted))
+        self.assertEqual(int(np.count_nonzero(shifted)), 1)
+
+    def test_cross_stitch_exact_tone_roles_and_seeded_checker(self):
+        values = np.array((0, 63, 64, 127, 128, 191, 192, 255), dtype=np.uint8)
+        frame = np.repeat(values[None, :, None], 3, axis=2)
+        first = EffectProcessor("cross-stitch", seed=0).apply(
+            frame
+        ).cells.glyph_indices
+        second = EffectProcessor("cross-stitch", seed=1).apply(
+            frame
+        ).cells.glyph_indices
+        np.testing.assert_array_equal(
+            first,
+            np.array(((0, 0, 1, 2, 3, 3, 4, 4),), dtype=np.uint8),
+        )
+        np.testing.assert_array_equal(
+            second,
+            np.array(((0, 0, 2, 1, 3, 3, 4, 4),), dtype=np.uint8),
+        )
+
+    def test_weave_and_kilim_repeat_their_locked_motifs(self):
+        weave_frame = np.full((8, 8, 3), 128, dtype=np.uint8)
+        weave = EffectProcessor("weave", seed=0).apply(
+            weave_frame
+        ).cells.glyph_indices
+        np.testing.assert_array_equal(weave, np.tile(weave[:4, :4], (2, 2)))
+        self.assertEqual(set(np.unique(weave).tolist()), {1, 2, 3})
+        self.assertFalse(
+            EffectProcessor("weave").apply(
+                np.zeros_like(weave_frame)
+            ).cells.glyph_indices.any()
+        )
+
+        kilim_frame = np.full((16, 32, 3), 255, dtype=np.uint8)
+        kilim = EffectProcessor("kilim", seed=0).apply(
+            kilim_frame
+        ).cells.glyph_indices
+        np.testing.assert_array_equal(kilim, np.tile(kilim[:8, :16], (2, 2)))
+        self.assertEqual(set(np.unique(kilim).tolist()), {1, 2, 3, 4, 5, 6})
+        changed = EffectProcessor("kilim", seed=1).apply(
+            kilim_frame
+        ).cells.glyph_indices
+        self.assertFalse(np.array_equal(kilim, changed))
+
+    def test_digital_rain_has_analytic_heads_trails_and_green_fade(self):
+        frame = np.empty((6, 4, 3), dtype=np.uint8)
+        frame[:] = (120, 100, 80)
+
+        def zero_hash(rows, cols, seed):
+            return np.zeros((rows, cols), dtype=np.uint64)
+
+        with mock.patch.object(effects, "_hash_grid", side_effect=zero_hash):
+            tick_zero = EffectProcessor("digital-rain").apply(
+                frame, 0.0
+            ).cells
+            tick_one = EffectProcessor("digital-rain").apply(
+                frame, 1 / 12
+            ).cells
+        self.assertTrue(np.all(tick_zero.glyph_indices[0] == 3))
+        self.assertFalse(tick_zero.glyph_indices[1:].any())
+        self.assertTrue(np.all(tick_one.glyph_indices[0] == 1))
+        self.assertTrue(np.all(tick_one.glyph_indices[1] == 3))
+        self.assertFalse(tick_one.glyph_indices[2:].any())
+        self.assertGreater(
+            int(tick_zero.fg_rgb[0, 0, 1]),
+            int(tick_zero.fg_rgb[0, 0, 0]),
+        )
+        self.assertTrue(np.all(tick_zero.fg_rgb[1:] == 0))
+
+    def test_stardust_density_twinkle_and_color_weights(self):
+        black = np.zeros((5, 7, 3), dtype=np.uint8)
+        self.assertFalse(
+            EffectProcessor("stardust").apply(black).cells.glyph_indices.any()
+        )
+        frame = np.empty((5, 7, 3), dtype=np.uint8)
+        frame[:] = (100, 150, 200)
+        hashes = np.zeros((5, 7), dtype=np.uint64)
+        with mock.patch.object(effects, "_hash_grid", return_value=hashes):
+            planes = [
+                EffectProcessor("stardust").apply(frame, tick / 8).cells
+                for tick in range(3)
+            ]
+        for expected_index, plane in enumerate(planes, 1):
+            self.assertTrue(np.all(plane.glyph_indices == expected_index))
+        np.testing.assert_array_equal(planes[0].fg_rgb[0, 0], (40, 60, 80))
+        np.testing.assert_array_equal(planes[1].fg_rgb[0, 0], (80, 120, 160))
+        np.testing.assert_array_equal(planes[2].fg_rgb[0, 0], (100, 150, 200))
+
+    def test_type_collage_preserves_custom_text_and_reverses_odd_bands(self):
+        frame = np.full((2, 10, 3), 255, dtype=np.uint8)
+        plane = EffectProcessor(
+            "type-collage", effect_text="AB", seed=0
+        ).apply(frame, 0.0).cells
+        self.assertEqual(plane.glyphs, " AB[]")
+        np.testing.assert_array_equal(
+            plane.glyph_indices,
+            np.array(
+                (
+                    (3, 1, 2, 4, 0, 3, 1, 2, 4, 0),
+                    (2, 1, 3, 0, 4, 2, 1, 3, 0, 4),
+                ),
+                dtype=np.uint8,
+            ),
+        )
+        dark = EffectProcessor(
+            "type-collage", effect_text="AB"
+        ).apply(np.zeros_like(frame)).cells
+        self.assertFalse(dark.glyph_indices.any())
+
+    def test_engraving_threshold_orientation_and_hatch_roles(self):
+        white = np.full((4, 4, 3), 255, dtype=np.uint8)
+        black = np.zeros_like(white)
+        self.assertFalse(
+            EffectProcessor("engraving").apply(white).cells.glyph_indices.any()
+        )
+        self.assertTrue(
+            np.all(
+                EffectProcessor("engraving")
+                .apply(black)
+                .cells.glyph_indices
+                == 7
+            )
+        )
+
+        frame = np.full((1, 2, 3), 200, dtype=np.uint8)
+        for strength, expected in ((95, (1, 2)), (96, (3, 3))):
+            gradients = np.full((1, 2), strength, dtype=np.int32)
+            with self.subTest(strength=strength), mock.patch.object(
+                effects,
+                "_sobel",
+                return_value=(gradients, np.zeros_like(gradients)),
+            ):
+                indices = EffectProcessor("engraving", seed=0).apply(
+                    frame
+                ).cells.glyph_indices
+                self.assertEqual(tuple(indices[0]), expected)
+
+    def test_brickwork_has_staggered_four_by_eight_mortar_courses(self):
+        frame = np.full((16, 16, 3), 200, dtype=np.uint8)
+        indices = EffectProcessor("brickwork", seed=0).apply(
+            frame
+        ).cells.glyph_indices
+        np.testing.assert_array_equal(indices, np.tile(indices[:8, :8], (2, 2)))
+        self.assertEqual(set(np.unique(indices).tolist()), {2, 3, 4, 5})
+        self.assertTrue(np.all(indices[0, 1:8] == 3))
+        self.assertTrue(np.all(indices[1:4, 0] == 4))
+        self.assertFalse(
+            EffectProcessor("brickwork").apply(
+                np.zeros_like(frame)
+            ).cells.glyph_indices.any()
+        )
+
+    def test_terminal_hud_draws_border_reticle_ticks_and_five_digit_time(self):
+        frame = np.full((9, 20, 3), 128, dtype=np.uint8)
+        plane = EffectProcessor("terminal-hud", seed=0).apply(
+            frame, 12.3
+        ).cells
+        glyph_rows = np.array(tuple(plane.glyphs))[plane.glyph_indices]
+        self.assertEqual("".join(glyph_rows[0, -7:]), "[00123]")
+        for col in range(1, 19):
+            self.assertEqual(glyph_rows[-1, col], "+" if col in (8, 16) else "-")
+        for row in range(1, 8):
+            expected = "+" if row == 4 else "|"
+            self.assertEqual(glyph_rows[row, 0], expected)
+            self.assertEqual(glyph_rows[row, -1], expected)
+        center_row, center_col = 4, 10
+        self.assertEqual(glyph_rows[center_row, center_col], "+")
+        self.assertEqual(glyph_rows[center_row, center_col - 1], "-")
+        self.assertEqual(glyph_rows[center_row, center_col + 1], "-")
+        self.assertEqual(glyph_rows[center_row - 1, center_col], "|")
+        self.assertEqual(glyph_rows[center_row + 1, center_col], "|")
+        self.assertEqual(glyph_rows[-1, 8], "+")
+
+    def test_poster_press_has_four_levels_displaced_plates_and_dark_edges(self):
+        for value, expected in (
+            (0, 0),
+            (42, 0),
+            (43, 85),
+            (127, 85),
+            (128, 170),
+            (212, 170),
+            (213, 255),
+            (255, 255),
+        ):
+            with self.subTest(value=value):
+                frame = np.full((2, 2, 3), value, dtype=np.uint8)
+                output = EffectProcessor("poster-press").apply(frame).rgb
+                self.assertTrue(np.all(output == expected))
+
+        frame = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3) * 4
+        quantized = (
+            (frame.astype(np.uint16) * 3 + 127) // 255 * 85
+        ).astype(np.uint8)
+        zeros = np.zeros(frame.shape[:2], dtype=np.int32)
+        with mock.patch.object(effects, "_sobel", return_value=(zeros, zeros)):
+            output = EffectProcessor("poster-press", seed=0).apply(frame).rgb
+        np.testing.assert_array_equal(
+            output[:, :, 0], np.roll(quantized[:, :, 0], -1, axis=0)
+        )
+        np.testing.assert_array_equal(output[:, :, 1], quantized[:, :, 1])
+        np.testing.assert_array_equal(
+            output[:, :, 2], np.roll(quantized[:, :, 2], 1, axis=0)
+        )
+
+        base = np.full((1, 2, 3), 128, dtype=np.uint8)
+        for strength, expected in ((95, 170), (96, 68)):
+            gradient = np.full((1, 2), strength, dtype=np.int32)
+            with self.subTest(strength=strength), mock.patch.object(
+                effects,
+                "_sobel",
+                return_value=(gradient, np.zeros_like(gradient)),
+            ):
+                result = EffectProcessor("poster-press").apply(base).rgb
+                self.assertTrue(np.all(result == expected))
+
+    def test_quadtree_uses_leaf_means_seams_and_four_pixel_depth_cap(self):
+        flat = np.empty((16, 16, 3), dtype=np.uint8)
+        flat[:] = (20, 80, 140)
+        np.testing.assert_array_equal(
+            EffectProcessor("quadtree").apply(flat).rgb, flat
+        )
+
+        quadrants = np.zeros((16, 16, 3), dtype=np.uint8)
+        quadrant_colors = ((40, 80, 120), (80, 120, 160),
+                           (120, 160, 200), (160, 200, 240))
+        quadrants[:8, :8] = quadrant_colors[0]
+        quadrants[:8, 8:] = quadrant_colors[1]
+        quadrants[8:, :8] = quadrant_colors[2]
+        quadrants[8:, 8:] = quadrant_colors[3]
+        output = EffectProcessor("quadtree").apply(quadrants).rgb
+        np.testing.assert_array_equal(output[1, 1], quadrant_colors[0])
+        np.testing.assert_array_equal(output[1, 9], quadrant_colors[1])
+        np.testing.assert_array_equal(output[9, 1], quadrant_colors[2])
+        np.testing.assert_array_equal(output[9, 9], quadrant_colors[3])
+        np.testing.assert_array_equal(
+            output[8, 1], np.array(quadrant_colors[2]) * 2 // 5
+        )
+        np.testing.assert_array_equal(
+            output[1, 8], np.array(quadrant_colors[1]) * 2 // 5
+        )
+
+        rows, cols = np.indices((128, 128))
+        detailed = (((rows + cols) & 1) * 255).astype(np.uint8)
+        detailed = np.repeat(detailed[:, :, None], 3, axis=2)
+        capped = EffectProcessor("quadtree").apply(detailed).rgb
+        for top in range(0, 128, 4):
+            for left in range(0, 128, 4):
+                interior = capped[top + 1:top + 4, left + 1:left + 4]
+                self.assertTrue(np.all(interior == interior[0, 0]))
+
+    def test_patchwork_fills_cached_region_means_and_one_sided_seams(self):
+        processor = EffectProcessor("patchwork", seed=18)
+        output = processor.apply(self.frame).rgb
+        labels = next(iter(processor._cache.values()))
+        expected = np.empty_like(self.frame)
+        for label in np.unique(labels):
+            mask = labels == label
+            mean = self.frame[mask].astype(np.uint32).sum(axis=0) // mask.sum()
+            expected[mask] = mean.astype(np.uint8)
+        boundaries = np.zeros(labels.shape, dtype=bool)
+        boundaries[1:] |= labels[1:] != labels[:-1]
+        boundaries[:, 1:] |= labels[:, 1:] != labels[:, :-1]
+        expected[boundaries] = (
+            expected[boundaries].astype(np.uint16) * 2 // 5
+        ).astype(np.uint8)
+        np.testing.assert_array_equal(output, expected)
+
+        layout = labels
+        changed_frame = 255 - self.frame
+        changed = processor.apply(changed_frame).rgb
+        self.assertIs(next(iter(processor._cache.values())), layout)
+        self.assertFalse(np.array_equal(output, changed))
+
+    def test_ribbon_scan_has_three_pixel_highlights_per_twelve_rows(self):
+        frame = np.full((24, 32, 3), 100, dtype=np.uint8)
+        output = EffectProcessor("ribbon-scan", seed=0).apply(
+            frame, 0.0
+        ).rgb
+        self.assertEqual(set(np.unique(output).tolist()), {60, 168})
+        for col in range(output.shape[1]):
+            self.assertEqual(int(np.count_nonzero(output[:, col, 0] == 168)), 6)
+        changed = EffectProcessor("ribbon-scan", seed=1).apply(
+            frame, 0.0
+        ).rgb
+        self.assertFalse(np.array_equal(output, changed))
+
+    def test_pixel_sort_is_stable_and_preserves_each_row_permutation(self):
+        values = np.arange(31, -1, -1, dtype=np.uint8)
+        frame = np.repeat(values[None, :, None], 3, axis=2)
+        output = EffectProcessor("pixel-sort", seed=0).apply(
+            frame, 0.0
+        ).rgb
+        expected = np.concatenate((np.arange(16, 32), np.arange(16))).astype(
+            np.uint8
+        )
+        np.testing.assert_array_equal(output[0, :, 0], expected)
+
+        equal_luma = np.array(
+            (
+                (0, 0, 128), (0, 8, 88), (0, 16, 48), (0, 24, 0),
+                (0, 24, 8), (8, 0, 104), (8, 8, 64), (8, 16, 24),
+                (16, 0, 88), (16, 8, 40), (16, 8, 48), (16, 16, 0),
+                (24, 0, 64), (24, 8, 24), (32, 0, 40), (32, 8, 0),
+            ),
+            dtype=np.uint8,
+        )[None, :, :]
+        self.assertEqual(
+            set(effects._luminance(equal_luma).ravel().tolist()), {14}
+        )
+        stable = EffectProcessor("pixel-sort", seed=0).apply(
+            equal_luma, 0.0
+        ).rgb
+        np.testing.assert_array_equal(stable, equal_luma)
+
+        rich = np.stack((self.frame, 255 - self.frame), axis=0).reshape(
+            24, 20, 3
+        )
+        sorted_frame = EffectProcessor("pixel-sort", seed=13).apply(
+            rich, 0.5
+        ).rgb
+        for source_row, sorted_row in zip(rich, sorted_frame):
+            source_codes = (
+                source_row[:, 0].astype(np.uint32) << 16
+                | source_row[:, 1].astype(np.uint32) << 8
+                | source_row[:, 2].astype(np.uint32)
+            )
+            sorted_codes = (
+                sorted_row[:, 0].astype(np.uint32) << 16
+                | sorted_row[:, 1].astype(np.uint32) << 8
+                | sorted_row[:, 2].astype(np.uint32)
+            )
+            np.testing.assert_array_equal(
+                np.sort(source_codes), np.sort(sorted_codes)
+            )
+
+    def test_prism_displaces_opposing_channels_and_highlights_edges(self):
+        flat = np.empty((4, 5, 3), dtype=np.uint8)
+        flat[:] = (30, 90, 150)
+        np.testing.assert_array_equal(
+            EffectProcessor("prism", seed=3).apply(flat).rgb, flat
+        )
+
+        frame = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3) * 4
+        zeros = np.zeros(frame.shape[:2], dtype=np.int32)
+        with mock.patch.object(effects, "_sobel", return_value=(zeros, zeros)):
+            output = EffectProcessor("prism", seed=1).apply(frame).rgb
+        np.testing.assert_array_equal(output[:, :, 1], frame[:, :, 1])
+        np.testing.assert_array_equal(
+            output[:, :, 0],
+            (
+                frame[:, :, 0].astype(np.uint16)
+                + np.roll(frame[:, :, 0], 1, axis=1)
+            ) // 2,
+        )
+        np.testing.assert_array_equal(
+            output[:, :, 2],
+            (
+                frame[:, :, 2].astype(np.uint16)
+                + np.roll(frame[:, :, 2], -1, axis=1)
+            ) // 2,
+        )
+
+        base = np.full((1, 2, 3), 100, dtype=np.uint8)
+        gradient = np.full((1, 2), 96, dtype=np.int32)
+        with mock.patch.object(
+            effects,
+            "_sobel",
+            return_value=(gradient, np.zeros_like(gradient)),
+        ):
+            highlighted = EffectProcessor("prism").apply(base).rgb
+        self.assertTrue(np.all(highlighted == 140))
+
+    def test_hologram_scanline_palette_and_sparkles_are_exact(self):
+        frame = np.full((4, 3, 3), 100, dtype=np.uint8)
+        maximum_hashes = np.full((4, 3), np.iinfo(np.uint64).max, dtype=np.uint64)
+        with mock.patch.object(
+            effects, "_hash_grid", return_value=maximum_hashes
+        ):
+            output = EffectProcessor("hologram").apply(frame, 0.0).rgb
+        np.testing.assert_array_equal(output[0, 0], (12, 60, 79))
+        np.testing.assert_array_equal(output[1, 0], (50, 33, 100))
+        np.testing.assert_array_equal(output[2, 0], (20, 100, 132))
+        np.testing.assert_array_equal(output[3, 0], (50, 33, 100))
+
+        zero_hashes = np.zeros((4, 3), dtype=np.uint64)
+        with mock.patch.object(effects, "_hash_grid", return_value=zero_hashes):
+            sparkles = EffectProcessor("hologram").apply(frame, 0.0).rgb
+        np.testing.assert_array_equal(
+            sparkles, np.broadcast_to((220, 255, 255), frame.shape)
+        )
+
+    def test_glass_applies_cached_refraction_frost_and_pane_highlights(self):
+        frame = np.full((9, 13, 3), 100, dtype=np.uint8)
+        processor = EffectProcessor("glass", seed=44)
+        output = processor.apply(frame).rgb
+        layout = next(iter(processor._cache.values()))
+        _source_rows, _source_cols, frost, edges = layout
+        expected = np.clip(
+            100 + frost.astype(np.int16)[:, :, None], 0, 255
+        )
+        expected = np.broadcast_to(expected, frame.shape).copy()
+        expected[edges] = np.minimum(255, expected[edges] + 28)
+        np.testing.assert_array_equal(output, expected.astype(np.uint8))
+        changed_layout = effects._glass_layout(9, 13, 45)
+        self.assertFalse(np.array_equal(layout[0], changed_layout[0]))
 
     def test_cell_reduction_averages_half_block_rows(self):
         frame = np.array(
