@@ -6,6 +6,7 @@ Usage:
 
 Keys (while playing):
     space        pause / resume
+    p            cycle character palette
     s            cycle visual style
     e            cycle compatible visual effect
     ← / →        seek -5s / +5s
@@ -67,6 +68,18 @@ PALETTES = {
     "symbols": " .,:;!|?*#@",
     "matrix": " 01:=+*<>|/",
 }
+PALETTE_NAMES = tuple(PALETTES)
+
+
+def _next_palette_name(current):
+    """Return the next built-in palette; custom selections enter at simple."""
+    if current == "custom":
+        return PALETTE_NAMES[0]
+    try:
+        index = PALETTE_NAMES.index(current)
+    except ValueError as error:
+        raise ValueError(f"unknown palette {current!r}") from error
+    return PALETTE_NAMES[(index + 1) % len(PALETTE_NAMES)]
 
 # Kept dependency-free so ``yt-ascii --version`` and ``--help`` work before
 # NumPy is installed. ``run`` and ``self_test`` import the implementations only
@@ -658,6 +671,8 @@ def _read_keys_windows():
             keys.append("s")
         elif ch == "e":
             keys.append("e")
+        elif ch == "p":
+            keys.append("p")
         elif ch.isdigit():
             keys.append(ch)
     return keys
@@ -698,6 +713,8 @@ def _read_keys_posix(fd):
                 keys.append("s"); i += 1; continue
             if ch == "e":
                 keys.append("e"); i += 1; continue
+            if ch == "p":
+                keys.append("p"); i += 1; continue
             if ch.isdigit():
                 keys.append(ch); i += 1; continue
             i += 1
@@ -953,6 +970,7 @@ def parse_args():
         epilog=(
             "Keys while playing:\n"
             "  space        pause / resume\n"
+            "  p            cycle character palette\n"
             "  s            cycle visual style\n"
             "  e            cycle compatible visual effect\n"
             "  ←/→          seek ±5s\n"
@@ -996,7 +1014,7 @@ def parse_args():
     p.add_argument(
         "--render", choices=RENDER_MODES, default=None, metavar="BACKEND",
         help=(
-            "terminal backend: chars (portable ASCII), cells (ANSI "
+            "terminal backend: chars (ASCII by default), cells (ANSI "
             "background-colored spaces), or half-block (Unicode ▀; default: "
             "chars)"
         ),
@@ -1041,9 +1059,17 @@ def parse_args():
                    help="output height in terminal cells")
     p.add_argument("--max-res", type=positive_int_type, default=480, metavar="N",
                    help="max source video resolution (default: 480)")
-    p.add_argument("--palette", choices=PALETTES, default="dense",
-                   help="chars-backend palette (default: dense, ~70 chars)")
-    p.add_argument("--chars", help="custom chars palette, dark→light")
+    p.add_argument(
+        "--palette", choices=PALETTES, default="dense",
+        help=(
+            "initial chars-backend palette; press p during playback to "
+            "cycle built-ins (default: dense, ~70 chars)"
+        ),
+    )
+    p.add_argument(
+        "--chars",
+        help="custom chars palette, dark→light; first p selects simple",
+    )
     p.add_argument(
         "--style", type=style_name_type, default="classic", metavar="NAME",
         help=(
@@ -1175,7 +1201,7 @@ def prompt_for_url():
         f"{reset}\n\n"
         f"{gray}   Paste a YouTube link and press Enter to play it.\n"
         "   While playing:  space=pause  <-/-> +-5s  up/down +-30s  "
-        "0-9=jump  s=style  e=effect  q=quit\n"
+        "0-9=jump  p=palette  s=style  e=effect  q=quit\n"
         "   Run with --help for renderer / color / audio / effect options."
         f"{reset}\n\n"
     )
@@ -1326,7 +1352,8 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
     args.effect = effect_processor.name
     effect_processor.reset("source")
 
-    chars = args.chars or PALETTES[args.palette]
+    palette_name = "custom" if args.chars is not None else args.palette
+    chars = args.chars if args.chars is not None else PALETTES[args.palette]
     if not chars:
         fail("palette must be non-empty")
     if "\x00" in chars:
@@ -1753,6 +1780,7 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
                 args.fps, current_pos(), info, cols, paused=True,
                 style=args.style, effect=args.effect,
                 render_backend=mode_label,
+                palette=active_palette_name(),
             )
             write_terminal_frame(body, status)
         else:
@@ -1761,6 +1789,7 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
                     args.fps, current_pos(), info, cols, paused=True,
                     style=args.style, effect=args.effect,
                     render_backend=mode_label,
+                    palette=active_palette_name(),
                 )
             diagnostics.increment(
                 "output_bytes",
@@ -1785,6 +1814,30 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
             diagnostics.event(
                 "control", reason="effect", effect=args.effect
             )
+
+    def active_palette_name():
+        """Return the label only while the renderer owns visible glyphs."""
+        if render_mode != "chars" or args.effect in TEXT_EFFECT_NAMES:
+            return None
+        return palette_name
+
+    def cycle_palette():
+        """Change only character composition, preserving decode/effect state."""
+        nonlocal palette_name
+        if active_palette_name() is None:
+            return False
+        palette_name = _next_palette_name(palette_name)
+        renderer.set_palette(PALETTES[palette_name])
+        # Persist the visible selection across the interactive multi-video
+        # loop. Once the user leaves a custom palette, cycling uses built-ins.
+        args.chars = None
+        args.palette = palette_name
+        if diagnostics is not None:
+            diagnostics.increment("controls")
+            diagnostics.event(
+                "control", reason="palette", palette=palette_name
+            )
+        return True
 
     def begin_reveal():
         """Start (or restart, after a seek) the current reveal animation: clear
@@ -1816,6 +1869,7 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
             )
             # ── Handle keyboard ──────────────────────────────────────────
             quit_now = False
+            palette_changed = False
             style_changed = False
             effect_changed = False
             pending_seek = None  # final target after applying all queued keys
@@ -1839,6 +1893,9 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
                         cycle_effect()
                         effect_changed = True
                         continue
+                    if key == "p":
+                        palette_changed = cycle_palette() or palette_changed
+                        continue
                     base = pending_seek if pending_seek is not None else current_pos()
                     if key == "left":
                         pending_seek = base - 5
@@ -1857,7 +1914,7 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
             # Key reads are batches. Redraw after the whole batch so both
             # ``space, s`` and ``s, space`` end with a correctly styled frozen
             # frame rather than a new label over the previous style.
-            if (style_changed or effect_changed) and paused:
+            if (palette_changed or style_changed or effect_changed) and paused:
                 redraw_paused_frame()
 
             if resize_flag[0]:
@@ -1872,6 +1929,7 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
                         args.fps, pos, info, cols, paused=True,
                         style=args.style, effect=args.effect,
                         render_backend=mode_label,
+                        palette=active_palette_name(),
                     )
                     sys.stdout.write(
                         f"\x1b[{oh + 1};1H" + status + "\x1b[K"
@@ -1883,6 +1941,7 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
                             args.fps, pos, info, cols, paused=True,
                             style=args.style, effect=args.effect,
                             render_backend=mode_label,
+                            palette=active_palette_name(),
                         )
                     paused_payload = (
                         f"\x1b[{oh + 1};1H" + status + "\x1b[K"
@@ -1980,6 +2039,7 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
                     args.fps, pos, info, cols, paused=False,
                     style=args.style, effect=args.effect,
                     render_backend=mode_label,
+                    palette=active_palette_name(),
                 )
                 write_terminal_frame(body, status)
             else:
@@ -1988,6 +2048,7 @@ def _run_playback(args, automatic_update_check=None, diagnostics=None):
                         args.fps, pos, info, cols, paused=False,
                         style=args.style, effect=args.effect,
                         render_backend=mode_label,
+                        palette=active_palette_name(),
                     )
                 output_bytes = write_terminal_frame(
                     body, status, diagnostics
@@ -2122,7 +2183,7 @@ def _truncate_terminal_cells(text, limit):
 
 def build_status(
     fps, pos, info, cols, paused, style="classic", effect="none",
-    render_backend="chars", pixel_fallback=False,
+    render_backend="chars", pixel_fallback=False, palette=None,
 ):
     if info["duration"]:
         clock = f"{fmt_time(pos)} / {fmt_time(info['duration'])}"
@@ -2136,21 +2197,37 @@ def build_status(
     if pixel_fallback:
         render_backend = "half-block→chars"
     render_label = f"render:{render_backend}"
-    head_options = (
+    palette_label = f"palette:{palette}" if palette is not None else None
+    head_options = [
         f"  {tag}  {clock}  {fps}fps  {render_label}  style:{style}  "
-        f"{effect_label}",
-        f"  {tag}  {clock}  {render_label}  style:{style}  {effect_label}",
+        f"{effect_label}"
+        + (f"  {palette_label}" if palette_label else ""),
+        f"  {tag}  {clock}  {render_label}  style:{style}  {effect_label}"
+        + (f"  {palette_label}" if palette_label else ""),
         f"  {render_label}  style:{style}  {effect_label}",
         f"  {clock}  {render_label}  {effect_label}",
         f"  {render_label}  {effect_label}",
         f"  {effect_label}",
-    )
-    control_options = (
-        "space:pause  s:style  e:effect  ←→±5s  ↑↓±30s  0-9:jump  q:quit",
-        "space:pause  s:style  e:effect  arrows:seek  0-9:jump  q:quit",
-        "space  s:style  e:effect  arrows:seek  q:quit",
-        "s:style  e:effect  q:quit",
-    )
+    ]
+    if palette_label:
+        head_options.insert(
+            2,
+            f"  {render_label}  style:{style}  {effect_label}  "
+            f"{palette_label}",
+        )
+        control_options = (
+            "space:pause  p:palette  s:style  e:effect  ←→±5s  ↑↓±30s  "
+            "0-9:jump  q:quit",
+            "space:pause  p:palette  s:style  e:effect  arrows:seek  q:quit",
+            "p:palette  s:style  e:effect  q:quit",
+        )
+    else:
+        control_options = (
+            "space:pause  s:style  e:effect  ←→±5s  ↑↓±30s  0-9:jump  q:quit",
+            "space:pause  s:style  e:effect  arrows:seek  0-9:jump  q:quit",
+            "space  s:style  e:effect  arrows:seek  q:quit",
+            "s:style  e:effect  q:quit",
+        )
     head = controls = fallback_head = ""
     title_reserve = min(12, _terminal_cell_width(info.get("title", "")))
     for reserve in ((title_reserve, 0) if title_reserve else (0,)):

@@ -107,21 +107,29 @@ _EVENT_NAMES = frozenset((
 _EVENT_TOKEN_VALUES = {
     "reason": frozenset((
         "eight_bit", "normal", "disabled", "seek", "pause", "resume",
-        "exhausted", "start", "resumed", "style", "effect", "quit",
+        "exhausted", "start", "resumed", "palette", "style", "effect",
+        "quit",
         "completed", "error",
         "video", "audio",
     )),
     "action": frozenset((
-        "seek", "pause", "resume", "style", "effect", "quit", "resize",
+        "seek", "pause", "resume", "palette", "style", "effect", "quit",
+        "resize",
     )),
     "outcome": frozenset(("start", "resumed", "completed", "failed", "exhausted")),
     "style": _CONFIG_TOKEN_CHOICES["style"],
     "effect": _EFFECT_TOKENS,
-    "value": _EFFECT_TOKENS | _CONFIG_TOKEN_CHOICES["style"],
+    "palette": _CONFIG_TOKEN_CHOICES["palette"],
+    "value": (
+        _EFFECT_TOKENS
+        | _CONFIG_TOKEN_CHOICES["style"]
+        | _CONFIG_TOKEN_CHOICES["palette"]
+    ),
 }
 _EVENT_FIELDS = frozenset((
     "reason", "position_seconds", "from_seconds", "to_seconds",
-    "duration_seconds", "count", "width", "height", "style", "effect",
+    "duration_seconds", "count", "width", "height", "palette", "style",
+    "effect",
     "paused", "success", "exit_code", "signal", "action", "value",
     "enabled", "eight_bit", "outcome", "attempt", "requested", "completed",
     "received", "expected",

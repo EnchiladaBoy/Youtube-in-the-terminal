@@ -24,7 +24,7 @@ accepted only by a backend with text-cell capability.
 
 ## Render backend registry
 
-| Name | Protocol | Source rows/cell | Visible payload | Unicode | Color required |
+| Name | Protocol | Source rows/cell | Visible payload | Unicode required | Color required |
 |---|---|---:|---|:---:|:---:|
 | `chars` | ANSI | 1 | ASCII luminance glyph by default | No | No |
 | `cells` | ANSI | 1 | Background-colored literal space | No | Yes |
@@ -37,6 +37,14 @@ same contract.
 Requested `cells` or `half-block` with `--no-color` resolves explicitly to
 effective `chars`, preventing invisible uncolored spaces. Compatibility is
 checked against the effective backend. Diagnostics retain both values.
+
+Character-palette selection belongs to terminal composition, not to styles or
+effects. While the effective renderer is consuming its luminance palette, `p`
+cycles the built-in palettes without resetting decode, reveal, style, effect,
+or trail history. The key is explicitly inactive for colored graphical
+backends and for text-specific effects, whose structured cell plane owns its
+glyphs. No-color graphical fallbacks are effective `chars`, so palette cycling
+remains available there.
 
 Backend capability records describe protocol, source-row density, Unicode,
 color, and structured-cell support. A future Kitty, Sixel, or iTerm backend can

@@ -266,6 +266,67 @@ class RendererTests(unittest.TestCase):
             chars[0].encode("utf-8") + chars[-1].encode("utf-8") + CLEAR_EOL,
         )
 
+    def test_palette_switch_rebuilds_glyph_workspace_without_resetting_reveals(self):
+        frame = np.array([[0, 63, 127, 191, 255]], dtype=np.uint8)
+        renderer = AnsiRenderer(" .", color=False, rng=np.random.default_rng(9))
+        renderer.render_scatter(frame, 0.4)
+        renderer.render_rain(frame, 0.4)
+        scatter_rank = renderer._scatter["rank"].copy()
+        rain_duration = renderer._rain["duration"].copy()
+        rain_offset = renderer._rain["offset"].copy()
+
+        for chars in (" ░▒▓█", "x", " .:-=+*#%@"):
+            with self.subTest(chars=chars):
+                renderer.set_palette(chars)
+                output = renderer.render(frame)
+                self.assertEqual(
+                    output,
+                    AnsiRenderer(chars, color=False).render(frame),
+                )
+                self.assertNotIn(b"\x00", output)
+                np.testing.assert_array_equal(
+                    renderer._scatter["rank"], scatter_rank
+                )
+                np.testing.assert_array_equal(
+                    renderer._rain["duration"], rain_duration
+                )
+                np.testing.assert_array_equal(
+                    renderer._rain["offset"], rain_offset
+                )
+
+    def test_palette_switch_materially_changes_colored_chars(self):
+        levels = np.array([0, 63, 127, 191, 255], dtype=np.uint8)
+        frame = np.repeat(levels[None, :, None], 3, axis=2)
+        renderer = AnsiRenderer(" .:-=+*#%@")
+        before = renderer.render(frame)
+        renderer.set_palette(" 01")
+        after = renderer.render(frame)
+        self.assertNotEqual(after, before)
+        self.assertEqual(after, AnsiRenderer(" 01").render(frame))
+
+    def test_palette_switch_validation_is_atomic_and_chars_only(self):
+        renderer = AnsiRenderer(" .", color=False)
+        frame = np.array([[0, 255]], dtype=np.uint8)
+        renderer.render(frame)
+        original_lut = renderer.palette_lut.copy()
+        original_key = renderer._workspace_key
+        for invalid in ("", "x\x00y"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                renderer.set_palette(invalid)
+            np.testing.assert_array_equal(renderer.palette_lut, original_lut)
+            self.assertEqual(renderer._workspace_key, original_key)
+
+        for mode in ("cells", "half-block"):
+            for color in (True, False):
+                with self.subTest(
+                    mode=mode, color=color
+                ), self.assertRaisesRegex(
+                    ValueError, "require render_mode='chars'"
+                ):
+                    AnsiRenderer(
+                        "x", render_mode=mode, color=color
+                    ).set_palette(" .#")
+
     def test_grayscale_rgb_fallback_matches_legacy_luminance(self):
         frame = np.array(
             [[[0, 10, 255], [255, 100, 1]], [[9, 99, 254], [1, 2, 3]]],

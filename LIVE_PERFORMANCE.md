@@ -68,8 +68,11 @@ the short diagnostic run.
    cycling and rejected when explicitly incompatible.
 5. Confirm `--no-color --render cells` and
    `--no-color --render half-block` show visible ASCII, not blank spaces.
-6. Exercise pause, seek, resize, style/effect cycling, scatter/rain reveal, and
-   quit. Confirm `trails` resets at playback boundaries.
+6. Exercise pause, seek, resize, palette/style/effect cycling, and scatter/rain
+   reveal. Confirm `p` redraws a paused `chars` frame without restarting
+   playback and is inactive when the effective backend is graphical or a
+   text-specific effect owns the glyph plane.
+   Confirm `trails` resets at playback boundaries, then quit.
 7. Confirm cursor/colors and decoder/audio child processes are restored.
 8. After approving the visual direction, capture fresh screenshots from a real
    attached terminal for the three canonical renderers. Do not use a captured

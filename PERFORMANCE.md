@@ -127,7 +127,7 @@ Both profiles passed every deterministic contract and applicable gate:
 
 The stress maxima were `half-block`, `riso`, `prism`, and
 `half-block/color/error-diffusion/prism`, respectively. The complete unit/integration run
-also passed 243 tests and the offline self-test passed. These results belong to
+also passed 249 tests and the offline self-test passed. These results belong to
 the uncommitted review candidate; they do not authorize a release, push, or
 tag. A second full ordinary run reproduced the default-path overhead at
 +1.33%, with no gate failures.

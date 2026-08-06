@@ -175,6 +175,7 @@ class CommandAndOutputTests(unittest.TestCase):
         self.assertIn("half-block", output.getvalue())
         self.assertIn("--style", output.getvalue())
         self.assertIn("--effect", output.getvalue())
+        self.assertIn("cycle character palette", output.getvalue())
         self.assertIn("--check-update", output.getvalue())
         self.assertIn("--update", output.getvalue())
         self.assertIn("--diagnostics-json", output.getvalue())
@@ -198,9 +199,10 @@ class CommandAndOutputTests(unittest.TestCase):
         self.assertEqual(output.getvalue(), "yt-ascii 0.5.0 (source)\n")
         dependency_check.assert_not_called()
 
-    def test_interactive_style_selection_persists_to_the_next_video(self):
+    def test_interactive_visual_selections_persist_to_the_next_video(self):
         args = SimpleNamespace(
-            url=None, style="classic", effect="none", self_test=False
+            url=None, style="classic", effect="none", palette="dense",
+            chars=" .@", self_test=False,
         )
         seen = []
         urls = iter(("first", "second"))
@@ -213,8 +215,13 @@ class CommandAndOutputTests(unittest.TestCase):
                 raise SystemExit(0) from error
 
         def run(current):
-            seen.append((current.url, current.style, current.effect))
+            seen.append((
+                current.url, current.palette, current.chars,
+                current.style, current.effect,
+            ))
             if current.url == "first":
+                current.palette = "matrix"
+                current.chars = None
                 current.style = "posterize"
                 current.effect = "pixelate"
 
@@ -230,8 +237,8 @@ class CommandAndOutputTests(unittest.TestCase):
         self.assertEqual(
             seen,
             [
-                ("first", "classic", "none"),
-                ("second", "posterize", "pixelate"),
+                ("first", "dense", " .@", "classic", "none"),
+                ("second", "matrix", None, "posterize", "pixelate"),
             ],
         )
 
@@ -398,6 +405,13 @@ class CommandAndOutputTests(unittest.TestCase):
                 )
 
     def test_style_effect_and_palette_cli_contract(self):
+        self.assertEqual(
+            CORE["PALETTE_NAMES"],
+            (
+                "simple", "dense", "blocks", "binary", "numbers",
+                "symbols", "matrix",
+            ),
+        )
         self.assertEqual(CORE["PALETTES"]["binary"], " 01")
         self.assertEqual(CORE["PALETTES"]["numbers"], " 123456789")
         self.assertEqual(CORE["PALETTES"]["symbols"], " .,:;!|?*#@")
@@ -420,6 +434,12 @@ class CommandAndOutputTests(unittest.TestCase):
             self.assertFalse(args.update)
             self.assertFalse(args.check_update)
             self.assertFalse(args.no_update_check)
+        cycle = CORE["_next_palette_name"]
+        self.assertEqual(cycle("custom"), "simple")
+        self.assertEqual(cycle("simple"), "dense")
+        self.assertEqual(cycle("matrix"), "simple")
+        with self.assertRaisesRegex(ValueError, "unknown palette"):
+            cycle("missing")
         for style in CORE["STYLE_NAMES"]:
             with self.subTest(style=style), mock.patch.object(
                 globals_["sys"], "argv", ["yt-ascii", "--style", style]
@@ -1034,6 +1054,31 @@ class CommandAndOutputTests(unittest.TestCase):
                 self.assertIn("s:style", visible)
                 self.assertIn("e:effect", visible)
 
+        palette_status = CORE["build_status"](
+            30,
+            12.0,
+            {"duration": 60.0, "title": "fixture"},
+            240,
+            paused=False,
+            style="riso",
+            effect="pixelate",
+            palette="simple",
+        )
+        self.assertIn("palette:simple", palette_status)
+        self.assertIn("p:palette", palette_status)
+        graphical_status = CORE["build_status"](
+            30,
+            12.0,
+            {"duration": 60.0, "title": "fixture"},
+            240,
+            paused=False,
+            style="riso",
+            effect="pixelate",
+            render_backend="cells",
+        )
+        self.assertNotIn("palette:", graphical_status)
+        self.assertNotIn("p:palette", graphical_status)
+
     def test_status_accounts_for_wide_combining_and_control_characters(self):
         title = "界e\u0301🙂\x1b[2J" * 20
         status = CORE["build_status"](
@@ -1063,12 +1108,12 @@ class CommandAndOutputTests(unittest.TestCase):
         self.assertIn("render:half-block→chars", status)
         self.assertIn("effect:pixelate", status)
 
-    def test_keyboard_backends_accept_only_lowercase_style_and_effect_keys(self):
+    def test_keyboard_backends_accept_only_lowercase_palette_style_effect_keys(self):
         globals_ = CORE["_read_keys_windows"].__globals__
 
         class FakeMsvcrt:
             def __init__(self):
-                self.chars = iter(("s", "S", "e", "E", "1"))
+                self.chars = iter(("p", "P", "s", "S", "e", "E", "1"))
                 self.pending = True
 
             def kbhit(self):
@@ -1083,16 +1128,20 @@ class CommandAndOutputTests(unittest.TestCase):
 
         fake = FakeMsvcrt()
         with mock.patch.dict(globals_, {"msvcrt": fake}):
-            self.assertEqual(CORE["_read_keys_windows"](), ["s", "e", "1"])
+            self.assertEqual(
+                CORE["_read_keys_windows"](), ["p", "s", "e", "1"]
+            )
 
         readiness = iter((([0], [], []), ([], [], [])))
         fake_select = SimpleNamespace(select=lambda *_args: next(readiness))
         posix_globals = CORE["_read_keys_posix"].__globals__
         with mock.patch.dict(posix_globals, {"select": fake_select}), \
                 mock.patch.object(
-                    posix_globals["os"], "read", return_value=b"sSeE1"
+                    posix_globals["os"], "read", return_value=b"pPsSeE1"
                 ):
-            self.assertEqual(CORE["_read_keys_posix"](0), ["s", "e", "1"])
+            self.assertEqual(
+                CORE["_read_keys_posix"](0), ["p", "s", "e", "1"]
+            )
 
 
 class NonSuspendResizeTests(unittest.TestCase):
@@ -1456,6 +1505,201 @@ class NonSuspendResizeTests(unittest.TestCase):
                 self.assertEqual(reveal_fractions[0], reveal_fractions[1])
                 self.assertEqual(len(reveal_resets), 1)
                 self.assertEqual(effect_resets, ["source", "style"])
+
+    def test_palette_cycle_redraws_pause_without_resetting_pipeline(self):
+        import yt_ascii_effects
+        import yt_ascii_renderer
+        from yt_ascii_frames import EffectFrame
+
+        base_renderer = yt_ascii_renderer.AnsiRenderer
+        globals_ = CORE["run"].__globals__
+
+        def exercise(key_batch, custom_chars=None):
+            contexts = []
+            effect_resets = []
+            palette_updates = []
+            reveal_fractions = []
+            reveal_resets = []
+            spawned = []
+            key_call = 0
+
+            class RecordingRenderer(base_renderer):
+                def set_palette(self, chars):
+                    palette_updates.append(chars)
+                    return super().set_palette(chars)
+
+                def reset_reveal(self):
+                    reveal_resets.append(True)
+                    return super().reset_reveal()
+
+                def render_scatter(self, frame, fraction):
+                    reveal_fractions.append(fraction)
+                    return super().render_scatter(frame, fraction)
+
+            class RecordingEffectProcessor:
+                def __init__(
+                    self, name, *, glyph_mode, speed, seed, effect_text
+                ):
+                    self.name = name
+
+                def reset(self, reason):
+                    effect_resets.append(reason)
+
+                def apply(self, frame, context):
+                    contexts.append(context)
+                    return EffectFrame(frame)
+
+            def spawn_video(*_args):
+                process = self.FakeProcess(video=True)
+                spawned.append(process)
+                return process
+
+            def read_keys(_fd):
+                nonlocal key_call
+                key_call += 1
+                if key_call == 1:
+                    return []
+                if key_call == 2:
+                    return key_batch
+                return ["q"]
+
+            args = self.args(
+                scatter=True, palette="simple", chars=custom_chars
+            )
+            replacements = {
+                "_CAN_SUSPEND": False,
+                "IS_WINDOWS": True,
+                "probe": lambda *_args: self.info(),
+                "spawn_video": spawn_video,
+                "find_ffplay": lambda: None,
+                "read_keys": read_keys,
+            }
+            with mock.patch.dict(globals_, replacements), \
+                    mock.patch.object(globals_["os"], "isatty", return_value=True), \
+                    mock.patch.object(globals_["time"], "monotonic", return_value=0.0), \
+                    mock.patch.object(globals_["time"], "sleep"), \
+                    mock.patch.object(
+                        yt_ascii_renderer, "AnsiRenderer", RecordingRenderer
+                    ), \
+                    mock.patch.object(
+                        yt_ascii_effects,
+                        "EffectProcessor",
+                        RecordingEffectProcessor,
+                    ), \
+                    mock.patch.object(
+                        globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)
+                    ), \
+                    mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
+                    mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+                CORE["run"](args)
+            return {
+                "args": args,
+                "contexts": contexts,
+                "effect_resets": effect_resets,
+                "palette_updates": palette_updates,
+                "reveal_fractions": reveal_fractions,
+                "reveal_resets": reveal_resets,
+                "spawned": spawned,
+            }
+
+        cases = (
+            (["space", "p"], None, "dense"),
+            (["p", "space"], None, "dense"),
+            (["space", "p"], " .@", "simple"),
+        )
+        for key_batch, custom_chars, expected_name in cases:
+            with self.subTest(
+                key_batch=key_batch, custom_chars=custom_chars
+            ):
+                result = exercise(key_batch, custom_chars)
+                self.assertEqual(result["args"].palette, expected_name)
+                self.assertIsNone(result["args"].chars)
+                self.assertEqual(
+                    result["palette_updates"],
+                    [CORE["PALETTES"][expected_name]],
+                )
+                self.assertEqual(result["effect_resets"], ["source"])
+                self.assertEqual(len(result["spawned"]), 1)
+                self.assertEqual(len(result["reveal_resets"]), 1)
+                self.assertEqual(len(result["reveal_fractions"]), 2)
+                self.assertEqual(
+                    result["reveal_fractions"][0],
+                    result["reveal_fractions"][1],
+                )
+                self.assertEqual(len(result["contexts"]), 2)
+                self.assertTrue(result["contexts"][0].advance_state)
+                self.assertFalse(result["contexts"][1].advance_state)
+                self.assertEqual(
+                    result["contexts"][0].video_time,
+                    result["contexts"][1].video_time,
+                )
+
+    def test_palette_hotkey_respects_effective_glyph_ownership(self):
+        import yt_ascii_renderer
+
+        base_renderer = yt_ascii_renderer.AnsiRenderer
+        globals_ = CORE["run"].__globals__
+
+        def exercise(**overrides):
+            palette_updates = []
+            key_call = 0
+
+            class RecordingRenderer(base_renderer):
+                def set_palette(self, chars):
+                    palette_updates.append(chars)
+                    return super().set_palette(chars)
+
+            def read_keys(_fd):
+                nonlocal key_call
+                key_call += 1
+                if key_call == 1:
+                    return []
+                if key_call == 2:
+                    return ["p"]
+                return ["q"]
+
+            args = self.args(palette="simple", **overrides)
+            process = self.FakeProcess(video=True)
+            replacements = {
+                "IS_WINDOWS": True,
+                "probe": lambda *_args: self.info(),
+                "spawn_video": lambda *_args: process,
+                "find_ffplay": lambda: None,
+                "read_keys": read_keys,
+            }
+            with mock.patch.dict(globals_, replacements), \
+                    mock.patch.object(globals_["os"], "isatty", return_value=True), \
+                    mock.patch.object(globals_["time"], "monotonic", return_value=0.0), \
+                    mock.patch.object(globals_["time"], "sleep"), \
+                    mock.patch.object(
+                        yt_ascii_renderer, "AnsiRenderer", RecordingRenderer
+                    ), \
+                    mock.patch.object(
+                        globals_["sys"], "stdin", SimpleNamespace(fileno=lambda: 0)
+                    ), \
+                    mock.patch.object(globals_["sys"], "stdout", io.StringIO()), \
+                    mock.patch.object(globals_["sys"], "stderr", io.StringIO()):
+                CORE["run"](args)
+            return args, palette_updates
+
+        cases = (
+            ({"render": "chars", "no_color": False}, True),
+            ({"render": "cells", "no_color": True}, True),
+            ({"render": "half-block", "no_color": True}, True),
+            ({"render": "cells", "no_color": False}, False),
+            ({"render": "half-block", "no_color": False}, False),
+            ({"render": "chars", "effect": "digital-rain"}, False),
+            ({"render": "chars", "effect": "terminal-hud"}, False),
+        )
+        for overrides, supported in cases:
+            with self.subTest(overrides=overrides):
+                args, updates = exercise(**overrides)
+                if supported:
+                    self.assertEqual(updates, [CORE["PALETTES"]["dense"]])
+                    self.assertEqual(args.palette, "dense")
+                else:
+                    self.assertEqual(updates, [])
+                    self.assertEqual(args.palette, "simple")
 
     def test_effect_cycle_redraws_pause_without_advancing_effect_state(self):
         import yt_ascii_effects

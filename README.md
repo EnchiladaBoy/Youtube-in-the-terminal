@@ -68,7 +68,7 @@ backends without making any non-portable protocol a requirement.
 
 Choose one with the canonical `--render` option:
 
-| Backend | Output contract | Unicode | Color |
+| Backend | Output contract | Unicode required | Color |
 |---|---|:---:|:---:|
 | `chars` | Luminance mapped to characters; ASCII-only by default | No | Optional |
 | `cells` | ANSI background colors followed by spaces; no visible glyphs | No | Required |
@@ -217,6 +217,7 @@ See [`EFFECTS.md`](EFFECTS.md) for the exact registry contract and
 | Key | Action |
 |---|---|
 | `space` | pause / resume |
+| `p` | cycle the active character palette |
 | `s` | cycle visual style |
 | `e` | cycle compatible effect |
 | `←` / `→` | seek -5s / +5s |
@@ -237,8 +238,15 @@ space/background-color output and introduce no decorative glyphs.
 | Playback | `--fps`, `--width`, `--height`, `--max-res`, `--no-audio`, `--8bit` |
 
 `--palette` and `--chars` affect character rendering and grayscale fallbacks.
-The default character palette and rain reveal are portable ASCII. Unicode
-presets are opt-in.
+When the effective renderer is `chars`, press `p` to cycle
+`simple → dense → blocks → binary → numbers → symbols → matrix → simple`.
+Colored `cells`/`half-block` and text-specific effects ignore the key because
+their output does not consume the luminance palette. A requested graphical
+backend that falls back to `chars` under `--no-color` does support it. A custom
+`--chars` selection is labelled `custom`; its first `p` selects `simple`, then
+cycling continues through the built-ins and persists for the next interactively
+selected video. The default character palette and rain reveal are portable
+ASCII; `blocks` is an opt-in Unicode built-in.
 
 ## Visual review and screenshots
 

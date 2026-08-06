@@ -22,7 +22,7 @@ effect matrix and its qualification results do not count toward this release.
 | RGB-first processing | Graphical methods remain visible in `cells` and `half-block` | Implemented |
 | Compatibility | Capability-derived errors and compatible-only effect cycling | Implemented |
 | CLI migration | `--render`, `--pixels`, style/effect boundary, narrow legacy shims | Implemented |
-| Visual contracts | Glyph-free cells, ASCII paths, deterministic/distinct output | Implemented; 243-test suite and self-test pass |
+| Visual contracts | Glyph-free cells, ASCII paths, deterministic/distinct output | Implemented; 249-test suite and self-test pass |
 | Performance matrix | 10 styles x applicable effects x six backend/color paths x two profiles | Implemented; ordinary and stress gates pass |
 | Live evidence | Short representative sink/tmux/PTY classification smokes | Fresh runs pass; not matched path qualification |
 | Documentation/packaging | README, help, installer, diagnostics, effects, performance, live process | Implemented in working tree |

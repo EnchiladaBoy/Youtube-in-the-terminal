@@ -256,6 +256,27 @@ class PlaybackDiagnosticsTests(unittest.TestCase):
             self.assertNotIn("presentation", config)
             self.assertNotIn("effect_glyphs", config)
 
+    def test_palette_control_events_allow_names_but_never_custom_glyphs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            diagnostics, _, _ = self.make_diagnostics(directory)
+            diagnostics.event(
+                "control", reason="palette", palette="blocks"
+            )
+            diagnostics.event(
+                "control", reason="palette", palette="PRIVATE-λ-glyphs"
+            )
+            diagnostics.record_cleanup(0.01)
+            report = diagnostics.finalize("normal")
+            records = report["events"]["records"]
+            self.assertEqual(
+                records[0]["fields"],
+                {"reason": "palette", "palette": "blocks"},
+            )
+            self.assertEqual(
+                records[1]["fields"],
+                {"reason": "palette", "palette": "redacted"},
+            )
+
     def test_resolved_output_geometry_controls_profile_and_report_dimensions(self):
         with tempfile.TemporaryDirectory() as directory:
             diagnostics, _, _ = self.make_diagnostics(

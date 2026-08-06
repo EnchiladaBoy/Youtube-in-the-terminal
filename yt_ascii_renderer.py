@@ -155,6 +155,22 @@ class AnsiRenderer:
         self._scatter.clear()
         self._rain.clear()
 
+    def set_palette(self, chars):
+        """Replace the active luminance palette without resetting reveals.
+
+        Palette selection belongs to character composition. Graphical
+        backends have no visible glyph palette, so accepting a change there
+        would create a control that appears to do nothing.
+        """
+        if self.requested_render_mode != "chars":
+            raise ValueError("character palettes require render_mode='chars'")
+        palette_lut = _glyph_lut(chars, "palette")
+        self.palette_lut = palette_lut
+        self.n_pal = palette_lut.shape[0] - 1
+        # UTF-8 width is part of the workspace shape. Force a rebuild on the
+        # next frame while deliberately preserving scatter/rain timing maps.
+        self._workspace_key = None
+
     def render(self, frame, cell_plane=None):
         """Render a complete frame without a reveal mask."""
         plane = self._prepare_cell_plane(frame, cell_plane)
